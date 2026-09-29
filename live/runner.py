@@ -110,6 +110,7 @@ class Radar:
         self.day = None
         self.baseline: dict[str, list[float] | None] = {}
         self.atr: dict[str, float | None] = {}
+        self.prev: dict[str, float | None] = {}
         self.sec_map: dict[str, int] = {}
         self.trades: dict[str, dict] = {}
         self.sent: set[str] = set()
@@ -160,13 +161,16 @@ class Radar:
         Q = yahoo.yf.EquityQuery
         exch = Q("is-in", ["exchange", *yahoo.US_EXCH])
         custom = Q("and", [Q("gt", ["percentchange", 3]), exch, Q("gt", ["dayvolume", 300000]), Q("gte", ["intradayprice", 1])])
+        sq: dict[str, dict] = {}  # cotizaciones que ya traen las pantallas (respaldo si v7/quote falla)
         r = yahoo.retry(lambda: yahoo.yf.screen(custom, size=150, sortField="percentchange", sortAsc=False), tries=2, what="screen subidas")
         for q in yahoo._quotes(r):
             add(q.get("symbol"), "subidas")
+            sq[str(q.get("symbol")).upper()] = q
         for name in ("day_gainers", "most_actives", "small_cap_gainers"):
             r = yahoo.retry(lambda name=name: yahoo.yf.screen(name, count=100), tries=2, what=f"screen {name}")
             for q in yahoo._quotes(r):
                 add(q.get("symbol"), name)
+                sq[str(q.get("symbol")).upper()] = q
         for s in watch:
             add(s, "watchlist")
         for s, h in halted.items():
@@ -179,7 +183,9 @@ class Radar:
                     add(it.get("t"), "escaneo")
             except (requests.RequestException, ValueError):
                 pass
-        quotes = yahoo.batch_quotes(sorted(cand))
+        quotes = yahoo.batch_quotes(sorted(cand)) or {}
+        for s, q in sq.items():
+            quotes.setdefault(s, q)
         t = now.astimezone(ET)
         elapsed = max(0, min(390, t.hour * 60 + t.minute - OPEN_M))
         frac = 0.12 + 0.88 * elapsed / 390 if phase != "pre" else 0.05
@@ -195,11 +201,11 @@ class Radar:
             ranked.append((math.log1p(rv) * 2 + max(chg, 0) / 4, s))
         ranked.sort(reverse=True)
         top = [s for _, s in ranked[:UNIVERSE_N]]
-        uni = list(dict.fromkeys(top + [s for s in watch if s in quotes] + [s for s in halted if s in quotes]))
+        uni = list(dict.fromkeys(top + watch + list(halted)))
         self.universe = uni
         self.sources = {s: sorted(cand.get(s, [])) for s in uni}
         self.universe_ts = time.time()
-        log.info("universo: %d candidatos → %d en seguimiento", len(cand), len(uni))
+        log.info("universo: %d candidatos, %d cotizados → %d en seguimiento", len(cand), len(quotes), len(uni))
 
     def ensure_context(self, syms: list[str], today):
         need = [s for s in syms if s not in self.baseline]
@@ -209,7 +215,12 @@ class Radar:
         hd = yahoo.history(need, period="3mo", interval="1d")
         for s in need:
             self.baseline[s] = baseline_curve(h5.get(s), today)
-            self.atr[s] = atr_pct(hd.get(s))
+            d = hd.get(s)
+            if d is not None and not d.empty:
+                d = d.dropna(subset=["Close"])
+                d = d[[ix.date() < today for ix in d.index]]
+            self.atr[s] = atr_pct(d)
+            self.prev[s] = float(d["Close"].iloc[-1]) if d is not None and not d.empty else None
 
     # ---------------- enriquecimiento con caché ----------------
     def news_ctx(self, s, now_ts):
@@ -241,7 +252,7 @@ class Radar:
         today = t_et.date()
         phase = phase_of(now)
         if self.day != today:
-            self.day, self.baseline, self.atr = today, {}, {}
+            self.day, self.baseline, self.atr, self.prev = today, {}, {}, {}
             if self.trades and next(iter(self.trades.values())).get("day") != today.isoformat():
                 self.trades, self.sent = {}, set()
         if phase == "closed":
@@ -258,7 +269,7 @@ class Radar:
 
         def mets(s):
             q = quotes.get(s, {})
-            prev = fnum(q.get("regularMarketPreviousClose"))
+            prev = fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
             live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
             return session_metrics(bars.get(s), prev, self.baseline.get(s), now, live)
 
