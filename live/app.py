@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from . import keepalive
 from .runner import Radar
 
 PAGE = os.path.join(os.path.dirname(__file__), "page.html")
@@ -21,6 +22,7 @@ STARTED = time.time()
 async def lifespan(app: FastAPI):
     if os.environ.get("NO_LOOP") != "1":
         threading.Thread(target=radar.run_forever, name="radar", daemon=True).start()
+        threading.Thread(target=keepalive.loop, name="keepalive", daemon=True).start()
     yield
 
 
