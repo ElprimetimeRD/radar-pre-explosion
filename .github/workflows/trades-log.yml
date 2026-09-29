@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "*/30 13-20 * * 1-5"
     - cron: "20 20 * * 1-5"
+    # GitHub a veces retrasa o se salta corridas programadas: más intentos después del cierre y a la mañana siguiente
+    - cron: "15 21,22,23 * * 1-5"
+    - cron: "30 11 * * 1-5"
   workflow_dispatch:
 
 permissions:
