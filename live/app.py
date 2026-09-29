@@ -45,3 +45,20 @@ def health():
     ts = radar.snapshot.get("ts")
     return {"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts,
             "uptime_min": round((time.time() - STARTED) / 60, 1), "now": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/api/news/{t}")
+def news_check(t: str):
+    """Diagnóstico: qué devuelve cada fuente de titulares desde este servidor."""
+    import requests
+    from scanner.sources import yahoo
+    from .runner import rss_news
+    out = {"yahoo_get_news": len(yahoo.news(t.upper(), count=10) or [])}
+    try:
+        r = requests.get("https://feeds.finance.yahoo.com/rss/2.0/headline",
+                         params={"s": t.upper(), "region": "US", "lang": "en-US"}, timeout=10)
+        out["rss_status"], out["rss_head"] = r.status_code, r.text[:160]
+    except requests.RequestException as e:
+        out["rss_error"] = str(e)[:160]
+    out["rss_items"] = [x["title"] for x in rss_news(t.upper())[:3]]
+    return out
