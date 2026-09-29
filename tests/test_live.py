@@ -126,6 +126,13 @@ def test_merge(tmp="/tmp/claude-0/merge_test"):
     run([{"t": "A", "time": "10:00", "status": "t1", "hit1": True}, {"t": "B", "time": "10:05", "status": "stop", "hit1": False}])
     sm = run([{"t": "A", "time": "10:00", "status": "abierta", "hit1": False}])  # reinicio del servidor: no retrocede
     assert sm["total"] == {"n": 2, "filled": 2, "t1": 1, "t2": 0, "stop": 1}, sm
+    # día siguiente: el cierre de ayer llega por "history" aunque GitHub se haya saltado la corrida de la tarde
+    with open(f"{tmp}/in.json", "w") as f:
+        json.dump({"day": "2026-09-30", "trades": [], "history": [{"day": "2026-09-29", "trades": [
+            {"t": "C", "time": "11:00", "status": "cierre", "hit1": False, "close_pct": 0.4}]}]}, f)
+    subprocess.run([sys.executable, "tools/merge_trades.py", f"{tmp}/in.json", f"{tmp}/live"], check=True, capture_output=True)
+    sm = json.load(open(f"{tmp}/live/summary.json"))
+    assert sm["total"]["n"] == 3 and sm["total"]["filled"] == 3 and sm["days"] == 1, sm
 
 
 def test_regime():
@@ -227,6 +234,11 @@ def test_cycle():
         assert rep["status"] == "ok" and "ejecutadas" in rep["resumen"], rep
         for x in rep["trades"]:
             assert x["result"] in ("+2%", "+5%", "abierta", "stop", "no ejecutada"), x
+        # cierre del día: nada queda abierto y el día pasa al historial
+        r._eod(now.replace(hour=16, minute=5).astimezone(ET))
+        x = r.trades["RUN"]
+        assert x["status"] == "cierre" and x["hit1"] and x["close_pct"] is not None, x
+        assert DAY.date().isoformat() in r.history and r.stats()["open"] == 0, r.stats()
     finally:
         for (mod, name), fn in old.items():
             setattr(mod, name, fn)
