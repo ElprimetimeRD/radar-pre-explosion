@@ -1,0 +1,36 @@
+name: Registro del semáforo
+
+# Guarda las señales del día (y un resumen acumulado) en data/live/ para que no se pierdan con los redeploys.
+on:
+  schedule:
+    - cron: "*/30 13-20 * * 1-5"
+    - cron: "20 20 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar-scan
+  cancel-in-progress: false
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar y fusionar
+        env:
+          URL: ${{ vars.SEMAFORO_URL || 'https://radar-semaforo.onrender.com' }}
+        run: |
+          curl -fsS --max-time 90 "$URL/api/trades" -o /tmp/today.json || curl -fsS --max-time 90 "$URL/api/signals" -o /tmp/today.json || exit 0
+          python3 tools/merge_trades.py /tmp/today.json data/live
+      - name: Commit
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add -f data/live
+          git diff --cached --quiet && exit 0
+          git commit -m "registro semáforo $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -X theirs && git push && exit 0; sleep 5; done
+          exit 1
