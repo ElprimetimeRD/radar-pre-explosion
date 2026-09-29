@@ -27,6 +27,7 @@ CYCLE_S = int(os.environ.get("CYCLE_S", "60"))
 UNIVERSE_TTL = 600
 ENRICH_N = 20
 STATE_DIR = os.path.join(DATA, "live")
+HIST_DAYS = 5
 DEFAULT_WATCH = ["MU", "SNDK", "MRVL", "ARM", "BE", "AXTI", "NVDA", "AMD", "SNXX", "MUU"]
 EARN_RX = r"(earnings|quarterly results|Q[1-4] (results|revenue)|beats?|tops? (estimates|expectations)|raises?\b.{0,40}\b(guidance|outlook|forecast)|record revenue)"
 
@@ -203,6 +204,7 @@ class Radar:
         self.sec_map: dict[str, int] = {}
         self.trades: dict[str, dict] = {}
         self.sent: set[str] = set()
+        self.history: dict[str, list] = {}  # días anteriores (hasta HIST_DAYS) para que GitHub los guarde aunque se salte corridas
         self.snapshot: dict = {"status": "iniciando", "rows": []}
         self.last_bars: dict = {}
         self.replay_state: dict = {"status": "sin correr"}
@@ -216,6 +218,9 @@ class Radar:
     def _load(self):
         s = read_json(self._state_path(), {}) or {}
         today = datetime.now(timezone.utc).astimezone(ET).date().isoformat()
+        self.history = {d: t for d, t in (s.get("history") or {}).items() if d != today}
+        if s.get("day") and s.get("day") != today and s.get("trades"):
+            self.history[s["day"]] = list(s["trades"].values())
         if s.get("day") == today:
             self.trades = s.get("trades", {})
             self.sent = set(s.get("sent", []))
@@ -236,7 +241,17 @@ class Radar:
 
     def _save(self):
         day = datetime.now(timezone.utc).astimezone(ET).date().isoformat()
-        write_json(self._state_path(), {"day": day, "trades": self.trades, "sent": sorted(self.sent)})
+        write_json(self._state_path(), {"day": day, "trades": self.trades, "sent": sorted(self.sent), "history": self.history})
+
+    def _archive(self):
+        """Copia las señales del día actual al historial (máx. HIST_DAYS días)."""
+        if not self.trades:
+            return
+        d = next(iter(self.trades.values())).get("day")
+        if d:
+            self.history[d] = [dict(x) for x in self.trades.values()]
+            for old in sorted(self.history)[:-HIST_DAYS]:
+                del self.history[old]
 
     # ---------------- Telegram ----------------
     def tg(self, key: str, text: str):
@@ -397,6 +412,7 @@ class Radar:
         if self.day != today:
             self.day, self.baseline, self.atr, self.prev = today, {}, {}, {}
             if self.trades and next(iter(self.trades.values())).get("day") != today.isoformat():
+                self._archive()
                 self.trades, self.sent = {}, set()
         if phase == "closed":
             self._eod(t_et)
@@ -523,10 +539,22 @@ class Radar:
         if t_et.weekday() >= 5 or t_et.hour < 16 or not self.trades:
             return
         day = t_et.date().isoformat()
+        changed = False
+        for x in self.trades.values():
+            if x["status"] == "pendiente":
+                x["status"], changed = "no ejecutada", True
+            elif x["status"] in ("abierta", "t1"):
+                # intradía: lo que siga abierto se cierra al precio de cierre
+                x["close_pct"] = round(100 * (float(x.get("last") or x["entry"]) / x["entry"] - 1), 2)
+                x["status"], changed = "cierre", True
+        if changed:
+            self._archive()
+            self._save()
         st = self.stats()
         lines = [f"Resumen {day}: {st['n']} COMPRA · {st['filled']} ejecutadas · {st['t1']} tocaron +2% · {st['t2']} +5% · {st['stop']} stop"]
         for x in self.trades.values():
-            lines.append(f"{x['t']} {x['time']} · máx {x['mfe']:+.1f}% · mín {x['mae']:+.1f}% · {x['status']}")
+            fin = f" {x['close_pct']:+.1f}%" if x.get("close_pct") is not None else ""
+            lines.append(f"{x['t']} {x['time']} · máx {x['mfe']:+.1f}% · mín {x['mae']:+.1f}% · {x['status']}{fin}")
         self.tg(f"eod:{day}", "\n".join(lines))
         path = os.path.join(STATE_DIR, f"log-{day}.json")
         if not os.path.exists(path):

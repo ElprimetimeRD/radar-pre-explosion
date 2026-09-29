@@ -62,7 +62,8 @@ def replay(step: int = 10, fresh: int = 0):
 def trades():
     """Señales del día (las guarda GitHub Actions en data/live/ para que sobrevivan a los redeploys)."""
     day = radar.day.isoformat() if radar.day else None
-    return JSONResponse(clean({"day": day, "trades": list(radar.trades.values()), "stats": radar.stats()}),
+    hist = [{"day": d, "trades": t} for d, t in sorted(radar.history.items())]
+    return JSONResponse(clean({"day": day, "trades": list(radar.trades.values()), "stats": radar.stats(), "history": hist}),
                         headers={"Cache-Control": "no-store"})
 
 

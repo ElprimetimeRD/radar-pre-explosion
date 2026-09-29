@@ -93,7 +93,7 @@ function render(){if(!D)return;const rows=D.rows||[];
  const L=rows.filter(r=>r.decision===F);
  $('#list').innerHTML=L.length?L.map(card).join(''):`<p class="foot">Nada en esta lista ahora.</p>`;
  const s=D.stats||{};$('#stats').innerHTML=`<div><b>${s.filled??s.n??0}<small style="font-size:12px">/${s.n||0}</small></b><small>ejecutadas</small></div><div><b>${s.t1||0}</b><small>tocaron +2 %</small></div><div><b>${s.t2||0}</b><small>tocaron +5 %</small></div><div><b>${s.stop||0}</b><small>stop</small></div>`;
- $('#trades').innerHTML=(D.trades||[]).map(t=>`<div class="meta"><span><b>${esc(t.t)}</b> ${t.time}</span><span>entrada ${f2(t.entry)}</span><span>máx ${pc(t.mfe)}</span><span>mín ${pc(t.mae)}</span><span>${esc(t.status)}</span></div>`).join('');
+ $('#trades').innerHTML=(D.trades||[]).map(t=>`<div class="meta"><span><b>${esc(t.t)}</b> ${t.time}</span><span>entrada ${f2(t.entry)}</span><span>máx ${pc(t.mfe)}</span><span>mín ${pc(t.mae)}</span><span>${esc(t.status)}${t.close_pct!=null?' '+pc(t.close_pct):''}</span></div>`).join('');
  $('#foot').innerHTML=`${D.universe||0} acciones en seguimiento · actualizado ${D.ts?new Date(D.ts).toLocaleTimeString():'—'}${(D.errors||[]).length?`<div class="err">${esc(D.errors.slice(-1)[0])}</div>`:''}`}
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{F=b.dataset.f;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));render()});
 async function load(){try{const r=await fetch('/api/signals',{cache:'no-store'});D=await r.json();
