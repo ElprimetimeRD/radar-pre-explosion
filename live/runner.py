@@ -61,7 +61,7 @@ def classify(items: list[dict], now_ts: float) -> dict:
     prio = ["fda", "mna", "contract", "earnings", "index", "analyst", "theme", "softpr"]
     rules = dict(RULES)
     rules["earnings"] = EARN_RX
-    out, best = {"offer": False}, None
+    out, best = {"offer": False, "n": len(items)}, None
     for it in items[:10]:
         ts = it.get("ts")
         if not ts:
@@ -86,14 +86,11 @@ def classify(items: list[dict], now_ts: float) -> dict:
     return out
 
 
-def rss_news(symbol: str) -> list[dict]:
-    """Titulares del RSS público de Yahoo (no pide crumb; respaldo cuando get_news viene vacío)."""
+def _rss(url: str, params: dict, src: str) -> list[dict]:
     import xml.etree.ElementTree as ETX
     from email.utils import parsedate_to_datetime
     try:
-        r = requests.get("https://feeds.finance.yahoo.com/rss/2.0/headline",
-                         params={"s": symbol, "region": "US", "lang": "en-US"},
-                         headers={"User-Agent": halts_src.UA}, timeout=10)
+        r = requests.get(url, params=params, headers={"User-Agent": halts_src.UA}, timeout=10)
         root = ETX.fromstring(r.content)
     except (requests.RequestException, ETX.ParseError):
         return []
@@ -105,9 +102,26 @@ def rss_news(symbol: str) -> list[dict]:
         except (TypeError, ValueError):
             ts = None
         if title:
-            out.append({"title": title, "ts": ts, "url": it.findtext("link"), "src": "Yahoo RSS"})
+            out.append({"title": title, "ts": ts, "url": it.findtext("link"), "src": src})
     out.sort(key=lambda x: x["ts"] or 0, reverse=True)
     return out[:10]
+
+
+def rss_news(symbol: str, name: str | None = None) -> list[dict]:
+    """Titulares sin crumb: RSS de Yahoo y, si Yahoo bloquea la IP (429), Google News filtrado por ticker o nombre."""
+    items = _rss("https://feeds.finance.yahoo.com/rss/2.0/headline",
+                 {"s": symbol, "region": "US", "lang": "en-US"}, "Yahoo RSS")
+    if items:
+        return items
+    items = _rss("https://news.google.com/rss/search",
+                 {"q": f"{symbol} stock when:2d", "hl": "en-US", "gl": "US", "ceid": "US:en"}, "Google News")
+    word = next((w for w in re.split(r"\W+", name or "") if len(w) >= 4), None)
+    keep = []
+    for x in items:
+        t = x["title"]
+        if re.search(rf"\b{re.escape(symbol)}\b", t) or (word and word.lower() in t.lower()):
+            keep.append(x)
+    return keep
 
 
 class TTLCache:
@@ -140,6 +154,8 @@ class Radar:
         self.trades: dict[str, dict] = {}
         self.sent: set[str] = set()
         self.snapshot: dict = {"status": "iniciando", "rows": []}
+        self.last_bars: dict = {}
+        self.replay_state: dict = {"status": "sin correr"}
         self.errors: list[str] = []
         self._load()
 
@@ -286,10 +302,10 @@ class Radar:
             self.prev[s] = float(d["Close"].iloc[-1]) if d is not None and not d.empty else None
 
     # ---------------- enriquecimiento con caché ----------------
-    def news_ctx(self, s, now_ts):
+    def news_ctx(self, s, now_ts, name=None):
         c = self.cache.get(("news", s), 600)
         if c is None:
-            c = self.cache.put(("news", s), classify(yahoo.news(s, count=10) or rss_news(s), now_ts))
+            c = self.cache.put(("news", s), classify(yahoo.news(s, count=10) or rss_news(s, name), now_ts))
         return c
 
     def sec_ctx(self, s, today):
@@ -329,6 +345,7 @@ class Radar:
         self.ensure_context(syms, today)
         bars = yahoo.history(syms, period="1d", interval="1m", prepost=True)
         quotes = self.quotes(syms)
+        self.last_bars = bars
 
         def mets(s):
             q = quotes.get(s, {})
@@ -358,10 +375,11 @@ class Radar:
         for i, s in enumerate(order[:ENRICH_N]):
             m, ctx, _ = base[s]
             try:
-                cat = self.news_ctx(s, now_ts)
+                cat = self.news_ctx(s, now_ts, ctx.get("name"))
                 if cat.get("type"):
                     ctx["cat"] = {k: cat.get(k) for k in ("type", "age", "title", "url", "hours")}
                 ctx["offer"] = cat.get("offer")
+                ctx["news_ok"] = cat.get("n", 0) > 0
                 f = self.sec_ctx(s, today)
                 ctx["offer30"], ctx["shelf"] = f.get("offer30"), f.get("shelf36m")
                 if i < 10 and (m.get("px") or 0) >= 3:
@@ -457,6 +475,83 @@ class Radar:
         path = os.path.join(STATE_DIR, f"log-{day}.json")
         if not os.path.exists(path):
             write_json(path, list(self.trades.values()))
+
+    # ---------------- replay: la sesión de hoy minuto a minuto con las reglas actuales ----------------
+    def replay(self, step: int = 10) -> dict:
+        from datetime import datetime as _dt
+        bars, day = dict(self.last_bars), self.day
+        if not bars or not day:
+            return {"status": "sin datos todavía"}
+        now_et = _dt.now(timezone.utc).astimezone(ET)
+        now_m = now_et.hour * 60 + now_et.minute if now_et.date() == day else 16 * 60
+        et = {s: to_et(df) for s, df in bars.items()}
+        news = {k[1]: v for k, v in self.cache.d.items() if k[0] == "news"}
+
+        def cut(s, m):
+            d = et.get(s)
+            return None if d is None or d.empty else d[(d["day"] == day) & (d["m"] <= m)]
+
+        trades, taken = [], set()
+        for m in range(OPEN_M + 15, min(LAST_ENTRY_M, now_m), step):
+            t = _dt(day.year, day.month, day.day, m // 60, m % 60, tzinfo=ET)
+            spy = session_metrics(cut("SPY", m), self.prev.get("SPY"), self.baseline.get("SPY"), t)
+            qqq = session_metrics(cut("QQQ", m), self.prev.get("QQQ"), self.baseline.get("QQQ"), t)
+            reg, _ = regime(spy, qqq)
+            for s in self.universe:
+                if s in taken or s not in et:
+                    continue
+                mm = session_metrics(cut(s, m), self.prev.get(s), self.baseline.get(s), t)
+                ctx = {"phase": "open", "regime": reg, "spy_chg": spy.get("chg"), "atr": self.atr.get(s)}
+                nv = news.get(s)
+                if nv:
+                    fetched, cat = nv
+                    ctx["news_ok"] = cat.get("n", 0) > 0
+                    if cat.get("type") and fetched - 3600 * (cat.get("hours") or 0) <= t.timestamp():
+                        ctx["cat"] = {"type": cat["type"], "age": cat.get("age")}
+                    ctx["offer"] = cat.get("offer")
+                r = decide(s, mm, ctx)
+                if r["decision"] == "COMPRA":
+                    taken.add(s)
+                    p = r["plan"]
+                    trades.append({"t": s, "time": t.strftime("%H:%M"), "m": m, "entry": p["entry"], "stop": p["stop"],
+                                   "t1": p["t1"], "t2": p["t2"], "score": r["score"], "why": r["why"]})
+        for tr in trades:
+            d = et[tr["t"]]
+            after = d[(d["day"] == day) & (d["m"] > tr["m"]) & (d["m"] < 16 * 60)]
+            res, mfe, mae = "abierta", 0.0, 0.0
+            for _, b in after.iterrows():
+                hi, lo = float(b["High"]), float(b["Low"])
+                mfe = max(mfe, 100 * (hi / tr["entry"] - 1))
+                mae = min(mae, 100 * (lo / tr["entry"] - 1))
+                if res == "abierta" and lo <= tr["stop"]:
+                    res = "stop"
+                    break
+                if res == "abierta" and hi >= tr["t1"]:
+                    res = "+2%"
+                if res == "+2%" and hi >= tr["t2"]:
+                    res = "+5%"
+                    break
+            last = float(after["Close"].iloc[-1]) if not after.empty else tr["entry"]
+            tr.update(result=res, mfe=round(mfe, 2), mae=round(mae, 2), last=round(100 * (last / tr["entry"] - 1), 2))
+        n = len(trades)
+        summ = {"n": n, "t1": sum(1 for x in trades if x["result"] in ("+2%", "+5%")),
+                "t2": sum(1 for x in trades if x["result"] == "+5%"), "stop": sum(1 for x in trades if x["result"] == "stop"),
+                "abiertas": sum(1 for x in trades if x["result"] == "abierta")}
+        return {"status": "ok", "day": day.isoformat(), "hasta": f"{min(now_m, LAST_ENTRY_M) // 60}:{min(now_m, LAST_ENTRY_M) % 60:02d}",
+                "paso_min": step, "universo": len(self.universe), "resumen": summ, "trades": trades}
+
+    def replay_async(self, step: int = 10) -> dict:
+        if self.replay_state.get("status") == "corriendo":
+            return self.replay_state
+        self.replay_state = {"status": "corriendo", "desde": datetime.now(timezone.utc).isoformat()}
+
+        def go():
+            try:
+                self.replay_state = self.replay(step)
+            except Exception as e:  # noqa: BLE001
+                self.replay_state = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        threading.Thread(target=go, daemon=True).start()
+        return self.replay_state
 
     # ---------------- bucle ----------------
     def run_forever(self):

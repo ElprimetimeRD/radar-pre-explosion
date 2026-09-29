@@ -1,6 +1,7 @@
 """Servicio web (Render): página del semáforo + API. El bucle corre en un hilo al arrancar."""
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -35,9 +36,26 @@ def page():
         return f.read()
 
 
+def clean(o):
+    """NaN/inf → None (JSON estricto no los acepta y la API respondía 500)."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [clean(v) for v in o]
+    return o
+
+
 @app.get("/api/signals")
 def signals():
-    return JSONResponse(radar.snapshot, headers={"Cache-Control": "no-store"})
+    return JSONResponse(clean(radar.snapshot), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/replay")
+def replay(step: int = 10):
+    """Reproduce la sesión de hoy con las reglas actuales (corre en segundo plano; vuelve a consultar)."""
+    return JSONResponse(clean(radar.replay_async(max(5, min(step, 30)))), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")
@@ -61,4 +79,5 @@ def news_check(t: str):
     except requests.RequestException as e:
         out["rss_error"] = str(e)[:160]
     out["rss_items"] = [x["title"] for x in rss_news(t.upper())[:3]]
+    out["google_items"] = [x["title"] for x in rss_news(t.upper(), t.upper())[:3]] if not out["rss_items"] else []
     return out

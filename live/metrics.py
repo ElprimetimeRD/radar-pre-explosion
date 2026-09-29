@@ -15,8 +15,8 @@ OPEN_M, CLOSE_M = 570, 960
 SESSION_LEN = CLOSE_M - OPEN_M  # 390
 
 # Parámetros de ballena (vela de 1 min anómala)
-WHALE_K = 5.0            # volumen ≥ K × mediana de los 30 minutos previos
-WHALE_MIN_USD = 150_000  # y al menos este monto en dólares en ese minuto
+WHALE_K = 3.0            # volumen ≥ K × mediana de los 30 minutos previos
+WHALE_MIN_USD = 100_000  # y al menos este monto en dólares en ese minuto
 WHALE_WINDOW = 15        # minutos hacia atrás que cuentan como "reciente"
 OR_MINUTES = 15          # rango de apertura (9:30–9:45)
 

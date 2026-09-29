@@ -18,7 +18,7 @@ CHG15_PARABOLIC = 15.0     # % en 15 minutos: no perseguir
 RISK_MAX = 2.5             # % máximo entre entrada y stop
 RISK_MIN = 0.7             # stop nunca más cerca que esto (ruido)
 MIN_ATR = 2.0              # % rango diario típico; debajo difícilmente da +2 %
-BUY_MIN = 60               # fuerza mínima para COMPRA (70 con mercado amarillo)
+BUY_MIN = 60               # fuerza mínima para COMPRA (65 con mercado amarillo)
 LAST_ENTRY_M = 15 * 60 + 30  # 15:30 ET: sin entradas nuevas
 T1, T2 = 2.0, 5.0          # objetivos %
 
@@ -34,15 +34,19 @@ def _clip(x, a, b):
 
 
 def strength(m: dict, ctx: dict) -> tuple[int, list[str]]:
-    """Fuerza 0–100 y lo que la explica."""
-    pts, why = 0.0, []
+    """Fuerza 0–100 sobre la evidencia DISPONIBLE: una fuente sin datos (noticias bloqueadas, sin opciones)
+    no cuenta en el máximo. Ballena y calls inusuales son bonos: suman, pero su ausencia no resta."""
+    pts, avail, why = 0.0, 0.0, []
     rv = m.get("rvol")
-    if rv:
+    if rv is not None:
+        avail += 25
         p = 0 if rv < 1 else 10 if rv < 2 else 10 + 10 * min(rv - 2, 3) / 3 if rv < 5 else 20 + min(rv - 5, 5)
         pts += p
         if rv >= 2:
             why.append(f"RVOL {rv:.1f}×")
     cat = ctx.get("cat") or {}
+    if ctx.get("news_ok") or cat.get("type"):
+        avail += 20
     if cat.get("type") and cat.get("age") in ("fresh", "d1"):
         p = CAT_PTS.get(cat["type"], 0)
         pts += p
@@ -55,6 +59,7 @@ def strength(m: dict, ctx: dict) -> tuple[int, list[str]]:
         why.append(f"ballena compradora ×{w['buy']}")
     px, vwap = m.get("px"), m.get("vwap")
     if px and vwap:
+        avail += 20
         if px > vwap:
             pts += 5
         if m.get("or_done") and px > m.get("orh", 1e18):
@@ -69,14 +74,17 @@ def strength(m: dict, ctx: dict) -> tuple[int, list[str]]:
         pts += _clip((cvo - 0.3) * 10, 0, 10)
         if cvo >= 1:
             why.append(f"calls inusuales {cvo:.1f}× OI")
-    rs = (m.get("chg") or 0) - (ctx.get("spy_chg") or 0)
-    pts += _clip(rs / 2, 0, 10)
+    if m.get("chg") is not None:
+        avail += 10
+        rs = m["chg"] - (ctx.get("spy_chg") or 0)
+        pts += _clip(rs / 2, 0, 10)
+    score = 100 * pts / avail if avail else 0
     if ctx.get("shelf"):
-        pts -= 5
+        score -= 5
     sp = ctx.get("spread")
     if sp and sp > 0.4:
-        pts -= 5
-    return int(round(_clip(pts, 0, 100))), why
+        score -= 5
+    return int(round(_clip(score, 0, 100))), why
 
 
 def _plan(entry: float, stop: float) -> dict:
@@ -171,7 +179,7 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     risk = 100 * (px / stop - 1)
     if risk > RISK_MAX:
         return res("ESPERA", f"stop lejos ({risk:.1f}%)", f"espera retroceso cerca de {px * (1 - (risk - RISK_MAX) / 100):.2f}")
-    need = BUY_MIN + (10 if reg == "amarillo" else 0)
+    need = BUY_MIN + (5 if reg == "amarillo" else 0)
     if score < need:
         return res("ESPERA", f"fuerza {score} < {need}", "falta confirmación: volumen, noticia o ballena")
     return res("COMPRA", "en juego, sobre VWAP y rompiendo con impulso", None, _plan(px, stop))
@@ -184,6 +192,6 @@ def regime(spy: dict, qqq: dict) -> tuple[str, str]:
     s_chg, q_chg = spy.get("chg") or 0, qqq.get("chg") or 0
     if (weak(spy) and weak(qqq)) and min(s_chg, q_chg) <= -0.8:
         return "rojo", f"SPY {s_chg:+.1f}% y QQQ {q_chg:+.1f}% bajo VWAP"
-    if weak(spy) or weak(qqq) or min(s_chg, q_chg) <= -0.5:
+    if (weak(spy) and weak(qqq)) or min(s_chg, q_chg) <= -0.5:
         return "amarillo", f"SPY {s_chg:+.1f}% · QQQ {q_chg:+.1f}%"
     return "verde", f"SPY {s_chg:+.1f}% · QQQ {q_chg:+.1f}%"
