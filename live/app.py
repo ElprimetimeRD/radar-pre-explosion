@@ -53,9 +53,9 @@ def signals():
 
 
 @app.get("/api/replay")
-def replay(step: int = 10):
-    """Reproduce la sesión de hoy con las reglas actuales (corre en segundo plano; vuelve a consultar)."""
-    return JSONResponse(clean(radar.replay_async(max(5, min(step, 30)))), headers={"Cache-Control": "no-store"})
+def replay(step: int = 10, fresh: int = 0):
+    """Reproduce la sesión de hoy con las reglas actuales (en segundo plano). Guarda el último resultado; ?fresh=1 lo recalcula."""
+    return JSONResponse(clean(radar.replay_async(max(5, min(step, 30)), bool(fresh))), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")

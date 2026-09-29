@@ -540,9 +540,10 @@ class Radar:
         return {"status": "ok", "day": day.isoformat(), "hasta": f"{min(now_m, LAST_ENTRY_M) // 60}:{min(now_m, LAST_ENTRY_M) % 60:02d}",
                 "paso_min": step, "universo": len(self.universe), "resumen": summ, "trades": trades}
 
-    def replay_async(self, step: int = 10) -> dict:
-        if self.replay_state.get("status") == "corriendo":
-            return self.replay_state
+    def replay_async(self, step: int = 10, fresh: bool = False) -> dict:
+        st = self.replay_state
+        if st.get("status") == "corriendo" or (st.get("status") == "ok" and not fresh):
+            return st
         self.replay_state = {"status": "corriendo", "desde": datetime.now(timezone.utc).isoformat()}
 
         def go():
