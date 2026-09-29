@@ -58,6 +58,14 @@ def replay(step: int = 10, fresh: int = 0):
     return JSONResponse(clean(radar.replay_async(max(5, min(step, 30)), bool(fresh))), headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/trades")
+def trades():
+    """Señales del día (las guarda GitHub Actions en data/live/ para que sobrevivan a los redeploys)."""
+    day = radar.day.isoformat() if radar.day else None
+    return JSONResponse(clean({"day": day, "trades": list(radar.trades.values()), "stats": radar.stats()}),
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.get("/health")
 def health():
     ts = radar.snapshot.get("ts")

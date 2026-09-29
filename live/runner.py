@@ -19,7 +19,7 @@ from scanner.sources import other, yahoo
 from scanner.util import DATA, ET, fnum, log, read_json, write_json
 
 from . import halts as halts_src
-from .decide import CAT_NAME, LAST_ENTRY_M, decide, regime
+from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, decide, regime
 from .metrics import OPEN_M, atr_pct, baseline_curve, session_metrics, to_et
 
 UNIVERSE_N = int(os.environ.get("UNIVERSE_N", "50"))
@@ -124,6 +124,56 @@ def rss_news(symbol: str, name: str | None = None) -> list[dict]:
     return keep
 
 
+def advance(tr: dict, bars) -> list[str]:
+    """Avanza una señal con velas nuevas (DataFrame con m, High, Low). Devuelve eventos:
+    fill, expired, stop, t1, t2, be. Estados: pendiente → abierta → t1 → t2 | t1-cerrada | stop | no ejecutada."""
+    ev = []
+    for _, b in bars.iterrows():
+        hi, lo, m = float(b["High"]), float(b["Low"]), int(b["m"])
+        if tr["status"] == "pendiente":
+            if m > tr.get("valid_m", 10**9):
+                tr["status"] = "no ejecutada"
+                ev.append("expired")
+                break
+            if lo > tr["entry"]:
+                continue
+            tr["status"], tr["fill_m"] = "abierta", m
+            ev.append("fill")
+        if tr["status"] not in ("abierta", "t1"):
+            break
+        tr["mfe"] = max(tr["mfe"], round(100 * (hi / tr["entry"] - 1), 2))
+        tr["mae"] = min(tr["mae"], round(100 * (lo / tr["entry"] - 1), 2))
+        if not tr["hit1"] and lo <= tr["stop"]:
+            tr["status"] = "stop"
+            ev.append("stop")
+            break
+        just_hit = False
+        if not tr["hit1"] and hi >= tr["t1"]:
+            tr["hit1"], tr["status"], just_hit = True, "t1", True
+            ev.append("t1")
+        if tr["hit1"] and hi >= tr["t2"]:
+            tr["status"] = "t2"
+            ev.append("t2")
+            break
+        if tr["hit1"] and lo <= tr["entry"] and not just_hit:
+            tr["status"] = "t1-cerrada"
+            ev.append("be")
+            break
+    return ev
+
+
+def new_trade(r: dict, day: str, t_str: str, m: int) -> dict:
+    p = r["plan"]
+    lim = bool(p.get("limit"))
+    return {"t": r["t"], "day": day, "time": t_str, "m": m, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"],
+            "t2": p["t2"], "risk": p.get("risk"), "score": r["score"], "limit": lim,
+            "valid_m": m + (p.get("valid_min") or 10) if lim else None,
+            "status": "pendiente" if lim else "abierta", "hit1": False, "mfe": 0.0, "mae": 0.0, "last": p["entry"]}
+
+
+LOG_BASE = os.environ.get("LOG_BASE", "https://raw.githubusercontent.com/ElprimetimeRD/radar-pre-explosion/main/data/live")
+
+
 class TTLCache:
     def __init__(self):
         self.d: dict = {}
@@ -169,6 +219,20 @@ class Radar:
         if s.get("day") == today:
             self.trades = s.get("trades", {})
             self.sent = set(s.get("sent", []))
+            return
+        # Contenedor nuevo (redeploy): recuperar las señales del día guardadas por GitHub Actions
+        try:
+            r = requests.get(f"{LOG_BASE}/{today}.json", timeout=10)
+            if r.ok:
+                for tr in (r.json().get("trades") or []):
+                    self.trades[tr["t"]] = tr
+                    self.sent.add(f"buy:{tr['t']}")
+                    for ev, st in (("t1", "t1"), ("t2", "t2"), ("stop", "stop")):
+                        if tr.get("hit1") and ev == "t1" or tr.get("status") == st:
+                            self.sent.add(f"{ev}:{tr['t']}")
+                log.info("recuperadas %d señales de hoy desde el registro", len(self.trades))
+        except (requests.RequestException, ValueError, KeyError) as e:
+            log.warning("no pude leer el registro del día: %s", e)
 
     def _save(self):
         day = datetime.now(timezone.utc).astimezone(ET).date().isoformat()
@@ -410,47 +474,37 @@ class Radar:
         for r in rows:
             if r["decision"] != "COMPRA" or r["t"] in self.trades:
                 continue
-            p = r["plan"]
-            self.trades[r["t"]] = {"t": r["t"], "day": day, "time": t_et.strftime("%H:%M"), "m": now_m,
-                                   "entry": p["entry"], "stop": p["stop"], "t1": p["t1"], "t2": p["t2"],
-                                   "score": r["score"], "status": "abierta", "hit1": False, "mfe": 0.0, "mae": 0.0,
-                                   "last": p["entry"]}
+            tr = self.trades[r["t"]] = new_trade(r, day, t_et.strftime("%H:%M"), now_m)
             why = ", ".join(r["why"][:3])
+            if tr["limit"]:
+                vm = tr["valid_m"]
+                how = f"orden LÍMITE {tr['entry']:.2f} válida hasta {vm // 60}:{vm % 60:02d} ET (no persigas {r['px']:.2f})"
+            else:
+                how = f"a {tr['entry']:.2f}, no pagues más de {tr['entry'] * 1.003:.2f}"
             self.tg(f"buy:{r['t']}", (
-                f"🟢 COMPRA {r['t']} a {p['entry']:.2f}\nFuerza {r['score']}/100 · {why}\n"
-                f"Stop {p['stop']:.2f} (−{p['risk']:.1f}%) · +2%: {p['t1']:.2f} · +5%: {p['t2']:.2f}\n"
-                f"No pagues más de {p['entry'] * 1.003:.2f}. Mercado: {reg_txt}"))
+                f"🟢 COMPRA {r['t']} {how}\nFuerza {r['score']}/100 · {why}\n"
+                f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}"))
         for s, tr in self.trades.items():
-            if tr["status"] not in ("abierta", "t1"):
+            if tr["status"] not in ("pendiente", "abierta", "t1"):
                 continue
             d = to_et(bars.get(s))
             if d.empty:
                 continue
             after = d[(d["day"] == t_et.date()) & (d["m"] > tr["m"]) & (d["m"] < 16 * 60)]
-            for _, b in after.iterrows():
-                hi, lo = float(b["High"]), float(b["Low"])
-                tr["mfe"] = max(tr["mfe"], round(100 * (hi / tr["entry"] - 1), 2))
-                tr["mae"] = min(tr["mae"], round(100 * (lo / tr["entry"] - 1), 2))
-                if not tr["hit1"] and lo <= tr["stop"]:
-                    tr["status"] = "stop"
-                    self.tg(f"stop:{s}", f"🛑 {s} perdió el stop {tr['stop']:.2f}. Sal.")
-                    break
-                if not tr["hit1"] and hi >= tr["t1"]:
-                    tr["hit1"], tr["status"] = True, "t1"
-                    self.tg(f"t1:{s}", f"✅ {s} tocó +2% ({tr['t1']:.2f}). Asegura: sube el stop a la entrada {tr['entry']:.2f}.")
-                if tr["hit1"] and hi >= tr["t2"]:
-                    tr["status"] = "t2"
-                    self.tg(f"t2:{s}", f"🎯 {s} tocó +5% ({tr['t2']:.2f}). Objetivo cumplido.")
-                    break
-                if tr["hit1"] and lo <= tr["entry"]:
-                    tr["status"] = "t1"  # volvió a la entrada después de +2 %: se cierra en empate
-                    tr["closed_be"] = True
-                    break
+            for ev in advance(tr, after):
+                msg = {"fill": f"📥 {s}: se llenó la límite a {tr['entry']:.2f}. Pon el stop en {tr['stop']:.2f}.",
+                       "expired": f"⌛ {s}: la límite {tr['entry']:.2f} no se llenó en {LIMIT_MIN} min. Cancelada, no persigas.",
+                       "stop": f"🛑 {s} perdió el stop {tr['stop']:.2f}. Sal.",
+                       "t1": f"✅ {s} tocó +2% ({tr['t1']:.2f}). Asegura: sube el stop a la entrada {tr['entry']:.2f}.",
+                       "t2": f"🎯 {s} tocó +5% ({tr['t2']:.2f}). Objetivo cumplido.",
+                       "be": None}.get(ev)
+                if msg:
+                    self.tg(f"{ev}:{s}", msg)
             if not after.empty:
                 tr["last"] = float(after["Close"].iloc[-1])
                 tr["m"] = int(after["m"].iloc[-1])
-            if tr.get("closed_be"):
-                tr["status"] = "t1-cerrada"
+            if tr["status"] == "pendiente" and now_m > (tr.get("valid_m") or 0):
+                tr["status"] = "no ejecutada"
         if now_m >= 15 * 60 + 50:
             open_ = [s for s, tr in self.trades.items() if tr["status"] in ("abierta", "t1")]
             if open_:
@@ -458,17 +512,18 @@ class Radar:
 
     def stats(self) -> dict:
         tr = list(self.trades.values())
-        n = len(tr)
-        return {"n": n, "t1": sum(1 for x in tr if x["hit1"]), "t2": sum(1 for x in tr if x["status"] == "t2"),
-                "stop": sum(1 for x in tr if x["status"] == "stop"),
-                "open": sum(1 for x in tr if x["status"] in ("abierta", "t1"))}
+        filled = [x for x in tr if x["status"] not in ("pendiente", "no ejecutada")]
+        return {"n": len(tr), "filled": len(filled), "t1": sum(1 for x in tr if x["hit1"]),
+                "t2": sum(1 for x in tr if x["status"] == "t2"), "stop": sum(1 for x in tr if x["status"] == "stop"),
+                "open": sum(1 for x in tr if x["status"] in ("abierta", "t1")),
+                "expired": sum(1 for x in tr if x["status"] == "no ejecutada")}
 
     def _eod(self, t_et):
         if t_et.weekday() >= 5 or t_et.hour < 16 or not self.trades:
             return
         day = t_et.date().isoformat()
         st = self.stats()
-        lines = [f"Resumen {day}: {st['n']} COMPRA · {st['t1']} tocaron +2% · {st['t2']} +5% · {st['stop']} stop"]
+        lines = [f"Resumen {day}: {st['n']} COMPRA · {st['filled']} ejecutadas · {st['t1']} tocaron +2% · {st['t2']} +5% · {st['stop']} stop"]
         for x in self.trades.values():
             lines.append(f"{x['t']} {x['time']} · máx {x['mfe']:+.1f}% · mín {x['mae']:+.1f}% · {x['status']}")
         self.tg(f"eod:{day}", "\n".join(lines))
@@ -492,7 +547,7 @@ class Radar:
             return None if d is None or d.empty else d[(d["day"] == day) & (d["m"] <= m)]
 
         trades, taken = [], set()
-        for m in range(OPEN_M + 15, min(LAST_ENTRY_M, now_m), step):
+        for m in range(OPEN_M + 15, min(ENTRY_END_M, now_m), step):
             t = _dt(day.year, day.month, day.day, m // 60, m % 60, tzinfo=ET)
             spy = session_metrics(cut("SPY", m), self.prev.get("SPY"), self.baseline.get("SPY"), t)
             qqq = session_metrics(cut("QQQ", m), self.prev.get("QQQ"), self.baseline.get("QQQ"), t)
@@ -512,31 +567,24 @@ class Radar:
                 r = decide(s, mm, ctx)
                 if r["decision"] == "COMPRA":
                     taken.add(s)
-                    p = r["plan"]
-                    trades.append({"t": s, "time": t.strftime("%H:%M"), "m": m, "entry": p["entry"], "stop": p["stop"],
-                                   "t1": p["t1"], "t2": p["t2"], "score": r["score"], "why": r["why"]})
+                    tr = new_trade(r, day.isoformat(), t.strftime("%H:%M"), m)
+                    tr["why"] = r["why"]
+                    trades.append(tr)
         for tr in trades:
             d = et[tr["t"]]
             after = d[(d["day"] == day) & (d["m"] > tr["m"]) & (d["m"] < 16 * 60)]
-            res, mfe, mae = "abierta", 0.0, 0.0
-            for _, b in after.iterrows():
-                hi, lo = float(b["High"]), float(b["Low"])
-                mfe = max(mfe, 100 * (hi / tr["entry"] - 1))
-                mae = min(mae, 100 * (lo / tr["entry"] - 1))
-                if res == "abierta" and lo <= tr["stop"]:
-                    res = "stop"
-                    break
-                if res == "abierta" and hi >= tr["t1"]:
-                    res = "+2%"
-                if res == "+2%" and hi >= tr["t2"]:
-                    res = "+5%"
-                    break
+            advance(tr, after)
+            if tr["status"] == "pendiente":
+                tr["status"] = "no ejecutada"
             last = float(after["Close"].iloc[-1]) if not after.empty else tr["entry"]
-            tr.update(result=res, mfe=round(mfe, 2), mae=round(mae, 2), last=round(100 * (last / tr["entry"] - 1), 2))
+            tr["result"] = {"t2": "+5%", "t1": "+2%", "t1-cerrada": "+2%"}.get(tr["status"], tr["status"])
+            tr["last"] = round(100 * (last / tr["entry"] - 1), 2)
         n = len(trades)
-        summ = {"n": n, "t1": sum(1 for x in trades if x["result"] in ("+2%", "+5%")),
+        summ = {"n": n, "ejecutadas": sum(1 for x in trades if x["result"] != "no ejecutada"),
+                "t1": sum(1 for x in trades if x["result"] in ("+2%", "+5%")),
                 "t2": sum(1 for x in trades if x["result"] == "+5%"), "stop": sum(1 for x in trades if x["result"] == "stop"),
-                "abiertas": sum(1 for x in trades if x["result"] == "abierta")}
+                "abiertas": sum(1 for x in trades if x["result"] == "abierta"),
+                "no_ejecutadas": sum(1 for x in trades if x["result"] == "no ejecutada")}
         return {"status": "ok", "day": day.isoformat(), "hasta": f"{min(now_m, LAST_ENTRY_M) // 60}:{min(now_m, LAST_ENTRY_M) % 60:02d}",
                 "paso_min": step, "universo": len(self.universe), "resumen": summ, "trades": trades}
 

@@ -5,6 +5,8 @@ Todos los umbrales están aquí arriba para ajustarlos con los resultados reales
 """
 from __future__ import annotations
 
+import os
+
 from .metrics import OPEN_M, OR_MINUTES
 
 # ---------- Umbrales ----------
@@ -19,7 +21,10 @@ RISK_MAX = 2.5             # % máximo entre entrada y stop
 RISK_MIN = 0.7             # stop nunca más cerca que esto (ruido)
 MIN_ATR = 2.0              # % rango diario típico; debajo difícilmente da +2 %
 BUY_MIN = 60               # fuerza mínima para COMPRA (65 con mercado amarillo)
-LAST_ENTRY_M = 15 * 60 + 30  # 15:30 ET: sin entradas nuevas
+LAST_ENTRY_M = 15 * 60 + 30  # 15:30 ET: fin de la fase de seguimiento
+ENTRY_END_M = int(os.environ.get("ENTRY_END_M", str(12 * 60)))  # 12:00 ET: sin COMPRA nuevas después
+CHASE_MAX = 0.5            # % sobre el nivel roto: más que esto = orden límite en el retesteo
+LIMIT_VALID_MIN = 10       # minutos que vale la orden límite
 T1, T2 = 2.0, 5.0          # objetivos %
 
 CAT_PTS = {"fda": 20, "mna": 20, "contract": 18, "earnings": 18, "halt_news": 15, "index": 12,
@@ -138,6 +143,8 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     now_m = m.get("now_m", 0)
     if now_m >= LAST_ENTRY_M or phase == "late":
         return res("NO", "después de 15:30: sin tiempo para +2 %")
+    if now_m >= ENTRY_END_M:
+        return res("NO", f"después de las {ENTRY_END_M // 60}:{ENTRY_END_M % 60:02d}: sin entradas nuevas (las rupturas de la tarde fallan más)")
 
     # ---- 2. ¿Está en juego? ----
     rv = m.get("rvol")
@@ -174,15 +181,25 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     impulse = m.get("higher_lows") or w.get("buy", 0) > 0 or (m.get("accel") or 0) >= 2
     if not impulse:
         return res("ESPERA", "sin impulso ahora", f"compra si hace nuevo máximo sobre {m.get('hod', px):.2f} con volumen")
+    # Entrada: no perseguir. Si el precio ya se alejó del nivel roto, orden límite en el retesteo.
+    level = max(m.get("breakout") or orh or px, vwap)
+    limit = px > level * (1 + CHASE_MAX / 100)
+    entry = level * 1.002 if limit else px
     stop = max(vwap, m.get("swing_low") or 0) * 0.999
-    stop = min(stop, px * (1 - RISK_MIN / 100))
-    risk = 100 * (px / stop - 1)
+    stop = min(stop, entry * (1 - RISK_MIN / 100))
+    risk = 100 * (entry / stop - 1)
     if risk > RISK_MAX:
-        return res("ESPERA", f"stop lejos ({risk:.1f}%)", f"espera retroceso cerca de {px * (1 - (risk - RISK_MAX) / 100):.2f}")
+        return res("ESPERA", f"stop lejos ({risk:.1f}%)", f"espera retroceso cerca de {entry * (1 - (risk - RISK_MAX) / 100):.2f}")
     need = BUY_MIN + (5 if reg == "amarillo" else 0)
     if score < need:
         return res("ESPERA", f"fuerza {score} < {need}", "falta confirmación: volumen, noticia o ballena")
-    return res("COMPRA", "en juego, sobre VWAP y rompiendo con impulso", None, _plan(px, stop))
+    plan = _plan(entry, stop)
+    plan["limit"] = limit
+    plan["valid_min"] = LIMIT_VALID_MIN
+    if limit:
+        return res("COMPRA", f"ruptura de {level:.2f} con impulso: compra en el retesteo, no persigas {px:.2f}",
+                   f"orden límite {entry:.2f} por {LIMIT_VALID_MIN} min; si no llena, se cancela", plan)
+    return res("COMPRA", "en juego, sobre VWAP y rompiendo con impulso", None, plan)
 
 
 def regime(spy: dict, qqq: dict) -> tuple[str, str]:

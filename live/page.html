@@ -62,6 +62,8 @@ small,.foot{color:var(--mute);font-size:12px}
 <h2>Hoy</h2>
 <div class="stats" id="stats"></div>
 <div id="trades"></div>
+<h2>Acumulado</h2>
+<div id="hist" class="foot">Cargando historial…</div>
 <p class="foot" id="foot"></p>
 <p class="foot">Datos de Yahoo con 1–2 min de retraso; confirma en tu bróker antes de entrar. Stop siempre puesto. Herramienta personal, no es asesoría financiera.</p>
 </main>
@@ -72,7 +74,7 @@ const pc=x=>x==null?'—':`<span class="${x>=0?'up':'down'}">${x>=0?'+':''}${x.t
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const LBL={COMPRA:'COMPRA',ESPERA:'ESPERA',NO:'NO COMPRES'};
 const PH={pre:'Pre-market',open:'Sesión',late:'Última media hora',closed:'Cerrado'};
-function plan(p){if(!p)return'';return`<div class="plan"><div><span>Entrada ≤</span><b>${f2(p.entry*1.003)}</b></div><div><span>Stop (−${f2(p.risk)}%)</span><b>${f2(p.stop)}</b></div><div><span>+2 %</span><b>${f2(p.t1)}</b></div><div><span>+5 %</span><b>${f2(p.t2)}</b></div></div>`}
+function plan(p){if(!p)return'';return`<div class="plan"><div><span>${p.limit?'Límite ('+(p.valid_min||10)+' min)':'Entrada ≤'}</span><b>${f2(p.limit?p.entry:p.entry*1.003)}</b></div><div><span>Stop (−${f2(p.risk)}%)</span><b>${f2(p.stop)}</b></div><div><span>+2 %</span><b>${f2(p.t1)}</b></div><div><span>+5 %</span><b>${f2(p.t2)}</b></div></div>`}
 function meta(r){const w=r.whale||{};const b=[];
  if(r.rvol!=null)b.push(`RVOL ${r.rvol.toFixed(1)}×`);if(r.ext!=null)b.push(`VWAP ${r.ext>=0?'+':''}${r.ext.toFixed(1)}%`);
  if(r.atr!=null)b.push(`rango diario ${r.atr.toFixed(1)}%`);if(r.spread!=null)b.push(`spread ${r.spread.toFixed(2)}%`);
@@ -90,14 +92,16 @@ function render(){if(!D)return;const rows=D.rows||[];
   :`<div class="lbl">Mejor opción ahora</div><div class="big"><span class="dec NO">NO COMPRES</span><span>Nada cumple ahora. No operar también es una decisión.</span></div>`;
  const L=rows.filter(r=>r.decision===F);
  $('#list').innerHTML=L.length?L.map(card).join(''):`<p class="foot">Nada en esta lista ahora.</p>`;
- const s=D.stats||{};$('#stats').innerHTML=`<div><b>${s.n||0}</b><small>señales</small></div><div><b>${s.t1||0}</b><small>tocaron +2 %</small></div><div><b>${s.t2||0}</b><small>tocaron +5 %</small></div><div><b>${s.stop||0}</b><small>stop</small></div>`;
+ const s=D.stats||{};$('#stats').innerHTML=`<div><b>${s.filled??s.n??0}<small style="font-size:12px">/${s.n||0}</small></b><small>ejecutadas</small></div><div><b>${s.t1||0}</b><small>tocaron +2 %</small></div><div><b>${s.t2||0}</b><small>tocaron +5 %</small></div><div><b>${s.stop||0}</b><small>stop</small></div>`;
  $('#trades').innerHTML=(D.trades||[]).map(t=>`<div class="meta"><span><b>${esc(t.t)}</b> ${t.time}</span><span>entrada ${f2(t.entry)}</span><span>máx ${pc(t.mfe)}</span><span>mín ${pc(t.mae)}</span><span>${esc(t.status)}</span></div>`).join('');
  $('#foot').innerHTML=`${D.universe||0} acciones en seguimiento · actualizado ${D.ts?new Date(D.ts).toLocaleTimeString():'—'}${(D.errors||[]).length?`<div class="err">${esc(D.errors.slice(-1)[0])}</div>`:''}`}
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{F=b.dataset.f;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));render()});
 async function load(){try{const r=await fetch('/api/signals',{cache:'no-store'});D=await r.json();
  if(F==='COMPRA'&&!(D.counts||{}).COMPRA&&(D.counts||{}).ESPERA){F='ESPERA';document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.f===F))}
  render()}catch(e){$('#foot').textContent='Sin conexión con el servidor; reintentando…'}}
-load();setInterval(load,20000);
+async function hist(){try{const r=await fetch('https://raw.githubusercontent.com/ElprimetimeRD/radar-pre-explosion/main/data/live/summary.json?'+Date.now());const h=await r.json();const t=h.total||{};const pct=t.filled?Math.round(100*t.t1/t.filled):0;
+ $('#hist').innerHTML=`<b>${h.days||0}</b> días · <b>${t.filled||0}</b> ejecutadas de ${t.n||0} señales · <b>${pct}%</b> tocaron +2 % · ${t.t2||0} llegaron a +5 % · ${t.stop||0} stops<br><small>Meta para subir tamaño: ≥ 50 % tocando +2 % con al menos 40 ejecutadas.</small>`}catch(e){$('#hist').textContent='Sin historial todavía (se guarda al cerrar cada sesión).'}}
+load();hist();setInterval(load,20000);
 </script>
 </body>
 </html>

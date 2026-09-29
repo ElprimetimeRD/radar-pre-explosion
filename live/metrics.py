@@ -127,6 +127,9 @@ def session_metrics(bars: pd.DataFrame, prev_close: float | None, baseline: list
     out["or_done"] = now_m >= OPEN_M + OR_MINUTES
     out["hod"], out["lod"] = float(reg["High"].max()), float(reg["Low"].min())
     out["dist_hod"] = round(100 * (out["hod"] / px - 1), 2)
+    # Nivel que se está rompiendo: el mayor entre el máximo de apertura y el máximo previo a los últimos 15 min
+    older = reg[reg["m"] < now_m - 15]
+    out["breakout"] = max(out["orh"], float(older["High"].max()) if not older.empty else out["orh"])
     out["usd_vol"] = float((reg["Close"] * vol).sum())
     elapsed = int(min(max(reg["m"].iloc[-1] - OPEN_M, 0), SESSION_LEN - 1))
     if baseline and baseline[elapsed] > 0:
