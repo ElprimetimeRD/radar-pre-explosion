@@ -226,7 +226,7 @@ class Radar:
         if phase == "pre":
             pmr = self.premarket_rank(sorted(cand))
             for s, (chg, usd) in pmr.items():
-                if usd >= 50_000:
+                if chg >= 2 or usd >= 50_000:  # Yahoo a veces reporta volumen 0 en pre-market
                     ranked.append((max(chg, 0) / 2 + math.log1p(usd / 1e5), s))
             quotes = {}
         for s, q in quotes.items():

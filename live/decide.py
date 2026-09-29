@@ -120,7 +120,8 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
         return res("NO", "mercado cerrado")
     if phase == "pre":
         gap = m.get("chg")
-        if gap is not None and gap >= 4 and (m.get("pm_vol") or 0) * px >= 500_000:
+        pmv = m.get("pm_vol") or 0  # Yahoo a veces reporta 0 en pre-market: no lo exijo
+        if gap is not None and gap >= 4 and (pmv == 0 or pmv * px >= 500_000):
             return res("ESPERA", f"gap pre-market {gap:+.1f}%", "se evalúa desde las 9:45 con el rango de apertura")
         return res("NO", "pre-market sin gap relevante")
     if h:
