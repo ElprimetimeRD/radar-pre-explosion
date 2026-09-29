@@ -349,7 +349,7 @@ class Radar:
         for r in rows:
             r["src"] = self.sources.get(r["t"], [])
         rank = {"COMPRA": 0, "ESPERA": 1, "NO": 2}
-        rows.sort(key=lambda r: (rank[r["decision"]], -r["score"]))
+        rows.sort(key=lambda r: (rank[r["decision"]], -((r["chg"] or 0) if phase == "pre" else r["score"])))
         self._track(rows, bars, t_et, reg_txt)
         best = next((r for r in rows if r["decision"] == "COMPRA"), None) or next((r for r in rows if r["decision"] == "ESPERA"), None)
         self.snapshot = {
