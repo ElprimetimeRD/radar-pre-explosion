@@ -400,7 +400,8 @@ class Radar:
                 self.trades, self.sent = {}, set()
         if phase == "closed":
             self._eod(t_et)
-            self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat()}
+            self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat(),
+                             "trades": list(self.trades.values()), "stats": self.stats()}
             return
         halted = halts_src.parse(halts_src.fetch(), now)
         if not self.universe or time.time() - self.universe_ts > UNIVERSE_TTL:
