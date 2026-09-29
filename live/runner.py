@@ -28,7 +28,7 @@ UNIVERSE_TTL = 600
 ENRICH_N = 20
 STATE_DIR = os.path.join(DATA, "live")
 DEFAULT_WATCH = ["MU", "SNDK", "MRVL", "ARM", "BE", "AXTI", "NVDA", "AMD", "SNXX", "MUU"]
-EARN_RX = r"(earnings|quarterly results|Q[1-4] (results|revenue)|beats?|tops? (estimates|expectations)|raises? (guidance|outlook|forecast)|record revenue)"
+EARN_RX = r"(earnings|quarterly results|Q[1-4] (results|revenue)|beats?|tops? (estimates|expectations)|raises?\b.{0,40}\b(guidance|outlook|forecast)|record revenue)"
 
 
 def phase_of(now: datetime) -> str:
@@ -84,6 +84,30 @@ def classify(items: list[dict], now_ts: float) -> dict:
         out.update(type=k, age="fresh" if age_h < 18 else "d1" if age_h < 36 else "old",
                    hours=round(age_h, 1), title=title, url=url)
     return out
+
+
+def rss_news(symbol: str) -> list[dict]:
+    """Titulares del RSS público de Yahoo (no pide crumb; respaldo cuando get_news viene vacío)."""
+    import xml.etree.ElementTree as ETX
+    from email.utils import parsedate_to_datetime
+    try:
+        r = requests.get("https://feeds.finance.yahoo.com/rss/2.0/headline",
+                         params={"s": symbol, "region": "US", "lang": "en-US"},
+                         headers={"User-Agent": halts_src.UA}, timeout=10)
+        root = ETX.fromstring(r.content)
+    except (requests.RequestException, ETX.ParseError):
+        return []
+    out = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        try:
+            ts = parsedate_to_datetime(it.findtext("pubDate") or "").timestamp()
+        except (TypeError, ValueError):
+            ts = None
+        if title:
+            out.append({"title": title, "ts": ts, "url": it.findtext("link"), "src": "Yahoo RSS"})
+    out.sort(key=lambda x: x["ts"] or 0, reverse=True)
+    return out[:10]
 
 
 class TTLCache:
@@ -265,7 +289,7 @@ class Radar:
     def news_ctx(self, s, now_ts):
         c = self.cache.get(("news", s), 600)
         if c is None:
-            c = self.cache.put(("news", s), classify(yahoo.news(s, count=10), now_ts))
+            c = self.cache.put(("news", s), classify(yahoo.news(s, count=10) or rss_news(s), now_ts))
         return c
 
     def sec_ctx(self, s, today):
