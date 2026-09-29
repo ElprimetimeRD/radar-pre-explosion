@@ -75,11 +75,12 @@
    "t1": 27.9072,
    "t2": 28.728,
    "score": 65,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.46,
    "mae": -1.1,
-   "last": 27.440000534057617
+   "last": 27.440000534057617,
+   "close_pct": 0.29
   },
   {
    "t": "CSIQ",
@@ -91,11 +92,12 @@
    "t1": 11.6076,
    "t2": 11.949,
    "score": 70,
-   "status": "t1",
+   "status": "cierre",
    "hit1": true,
    "mfe": 3.25,
    "mae": -0.57,
-   "last": 11.609999656677246
+   "last": 11.609999656677246,
+   "close_pct": 2.02
   },
   {
    "t": "BE",
@@ -123,11 +125,12 @@
    "t1": 25.7193,
    "t2": 26.4758,
    "score": 90,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.26,
    "mae": -0.73,
-   "last": 25.114999771118164
+   "last": 25.114999771118164,
+   "close_pct": -0.4
   },
   {
    "t": "AIG",
@@ -139,11 +142,12 @@
    "t1": 76.9233,
    "t2": 79.1858,
    "score": 60,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.58,
    "mae": -0.17,
-   "last": 75.29000091552734
+   "last": 75.29000091552734,
+   "close_pct": -0.17
   },
   {
    "t": "ABCL",
