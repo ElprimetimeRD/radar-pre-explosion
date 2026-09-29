@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Semáforo Radar</title>
+<meta name="theme-color" content="#0f1115">
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#14161a;--mute:#626873;--line:#e3e6ea;
+--go:#0f8a4a;--go-bg:#e4f5ec;--wait:#a86400;--wait-bg:#fdf1dc;--no:#b3261e;--no-bg:#fbe7e5;--chip:#eef0f3}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a20;--ink:#eef0f3;--mute:#9aa1ad;--line:#262a33;
+--go:#3ccf83;--go-bg:#11281c;--wait:#f2b150;--wait-bg:#2b2112;--no:#ff7b72;--no-bg:#2c1614;--chip:#20242c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:760px;margin:0 auto;padding:12px 16px 40px}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+h1{font-size:18px;margin:4px 0}
+.chip{display:inline-block;padding:3px 9px;border-radius:99px;background:var(--chip);font-size:12.5px;color:var(--mute)}
+.reg-verde{background:var(--go-bg);color:var(--go)}.reg-amarillo{background:var(--wait-bg);color:var(--wait)}.reg-rojo{background:var(--no-bg);color:var(--no)}
+.hero{margin:12px 0;padding:16px;border-radius:14px;background:var(--card);border:1px solid var(--line)}
+.hero .lbl{font-size:12px;color:var(--mute);text-transform:uppercase;letter-spacing:.06em}
+.big{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:6px 0}
+.big .t{font-size:30px;font-weight:700}
+.dec{font-weight:800;padding:4px 10px;border-radius:8px;font-size:14px;letter-spacing:.03em}
+.COMPRA{background:var(--go-bg);color:var(--go)}.ESPERA{background:var(--wait-bg);color:var(--wait)}.NO{background:var(--no-bg);color:var(--no)}
+.plan{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:10px}
+.plan div{background:var(--chip);border-radius:8px;padding:6px 8px}
+.plan b{display:block;font-size:15px}.plan span{font-size:11.5px;color:var(--mute)}
+.tabs{display:flex;gap:6px;margin:14px 0 8px}
+.tabs button{flex:1;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px;border-radius:10px;font:inherit;cursor:pointer}
+.tabs button.on{border-color:var(--ink);font-weight:700}
+.row{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:8px 0}
+.top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.top .t{font-weight:700;font-size:17px}.name{color:var(--mute);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
+.sc{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--mute);font-size:13px}
+.reason{margin-top:4px}.trig{color:var(--mute);font-size:13.5px}
+.meta{display:flex;gap:10px;flex-wrap:wrap;color:var(--mute);font-size:12.5px;margin-top:4px;font-variant-numeric:tabular-nums}
+.up{color:var(--go)}.down{color:var(--no)}
+a{color:inherit}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:8px 0}
+.stats div{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px;text-align:center}
+.stats b{display:block;font-size:20px}
+h2{font-size:15px;margin:18px 0 6px}
+small,.foot{color:var(--mute);font-size:12px}
+.err{color:var(--no);font-size:12.5px}
+@media (max-width:420px){.plan{grid-template-columns:repeat(2,1fr)}.big .t{font-size:26px}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Semáforo Radar</h1>
+  <div><span id="phase" class="chip">…</span> <span id="reg" class="chip">…</span></div>
+</header>
+<div id="hero" class="hero"><div class="lbl">Mejor opción ahora</div><div class="big"><span class="t">Cargando…</span></div></div>
+<div class="tabs">
+  <button data-f="COMPRA" class="on">Compra <span id="nC"></span></button>
+  <button data-f="ESPERA">Espera <span id="nE"></span></button>
+  <button data-f="NO">No compres <span id="nN"></span></button>
+</div>
+<div id="list"></div>
+<h2>Hoy</h2>
+<div class="stats" id="stats"></div>
+<div id="trades"></div>
+<p class="foot" id="foot"></p>
+<p class="foot">Datos de Yahoo con 1–2 min de retraso; confirma en tu bróker antes de entrar. Stop siempre puesto. Herramienta personal, no es asesoría financiera.</p>
+</main>
+<script>
+const $=s=>document.querySelector(s);let F='COMPRA',D=null;
+const f2=x=>x==null?'—':(x>=100?x.toFixed(1):x.toFixed(2));
+const pc=x=>x==null?'—':`<span class="${x>=0?'up':'down'}">${x>=0?'+':''}${x.toFixed(1)}%</span>`;
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const LBL={COMPRA:'COMPRA',ESPERA:'ESPERA',NO:'NO COMPRES'};
+const PH={pre:'Pre-market',open:'Sesión',late:'Última media hora',closed:'Cerrado'};
+function plan(p){if(!p)return'';return`<div class="plan"><div><span>Entrada ≤</span><b>${f2(p.entry*1.003)}</b></div><div><span>Stop (−${f2(p.risk)}%)</span><b>${f2(p.stop)}</b></div><div><span>+2 %</span><b>${f2(p.t1)}</b></div><div><span>+5 %</span><b>${f2(p.t2)}</b></div></div>`}
+function meta(r){const w=r.whale||{};const b=[];
+ if(r.rvol!=null)b.push(`RVOL ${r.rvol.toFixed(1)}×`);if(r.ext!=null)b.push(`VWAP ${r.ext>=0?'+':''}${r.ext.toFixed(1)}%`);
+ if(r.atr!=null)b.push(`rango diario ${r.atr.toFixed(1)}%`);if(r.spread!=null)b.push(`spread ${r.spread.toFixed(2)}%`);
+ if(w.buy||w.sell)b.push(`ballenas ${w.buy||0}↑ ${w.sell||0}↓`);return b.map(x=>`<span>${x}</span>`).join('')}
+function card(r){const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
+ return`<div class="row"><div class="top"><span class="dec ${r.decision}">${LBL[r.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(r.t)}" target="_blank" rel="noopener">${esc(r.t)}</a><span>${f2(r.px)} ${pc(r.chg)}</span><span class="name">${esc(r.name||'')}</span><span class="sc">fuerza ${r.score}</span></div>
+ <div class="reason">${esc(r.reason)}${r.why&&r.why.length?` · <small>${esc(r.why.join(' · '))}</small>`:''}</div>
+ ${r.trigger?`<div class="trig">➜ ${esc(r.trigger)}</div>`:''}${cat}${r.decision==='COMPRA'?plan(r.plan):''}<div class="meta">${meta(r)}</div></div>`}
+function render(){if(!D)return;const rows=D.rows||[];
+ $('#phase').textContent=(PH[D.phase]||D.phase||'')+(D.et?' · '+D.et.slice(0,5)+' ET':'');
+ const rg=$('#reg');rg.className='chip reg-'+(D.regime||'');rg.textContent=D.regime?`Mercado ${D.regime} · ${D.regimeText||''}`:'Mercado —';
+ const c=D.counts||{};$('#nC').textContent=`(${c.COMPRA||0})`;$('#nE').textContent=`(${c.ESPERA||0})`;$('#nN').textContent=`(${c.NO||0})`;
+ const b=rows.find(r=>r.t===D.best);
+ $('#hero').innerHTML=b?`<div class="lbl">Mejor opción ahora</div><div class="big"><span class="dec ${b.decision}">${LBL[b.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(b.t)}" target="_blank" rel="noopener">${esc(b.t)}</a><span>${f2(b.px)} ${pc(b.chg)}</span><span class="sc">fuerza ${b.score}</span></div><div>${esc(b.reason)}</div>${b.trigger?`<div class="trig">➜ ${esc(b.trigger)}</div>`:''}${plan(b.plan)}<div class="meta">${meta(b)}</div>`
+  :`<div class="lbl">Mejor opción ahora</div><div class="big"><span class="dec NO">NO COMPRES</span><span>Nada cumple ahora. No operar también es una decisión.</span></div>`;
+ const L=rows.filter(r=>r.decision===F);
+ $('#list').innerHTML=L.length?L.map(card).join(''):`<p class="foot">Nada en esta lista ahora.</p>`;
+ const s=D.stats||{};$('#stats').innerHTML=`<div><b>${s.n||0}</b><small>señales</small></div><div><b>${s.t1||0}</b><small>tocaron +2 %</small></div><div><b>${s.t2||0}</b><small>tocaron +5 %</small></div><div><b>${s.stop||0}</b><small>stop</small></div>`;
+ $('#trades').innerHTML=(D.trades||[]).map(t=>`<div class="meta"><span><b>${esc(t.t)}</b> ${t.time}</span><span>entrada ${f2(t.entry)}</span><span>máx ${pc(t.mfe)}</span><span>mín ${pc(t.mae)}</span><span>${esc(t.status)}</span></div>`).join('');
+ $('#foot').innerHTML=`${D.universe||0} acciones en seguimiento · actualizado ${D.ts?new Date(D.ts).toLocaleTimeString():'—'}${(D.errors||[]).length?`<div class="err">${esc(D.errors.slice(-1)[0])}</div>`:''}`}
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{F=b.dataset.f;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));render()});
+async function load(){try{const r=await fetch('/api/signals',{cache:'no-store'});D=await r.json();
+ if(F==='COMPRA'&&!(D.counts||{}).COMPRA&&(D.counts||{}).ESPERA){F='ESPERA';document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.f===F))}
+ render()}catch(e){$('#foot').textContent='Sin conexión con el servidor; reintentando…'}}
+load();setInterval(load,20000);
+</script>
+</body>
+</html>
