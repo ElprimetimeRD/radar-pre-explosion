@@ -1,0 +1,13 @@
+name: Despertar semáforo
+
+# Despierta el servicio de Render (plan free) antes del pre-market y lo mantiene activo en la sesión.
+on:
+  schedule:
+    - cron: "*/15 8-20 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS --max-time 60 "${{ vars.SEMAFORO_URL || 'https://radar-semaforo.onrender.com' }}/health" || true
