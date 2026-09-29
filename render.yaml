@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: radar-semaforo
+    runtime: python
+    plan: starter
+    region: virginia
+    buildCommand: pip install -r requirements-live.txt
+    startCommand: uvicorn live.app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: CYCLE_S
+        value: "60"
+      - key: UNIVERSE_N
+        value: "50"
+      - key: SEC_USER_AGENT
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: WATCHLIST
+        sync: false
+      - key: RADAR_SCAN_URL
+        value: https://raw.githubusercontent.com/elprimetimerd/radar-pre-explosion/main/data/artifact/latest-A.json

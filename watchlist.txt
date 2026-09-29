@@ -1,0 +1,17 @@
+# Tickers que siempre se evalúan (escáner y semáforo), uno por línea. Edita a tu gusto.
+MU
+SNDK
+MRVL
+ARM
+BE
+AXTI
+NVDA
+AMD
+WDC
+STX
+SNXX
+SNDQ
+MUU
+MVLL
+AXTX
+BEG
