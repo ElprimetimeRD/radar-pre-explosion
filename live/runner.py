@@ -111,6 +111,7 @@ class Radar:
         self.baseline: dict[str, list[float] | None] = {}
         self.atr: dict[str, float | None] = {}
         self.prev: dict[str, float | None] = {}
+        self.q_off_until = 0.0
         self.sec_map: dict[str, int] = {}
         self.trades: dict[str, dict] = {}
         self.sent: set[str] = set()
@@ -148,6 +149,38 @@ class Radar:
         except requests.RequestException as e:
             log.warning("Telegram: %s", e)
 
+    def quotes(self, syms: list[str]) -> dict[str, dict]:
+        """v7/quote con cortacircuito: si Yahoo niega el crumb (401), no insistir por 20 min."""
+        if not syms or time.time() < self.q_off_until:
+            return {}
+        first = yahoo.batch_quotes(syms[:40])
+        if not first:
+            self.q_off_until = time.time() + 1200
+            log.warning("v7/quote no disponible; sigo con precios de velas por 20 min")
+            return {}
+        if len(syms) > 40:
+            first.update(yahoo.batch_quotes(syms[40:]))
+        return first
+
+    def premarket_rank(self, syms: list[str]) -> dict[str, tuple[float, float]]:
+        """{ticker: (cambio % pre-market vs. cierre previo, dólares negociados en pre-market)} con velas de 5 min."""
+        out = {}
+        bars = yahoo.history(syms, period="2d", interval="5m", prepost=True)
+        for s, df in bars.items():
+            d = to_et(df)
+            if d.empty:
+                continue
+            days = sorted(set(d["day"]))
+            if len(days) < 2:
+                continue
+            y = d[(d["day"] == days[-2]) & (d["m"] >= OPEN_M) & (d["m"] < 16 * 60)]
+            t = d[(d["day"] == days[-1]) & (d["m"] < OPEN_M)]
+            if y.empty or t.empty:
+                continue
+            prev, last = float(y["Close"].iloc[-1]), float(t["Close"].iloc[-1])
+            out[s] = (100 * (last / prev - 1), float((t["Close"] * t["Volume"]).sum()))
+        return out
+
     # ---------------- universo ----------------
     def refresh_universe(self, now: datetime, phase: str, halted: dict):
         watch = load_watchlist()
@@ -183,13 +216,19 @@ class Radar:
                     add(it.get("t"), "escaneo")
             except (requests.RequestException, ValueError):
                 pass
-        quotes = yahoo.batch_quotes(sorted(cand)) or {}
+        quotes = self.quotes(sorted(cand))
         for s, q in sq.items():
             quotes.setdefault(s, q)
         t = now.astimezone(ET)
         elapsed = max(0, min(390, t.hour * 60 + t.minute - OPEN_M))
         frac = 0.12 + 0.88 * elapsed / 390 if phase != "pre" else 0.05
         ranked = []
+        if phase == "pre":
+            pmr = self.premarket_rank(sorted(cand))
+            for s, (chg, usd) in pmr.items():
+                if usd >= 50_000:
+                    ranked.append((max(chg, 0) / 2 + math.log1p(usd / 1e5), s))
+            quotes = {}
         for s, q in quotes.items():
             px = fnum(q.get("regularMarketPrice"))
             if not px or px < 1 or q.get("quoteType") not in ("EQUITY", "ETF"):
@@ -265,7 +304,7 @@ class Radar:
         syms = list(dict.fromkeys(self.universe + ["SPY", "QQQ"]))
         self.ensure_context(syms, today)
         bars = yahoo.history(syms, period="1d", interval="1m", prepost=True)
-        quotes = yahoo.batch_quotes(syms)
+        quotes = self.quotes(syms)
 
         def mets(s):
             q = quotes.get(s, {})
