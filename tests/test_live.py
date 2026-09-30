@@ -245,6 +245,109 @@ def test_cycle():
     return snap
 
 
+def test_positions(tmp="/tmp/claude-0/positions_test.json"):
+    """Monitor de posiciones: cada nivel de caída y el objetivo avisan una sola vez; sobrevive reinicios."""
+    import os
+    from live.positions import Positions
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    P = Positions(tmp, drops=(2.0, 3.0), default_tp=3.0)
+    P.upsert("run", 10.0, qty=50)
+    assert P.check({"RUN": 9.90}) == []                                   # −1 %: nada
+    a = P.check({"RUN": 9.79})                                            # −2.1 %: primer aviso
+    assert len(a) == 1 and "cayó" in a[0][1] and "véndela RUN" in a[0][1] and "-10.50 US$" in a[0][1], a
+    assert P.check({"RUN": 9.78}) == []                                   # mismo nivel: no repite
+    b = P.check({"RUN": 9.69})                                            # −3.1 %: segundo nivel
+    assert len(b) == 1 and a[0][0] != b[0][0], b
+    assert P.check({"RUN": 9.60}) == []
+    P.upsert("GAP", 10.0)
+    c = P.check({"GAP": 9.60})                                            # cruza −2 % y −3 % de golpe: un solo aviso
+    assert len(c) == 1 and "-4.0%" in c[0][1] and set(P.items["GAP"]["sent"]) == {"d2", "d3"}, c
+    P.upsert("UP", 10.0, tp=3.0)
+    assert P.check({"UP": 10.20}) == []
+    d = P.check({"UP": 10.31})                                            # objetivo
+    assert len(d) == 1 and "🎯" in d[0][1] and P.check({"UP": 10.50}) == []
+    assert P.items["UP"]["max_pct"] >= 3.0 and P.items["RUN"]["min_pct"] <= -3.0
+    assert P.check({}) == [] and P.check({"RUN": None, "UP": 0}) == []    # sin precio: no falla ni avisa
+    # persistencia: reiniciar el servicio no repite avisos; volver a registrar igual conserva lo enviado
+    Q = Positions(tmp, drops=(2.0, 3.0), default_tp=3.0)
+    assert set(Q.items) == {"RUN", "GAP", "UP"} and Q.check({"RUN": 9.6}) == []
+    Q.upsert("RUN", 10.0, qty=50)
+    assert Q.check({"RUN": 9.6}) == []
+    Q.upsert("RUN", 9.5)                                                  # entrada nueva = posición nueva: se reinician avisos
+    assert Q.items["RUN"]["sent"] == [] and Q.check({"RUN": 9.2}) != []
+    assert Q.remove("run") and not Q.remove("RUN") and "RUN" not in Q.symbols()
+    for bad in (("", 10), ("TOOLONGX", 10), ("RUN", 0), ("RUN", -1), ("RUN", 10, -5), ("RUN", 10, None, 0)):
+        try:
+            Q.upsert(*bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"debió rechazar {bad}")
+    os.remove(tmp)
+
+
+def test_positions_api(tmp="/tmp/claude-0/positions_api_test.json"):
+    """API de posiciones: cerrada sin token, 401 con token malo, alta/lista/baja con el bueno."""
+    import os
+    os.environ.update(NO_LOOP="1", NO_NOTIFY="1")
+    from fastapi.testclient import TestClient
+    from live import app as A
+    from live.positions import Positions
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    A.radar.positions = Positions(tmp, drops=(2.0, 3.0), default_tp=3.0)
+    cl = TestClient(A.app)
+    body = {"t": "run", "entry": 10.41, "qty": 30, "tp": 3}
+    os.environ.pop("POSITIONS_TOKEN", None)
+    assert cl.get("/api/positions", headers={"X-Token": "x"}).status_code == 503
+    os.environ["POSITIONS_TOKEN"] = "secreto"
+    assert cl.get("/api/positions").status_code == 401
+    assert cl.post("/api/positions", json=body, headers={"X-Token": "malo"}).status_code == 401
+    ok = cl.post("/api/positions", json=body, headers={"X-Token": "secreto"})
+    assert ok.status_code == 200 and ok.json()["t"] == "RUN" and ok.json()["tp"] == 3, ok.text
+    assert cl.post("/api/positions", json={"t": "no valido!", "entry": 5}, headers={"X-Token": "secreto"}).status_code == 422
+    lst = cl.get("/api/positions", headers={"X-Token": "secreto"}).json()["positions"]
+    assert [p["t"] for p in lst] == ["RUN"] and lst[0]["entry"] == 10.41
+    assert cl.delete("/api/positions/run", headers={"X-Token": "secreto"}).json() == {"removed": True}
+    assert cl.get("/api/positions", headers={"X-Token": "secreto"}).json()["positions"] == []
+    os.environ.pop("POSITIONS_TOKEN", None)
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+
+def test_watch_positions(tmp="/tmp/claude-0/positions_watch_test.json"):
+    """El ciclo lee precios (velas si Yahoo niega la cotización) y manda el aviso por el mismo canal de Telegram."""
+    import os
+    from scanner.sources import yahoo
+    from live.positions import Positions
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    now = DAY.replace(hour=10, minute=30)
+    bars_now = bars(DAY, [10.0, 9.9, 9.75], 50000, start_m=570 + 58)      # último cierre 9.75 = −2.5 %
+    old_h, old_q = yahoo.history, yahoo.batch_quotes
+    yahoo.history = lambda syms, period="1y", interval="1d", prepost=False: {s: bars_now for s in syms}
+    yahoo.batch_quotes = lambda syms: {}                                   # Yahoo niega la cotización (401)
+    sent = []
+    try:
+        r = runner.Radar(notify=False)
+        r.positions = Positions(tmp, drops=(2.0, 3.0), default_tp=3.0)
+        r.sent = set()
+        r.tg = lambda key, text: sent.append((key, text))
+        r.positions.upsert("RUN", 10.0)
+        r._watch_positions(now, "open")
+        assert len(sent) == 1 and "RUN cayó -2.5%" in sent[0][1], sent
+        r._watch_positions(now, "open")
+        assert len(sent) == 1, sent                                        # no repite
+        r.positions.upsert("NOP", 5.0)                                     # sin datos de precio: no rompe el resto
+        yahoo.history = lambda syms, period="1y", interval="1d", prepost=False: {}
+        r._watch_positions(now, "open")
+        assert len(sent) == 1
+    finally:
+        yahoo.history, yahoo.batch_quotes = old_h, old_q
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -254,5 +357,8 @@ if __name__ == "__main__":
     test_regime()
     test_halts()
     test_classify()
+    test_positions()
+    test_positions_api()
+    test_watch_positions()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})
