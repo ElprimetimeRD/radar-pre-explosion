@@ -21,6 +21,7 @@ from scanner.util import DATA, ET, fnum, log, read_json, write_json
 from . import halts as halts_src
 from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, decide, regime
 from .metrics import OPEN_M, atr_pct, baseline_curve, session_metrics, to_et
+from .positions import Positions
 
 UNIVERSE_N = int(os.environ.get("UNIVERSE_N", "50"))
 CYCLE_S = int(os.environ.get("CYCLE_S", "60"))
@@ -203,6 +204,7 @@ class Radar:
         self.q_off_until = 0.0
         self.sec_map: dict[str, int] = {}
         self.trades: dict[str, dict] = {}
+        self.positions = Positions()  # posiciones reales que Priamo registra al ejecutar (avisos de caída y objetivo)
         self.sent: set[str] = set()
         self.history: dict[str, list] = {}  # días anteriores (hasta HIST_DAYS) para que GitHub los guarde aunque se salte corridas
         self.snapshot: dict = {"status": "iniciando", "rows": []}
@@ -419,6 +421,10 @@ class Radar:
             self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat(),
                              "trades": list(self.trades.values()), "stats": self.stats()}
             return
+        try:  # el monitor de posiciones va antes de lo pesado: si el escaneo falla, los avisos de tus posiciones siguen
+            self._watch_positions(now, phase)
+        except Exception as e:  # noqa: BLE001
+            log.warning("monitor de posiciones: %s", e)
         halted = halts_src.parse(halts_src.fetch(), now)
         if not self.universe or time.time() - self.universe_ts > UNIVERSE_TTL:
             self.refresh_universe(now, phase, halted)
@@ -484,6 +490,27 @@ class Radar:
         }
         self._save()
 
+    # ---------------- posiciones reales ----------------
+    def _watch_positions(self, now: datetime, phase: str):
+        """Último precio de cada posición registrada (cotización; si Yahoo la niega, última vela de 1 min) → avisos."""
+        syms = self.positions.symbols()
+        if not syms:
+            return
+        px: dict[str, float] = {}
+        for s, q in self.quotes(syms).items():
+            v = fnum(q.get("preMarketPrice")) if phase == "pre" else None
+            v = v or fnum(q.get("regularMarketPrice"))
+            if v:
+                px[s] = v
+        missing = [s for s in syms if not px.get(s)]
+        if missing:
+            for s, df in yahoo.history(missing, period="1d", interval="1m", prepost=True).items():
+                d = to_et(df)
+                if not d.empty:
+                    px[s] = float(d["Close"].iloc[-1])
+        for key, text in self.positions.check(px):
+            self.tg(key, text)
+
     # ---------------- seguimiento de señales y alertas ----------------
     def _track(self, rows, bars, t_et, reg_txt):
         now_m = t_et.hour * 60 + t_et.minute
@@ -500,7 +527,8 @@ class Radar:
                 how = f"a {tr['entry']:.2f}, no pagues más de {tr['entry'] * 1.003:.2f}"
             self.tg(f"buy:{r['t']}", (
                 f"🟢 COMPRA {r['t']} {how}\nFuerza {r['score']}/100 · {why}\n"
-                f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}"))
+                f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}\n"
+                f"Para operarla dime: «ejecuta {r['t']} $monto, vender a +3%»"))
         for s, tr in self.trades.items():
             if tr["status"] not in ("pendiente", "abierta", "t1"):
                 continue
