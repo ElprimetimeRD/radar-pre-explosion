@@ -1,6 +1,7 @@
 """Servicio web (Render): página del semáforo + API. El bucle corre en un hilo al arrancar."""
 from __future__ import annotations
 
+import hmac
 import math
 import os
 import threading
@@ -8,8 +9,9 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 from . import keepalive
 from .runner import Radar
@@ -65,6 +67,44 @@ def trades():
     hist = [{"day": d, "trades": t} for d, t in sorted(radar.history.items())]
     return JSONResponse(clean({"day": day, "trades": list(radar.trades.values()), "stats": radar.stats(), "history": hist}),
                         headers={"Cache-Control": "no-store"})
+
+
+def _auth(token: str | None):
+    """Las posiciones son privadas: exigen POSITIONS_TOKEN (cabecera X-Token). Sin la variable, el acceso queda cerrado."""
+    want = os.environ.get("POSITIONS_TOKEN") or ""
+    if not want:
+        raise HTTPException(503, "POSITIONS_TOKEN no está configurado en el servicio")
+    if not token or not hmac.compare_digest(token.encode(), want.encode()):
+        raise HTTPException(401, "token inválido")
+
+
+class PositionIn(BaseModel):
+    t: str
+    entry: float
+    qty: float | None = None
+    tp: float | None = None  # objetivo en % (por defecto DEFAULT_TP)
+
+
+@app.get("/api/positions")
+def positions_list(x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    return JSONResponse(clean({"positions": radar.positions.listing()}), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/positions")
+def positions_add(p: PositionIn, x_token: str | None = Header(default=None)):
+    """Registra (o actualiza) una posición ya ejecutada para vigilarla: avisa si cae 2 %/3 % o llega al objetivo."""
+    _auth(x_token)
+    try:
+        return clean(radar.positions.upsert(p.t, p.entry, p.qty, p.tp))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.delete("/api/positions/{t}")
+def positions_remove(t: str, x_token: str | None = Header(default=None)):
+    _auth(x_token)
+    return {"removed": radar.positions.remove(t)}
 
 
 @app.get("/health")
