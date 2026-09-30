@@ -1,90 +1,12 @@
 {
  "days": 2,
  "total": {
-  "n": 22,
-  "filled": 17,
-  "t1": 4,
-  "t2": 2,
+  "n": 20,
+  "filled": 16,
+  "t1": 3,
+  "t2": 1,
   "stop": 8
  },
- "byScore": [
-  {
-   "range": "60–69",
-   "n": 15,
-   "filled": 10,
-   "t1": 2,
-   "t2": 1,
-   "stop": 4,
-   "pct": 20
-  },
-  {
-   "range": "70–79",
-   "n": 3,
-   "filled": 3,
-   "t1": 2,
-   "t2": 1,
-   "stop": 1,
-   "pct": 67
-  },
-  {
-   "range": "80+",
-   "n": 4,
-   "filled": 4,
-   "t1": 0,
-   "t2": 0,
-   "stop": 3,
-   "pct": 0
-  }
- ],
- "byHalf": [
-  {
-   "range": "mañana",
-   "n": 6,
-   "filled": 2,
-   "t1": 2,
-   "t2": 1,
-   "stop": 0,
-   "pct": 100
-  },
-  {
-   "range": "tarde",
-   "n": 16,
-   "filled": 15,
-   "t1": 2,
-   "t2": 1,
-   "stop": 8,
-   "pct": 13
-  }
- ],
- "byEntry": [
-  {
-   "range": "a mercado",
-   "n": 17,
-   "filled": 17,
-   "t1": 4,
-   "t2": 2,
-   "stop": 8,
-   "pct": 24
-  },
-  {
-   "range": "límite llenada",
-   "n": 0,
-   "filled": 0,
-   "t1": 0,
-   "t2": 0,
-   "stop": 0,
-   "pct": null
-  },
-  {
-   "range": "límite sin llenar",
-   "n": 5,
-   "filled": 0,
-   "t1": 0,
-   "t2": 0,
-   "stop": 0,
-   "pct": null
-  }
- ],
  "byDay": [
   {
    "day": "2026-09-29",
@@ -96,10 +18,10 @@
   },
   {
    "day": "2026-09-30",
-   "n": 11,
-   "filled": 6,
-   "t1": 2,
-   "t2": 1,
+   "n": 9,
+   "filled": 5,
+   "t1": 1,
+   "t2": 0,
    "stop": 2
   }
  ]
