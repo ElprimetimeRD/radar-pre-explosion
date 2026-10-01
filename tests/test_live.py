@@ -87,11 +87,42 @@ def test_vetos(m):
 
 
 def test_espera_or():
-    b = bars(DAY, runner_path(10), 40000)
+    k = metrics.OR_MINUTES
+    b = bars(DAY, runner_path(k), 40000)
     base = metrics.baseline_curve(five_days(), DAY.date())
-    m = metrics.session_metrics(b, 9.6, base, DAY.replace(hour=9, minute=39))
+    m = metrics.session_metrics(b, 9.6, base, DAY.replace(hour=9, minute=30 + k - 1))
     r = D.decide("X", m, ctx())
     assert r["decision"] == "ESPERA" and "apertura" in r["reason"], r
+
+
+def test_triggers(m):
+    """El gatillo es el máximo más alto que haya que romper, y nunca hay COMPRA por debajo de un máximo previo."""
+    hod = m["orh"] * 1.03
+    below = {**m, "px": m["orh"] * 0.999, "vwap": m["orh"] * 0.99, "ext": 0.9, "hod": hod}
+    r = D.decide("X", below, ctx())
+    assert r["decision"] == "ESPERA" and "máximo del día" in r["reason"] and abs(r["level"] - hod) < 1e-3, r
+    assert f"{hod:.2f}" in r["trigger"] and abs(r["plan"]["entry"] - hod * 1.001) < 1e-3, r
+    flat = {**below, "hod": m["orh"]}
+    r = D.decide("X", flat, ctx())
+    assert "apertura" in r["reason"] and abs(r["level"] - m["orh"]) < 1e-3 and r["plan"]["risk"] >= D.RISK_MIN - 1e-6, r
+    under = D.decide("X", {**m, "breakout": m["px"] * 1.01}, ctx())  # un máximo previo arriba: todavía no es ruptura
+    assert under["decision"] == "ESPERA" and "aún no rompe" in under["reason"] and under["level"] > m["px"], under
+    calm = D.decide("X", {**m, "higher_lows": False, "whale": {}, "accel": 1.0, "breakout": m["px"] * 0.999}, ctx())
+    assert calm["decision"] == "ESPERA" and "nuevo máximo" in calm["trigger"] and calm["level"] == round(m["hod"], 4), calm
+
+
+def test_strength_acn():
+    """ACN 1-oct 10:10: +23 % por resultados, RVOL 14×, calls inusuales, debajo del máximo de apertura. Antes: fuerza 99."""
+    m = {"now_m": 610, "px": 225.6, "chg": 23.0, "vwap": 221.6, "ext": 1.8, "orh": 226.5, "hod": 227.63, "or_done": True,
+         "higher_lows": True, "dist_hod": 0.9, "rvol": 14.3, "whale": {}, "usd_vol": 9e8, "swing_low": 224.0, "breakout": 227.63}
+    c = ctx(cat={"type": "earnings", "age": "fresh", "title": "x"}, news_ok=True, callVolOI=1.8, atr=3.93, spy_chg=-0.2,
+            shelf=True, spread=0.04, regime="amarillo")
+    r = D.decide("ACN", m, c)
+    assert r["score"] <= 60 and r["decision"] == "ESPERA", (r["score"], r["why"])
+    assert abs(r["level"] - 227.63) < 1e-6 and any("rangos diarios" in w for w in r["why"]), r
+    # el mismo cuadro sin la subida exagerada sí puntúa alto: el tope castiga la extensión, no el volumen
+    calm = D.decide("ACN", {**m, "chg": 4.0}, c)
+    assert calm["score"] >= r["score"] + 5, (calm["score"], r["score"])
 
 
 def test_limit_and_cutoff(m):
@@ -163,6 +194,83 @@ def test_classify():
     assert c["offer"], c
 
 
+def test_news_relevance():
+    """Un resumen genérico de analistas no es noticia de cada ticker que Yahoo le asocia (UTHR, COHR, LITE el 1-oct)."""
+    now = DAY.timestamp()
+    roundup = [{"title": "Target upgraded, Moderna downgraded: Wall Street's top analyst calls", "ts": now - 3600}]
+    assert not runner.classify(roundup, now, "LITE", "Lumentum Holdings Inc.").get("type")
+    assert not runner.classify(roundup, now, "UTHR", "United Therapeutics Corporati").get("type")
+    assert runner.classify(roundup, now).get("type") == "analyst"  # sin ticker/nombre: comportamiento anterior
+    own = [{"title": "Lumentum upgraded to Buy at Goldman", "ts": now - 3600}]
+    assert runner.classify(own, now, "LITE", "Lumentum Holdings Inc.")["type"] == "analyst"
+    tick = [{"title": "UTHR stock upgraded after trial data", "ts": now - 3600}]
+    assert runner.classify(tick, now, "UTHR", "United Therapeutics Corporati")["type"] == "analyst"
+    phrase = [{"title": "United Therapeutics upgraded at JPMorgan", "ts": now - 3600}]
+    assert runner.classify(phrase, now, "UTHR", "United Therapeutics Corporati")["type"] == "analyst"
+    acn = [{"title": "Accenture Surges On Fiscal Q4 Beat, Outlook Amid AI Disruption Worries", "ts": now - 3600}]
+    assert runner.classify(acn, now, "ACN", "Accenture plc")["type"] == "earnings"
+
+
+def test_spread_sanity():
+    """Bid/ask viejos de Yahoo no deben vetar acciones líquidas (MRVL con 10 % de spread a las 10:40)."""
+    assert runner.sane_spread(251.5, 279.0, 265.3, 0.15) is None          # más ancho que lo que opera en 1 min
+    assert runner.sane_spread(10.0, 10.5, 12.0, None) is None             # no cuadra con el último precio
+    assert runner.sane_spread(265.2, 265.3, 265.25, 0.15) == 0.04
+    assert runner.sane_spread(1.90, 2.00, 1.95, 2.5) == 5.13              # spread ancho real (centavos): se respeta
+    assert runner.sane_spread(None, 2.0, 1.95) is None and runner.sane_spread(2.0, 2.0, 2.0) is None
+
+
+def test_arm_and_fast(tmp="/tmp/claude-0/arm_test_state"):
+    """Ruptura armada: aviso con la orden lista, el vigía rápido avisa al cruzar el gatillo y despierta el ciclo."""
+    from scanner.sources import yahoo
+    now = DAY.replace(hour=10, minute=0)
+
+    def row(t, lvl, px, score=70, risk=1.0):
+        entry = lvl * 1.001
+        return {"t": t, "decision": "ESPERA", "level": lvl, "px": px, "chg": 6.0, "score": score,
+                "reason": "debajo del máximo de apertura",
+                "plan": {"entry": entry, "stop": entry * (1 - risk / 100), "t1": entry * 1.02, "risk": risk}}
+    old_q = yahoo.batch_quotes
+    try:
+        r = runner.Radar(notify=False)
+        r.trades, r.sent = {}, set()
+        rows = [row("AAA", 50.0, 49.8), row("FAR", 50.0, 48.0), row("WEAK", 50.0, 49.9, score=40),
+                row("RISKY", 50.0, 49.9, risk=3.0)] + [row(f"Z{i}", 20.0, 19.95) for i in range(10)]
+        r._arm(rows, "verde", "open", 10 * 60)
+        assert "AAA" in r.armed and not ({"FAR", "WEAK", "RISKY"} & set(r.armed)), r.armed
+        arms = [k for k in r.sent if k.startswith("arm:")]
+        assert len(arms) == runner.ARM_MAX and "arm:AAA" in r.sent, arms                 # tope diario de avisos
+        r._arm(rows, "rojo", "open", 10 * 60)
+        assert r.armed == {}                                                             # mercado en rojo: nada armado
+        r._arm([row("MID", 50.0, 49.8, score=57)], "amarillo", "open", 10 * 60)
+        assert r.armed == {}                                                             # amarillo pide 5 puntos más
+        r._arm([row("MID", 50.0, 49.8, score=57)], "verde", "open", 10 * 60)
+        assert "MID" in r.armed
+        r._arm(rows, "verde", "open", 10 * 60)
+        yahoo.batch_quotes = lambda syms: {s: {"symbol": s, "regularMarketPrice": 50.08 if s == "AAA" else 19.9} for s in syms}
+        r.q_off_until = 0
+        fired = r.fast_once(now)
+        assert fired == ["AAA"] and r.wake.is_set() and "break:AAA:50.00" in r.sent, (fired, r.sent)
+        r.wake.clear()
+        assert r.fast_once(now) == [] and not r.wake.is_set()                           # no repite el aviso
+        assert r.fast_once(now.replace(hour=16, minute=5)) == []                         # fuera de sesión no vigila
+    finally:
+        yahoo.batch_quotes = old_q
+
+
+def test_pre_list():
+    r = runner.Radar(notify=False)
+    r.sent = set()
+    got = []
+    r.tg = lambda key, text: got.append((key, text))
+    rows = [{"t": "GAP", "decision": "ESPERA", "chg": 12.5, "pmh": 8.4, "cat": {"type": "earnings"}},
+            {"t": "NOP", "decision": "NO", "chg": 1.0}]
+    r._pre_list(rows, DAY.replace(hour=9, minute=5))
+    assert got == []                                                                    # antes de las 9:15 no avisa
+    r._pre_list(rows, DAY.replace(hour=9, minute=20))
+    assert len(got) == 1 and "GAP +12.5% · máx. pre 8.40 · resultados" in got[0][1] and "NOP" not in got[0][1], got
+
+
 def test_cycle():
     """Ciclo completo con fuentes falsas: universo, contexto, decisión, alerta y seguimiento."""
     from scanner.sources import other, yahoo
@@ -206,6 +314,7 @@ def test_cycle():
         assert snap["regime"] == "verde", snap["regime"]
         assert row["decision"] == "COMPRA", (row["decision"], row["reason"], row["score"])
         assert snap["best"] == "RUN" and "RUN" in r.trades and "buy:RUN" in r.sent
+        assert snap["armed"] == [] and "watching" in snap and "fast" in snap, snap.keys()
         # siguiente minuto: sube a +2 %
         e = r.trades["RUN"]["entry"]
         assert r.trades["RUN"]["limit"] and r.trades["RUN"]["status"] == "pendiente", r.trades["RUN"]
@@ -352,11 +461,17 @@ if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
     test_limit_and_cutoff(m)
+    test_triggers(m)
+    test_strength_acn()
     test_merge()
     test_espera_or()
     test_regime()
     test_halts()
     test_classify()
+    test_news_relevance()
+    test_spread_sanity()
+    test_arm_and_fast()
+    test_pre_list()
     test_positions()
     test_positions_api()
     test_watch_positions()
