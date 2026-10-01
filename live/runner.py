@@ -19,18 +19,28 @@ from scanner.sources import other, yahoo
 from scanner.util import DATA, ET, fnum, log, read_json, write_json
 
 from . import halts as halts_src
-from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, decide, regime
-from .metrics import OPEN_M, atr_pct, baseline_curve, session_metrics, to_et
+from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, RISK_MAX, decide, regime
+from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
 from .positions import Positions
 
 UNIVERSE_N = int(os.environ.get("UNIVERSE_N", "50"))
 CYCLE_S = int(os.environ.get("CYCLE_S", "60"))
-UNIVERSE_TTL = 600
+UNIVERSE_TTL = int(os.environ.get("UNIVERSE_TTL", "180"))  # s entre refrescos del universo en sesión (pre-market: 600)
+FAST_S = int(os.environ.get("FAST_S", "15"))         # s entre vistazos del vigía rápido a las acciones armadas
+ARM_MIN = int(os.environ.get("ARM_MIN", "55"))        # fuerza mínima para armar (60 con mercado amarillo): la ruptura suma 5
+ARM_NEAR = float(os.environ.get("ARM_NEAR", "1.0"))   # % máximo debajo del gatillo para armarla
+ARM_MAX = int(os.environ.get("ARM_MAX", "8"))         # avisos de "arma" por día (no saturar Telegram)
 ENRICH_N = 20
 STATE_DIR = os.path.join(DATA, "live")
 HIST_DAYS = 5
 DEFAULT_WATCH = ["MU", "SNDK", "MRVL", "ARM", "BE", "AXTI", "NVDA", "AMD", "SNXX", "MUU"]
 EARN_RX = r"(earnings|quarterly results|Q[1-4] (results|revenue)|beats?|tops? (estimates|expectations)|raises?\b.{0,40}\b(guidance|outlook|forecast)|record revenue)"
+# Palabras de nombre que no identifican a una empresa (prefijos: también cubren nombres truncados como "Corporati")
+GENERIC = ("united", "american", "first", "general", "national", "internation", "global", "holding", "group",
+           "corp", "company", "incorp", "limited", "trust", "fund", "technolog", "system", "solution", "industr",
+           "partners", "capital", "financial", "bancorp", "resource", "pharmaceut", "therapeut", "acquisition",
+           "daily", "shares", "leverage", "etf", "long", "short", "bull", "bear", "inverse", "ultra", "tradr",
+           "direxion", "proshares", "graniteshares", "defiance")
 
 
 def phase_of(now: datetime) -> str:
@@ -58,8 +68,42 @@ def load_watchlist() -> list[str]:
     return list(dict.fromkeys(w + extra)) or DEFAULT_WATCH
 
 
-def classify(items: list[dict], now_ts: float) -> dict:
-    """Mejor catalizador de las últimas ~2 semanas + bandera de oferta."""
+def name_keys(name: str | None) -> list[str]:
+    """Palabras distintivas del nombre de la empresa ('Accenture plc' → ['Accenture']). Si todas son genéricas
+    ('United Therapeutics Corporati…'), usa las dos primeras juntas como frase."""
+    words = [w.strip("'-&") for w in re.split(r"[^A-Za-z0-9&'-]+", name or "")]
+    words = [w for w in words if w]
+    keys = [w for w in words if len(w) >= 4 and not w.lower().startswith(GENERIC)]
+    if keys:
+        return keys[:2]
+    return [" ".join(words[:2])] if len(words) >= 2 else words[:1]
+
+
+def relevant(title: str, symbol: str | None, name: str | None) -> bool:
+    """¿El titular habla de esta empresa? Evita que un resumen genérico ('top analyst calls') cuente como su noticia."""
+    if not symbol or not name:
+        return True  # sin nombre no hay con qué comparar: no filtrar
+    if re.search(rf"(?<![A-Za-z]){re.escape(symbol)}(?![A-Za-z])", title):
+        return True
+    return any(k and re.search(rf"(?<![A-Za-z]){re.escape(k)}(?![A-Za-z])", title, re.I) for k in name_keys(name))
+
+
+def sane_spread(bid, ask, px, rng1m=None) -> float | None:
+    """Spread % solo si es creíble. Yahoo a veces deja bid/ask viejos (MRVL o AMD con 10 % en plena sesión):
+    si el spread no cuadra con el último precio o es mucho más ancho que lo que de verdad opera en 1 min, se ignora."""
+    if not (bid and ask and ask > bid):
+        return None
+    sp = 100 * (ask - bid) / ((ask + bid) / 2)
+    if px and (bid > px * 1.02 or ask < px * 0.98):
+        return None
+    if rng1m is not None and sp > max(1.0, 4 * rng1m):
+        return None
+    return round(sp, 2)
+
+
+def classify(items: list[dict], now_ts: float, symbol: str | None = None, name: str | None = None) -> dict:
+    """Mejor catalizador de las últimas ~2 semanas + bandera de oferta. Con symbol/name, solo cuentan los titulares
+    que mencionan el ticker o el nombre de la empresa."""
     prio = ["fda", "mna", "contract", "earnings", "index", "analyst", "theme", "softpr"]
     rules = dict(RULES)
     rules["earnings"] = EARN_RX
@@ -72,6 +116,8 @@ def classify(items: list[dict], now_ts: float) -> dict:
         if age_h > 24 * 14:
             continue
         title = it["title"]
+        if not relevant(title, symbol, name):
+            continue
         if re.search(rules["offer"], title, re.I) and age_h <= 24 * 5:
             out["offer"] = True
             out["offerTitle"] = title
@@ -211,6 +257,11 @@ class Radar:
         self.last_bars: dict = {}
         self.replay_state: dict = {"status": "sin correr"}
         self.errors: list[str] = []
+        self.names: dict[str, str] = {}   # nombre de cada ticker (de las pantallas), para filtrar titulares ajenos
+        self.armed: dict[str, dict] = {}  # rupturas armadas: {ticker: nivel, entrada, stop…} que vigila el vigía rápido
+        self.fast_state: dict = {}
+        self.wake = threading.Event()     # el vigía rápido despierta el ciclo completo cuando algo rompe
+        self.tg_lock = threading.Lock()
         self._load()
 
     # ---------------- persistencia (sobrevive reinicios dentro del día) ----------------
@@ -243,7 +294,9 @@ class Radar:
 
     def _save(self):
         day = datetime.now(timezone.utc).astimezone(ET).date().isoformat()
-        write_json(self._state_path(), {"day": day, "trades": self.trades, "sent": sorted(self.sent), "history": self.history})
+        with self.tg_lock:
+            sent = sorted(self.sent)
+        write_json(self._state_path(), {"day": day, "trades": self.trades, "sent": sent, "history": self.history})
 
     def _archive(self):
         """Copia las señales del día actual al historial (máx. HIST_DAYS días)."""
@@ -257,9 +310,10 @@ class Radar:
 
     # ---------------- Telegram ----------------
     def tg(self, key: str, text: str):
-        if key in self.sent:
-            return
-        self.sent.add(key)
+        with self.tg_lock:  # el ciclo y el vigía rápido avisan desde hilos distintos
+            if key in self.sent:
+                return
+            self.sent.add(key)
         tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
         log.info("ALERTA %s", text.replace("\n", " | "))
         if not (self.notify and tok and chat):
@@ -340,6 +394,10 @@ class Radar:
         quotes = self.quotes(sorted(cand))
         for s, q in sq.items():
             quotes.setdefault(s, q)
+        for s, q in quotes.items():
+            nm = q.get("shortName") or q.get("longName")
+            if nm:
+                self.names[s] = nm
         t = now.astimezone(ET)
         elapsed = max(0, min(390, t.hour * 60 + t.minute - OPEN_M))
         frac = 0.12 + 0.88 * elapsed / 390 if phase != "pre" else 0.05
@@ -386,7 +444,7 @@ class Radar:
     def news_ctx(self, s, now_ts, name=None):
         c = self.cache.get(("news", s), 600)
         if c is None:
-            c = self.cache.put(("news", s), classify(yahoo.news(s, count=10) or rss_news(s, name), now_ts))
+            c = self.cache.put(("news", s), classify(yahoo.news(s, count=10) or rss_news(s, name), now_ts, s, name))
         return c
 
     def sec_ctx(self, s, today):
@@ -418,15 +476,16 @@ class Radar:
                 self.trades, self.sent = {}, set()
         if phase == "closed":
             self._eod(t_et)
+            self.armed = {}
             self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat(),
-                             "trades": list(self.trades.values()), "stats": self.stats()}
+                             "trades": list(self.trades.values()), "stats": self.stats(), "armed": [], "watching": []}
             return
         try:  # el monitor de posiciones va antes de lo pesado: si el escaneo falla, los avisos de tus posiciones siguen
             self._watch_positions(now, phase)
         except Exception as e:  # noqa: BLE001
             log.warning("monitor de posiciones: %s", e)
         halted = halts_src.parse(halts_src.fetch(), now)
-        if not self.universe or time.time() - self.universe_ts > UNIVERSE_TTL:
+        if not self.universe or time.time() - self.universe_ts > (UNIVERSE_TTL if phase == "open" else 600):
             self.refresh_universe(now, phase, halted)
         syms = list(dict.fromkeys(self.universe + ["SPY", "QQQ"]))
         self.ensure_context(syms, today)
@@ -447,12 +506,11 @@ class Radar:
         for s in self.universe:
             q = quotes.get(s, {})
             m = mets(s)
-            b, a = fnum(q.get("bid")), fnum(q.get("ask"))
-            spread = round(100 * (a - b) / ((a + b) / 2), 2) if b and a and a > b else None
+            spread = sane_spread(fnum(q.get("bid")), fnum(q.get("ask")), m.get("px"), m.get("rng1m"))
             h = halted.get(s)
             ctx = {"phase": phase, "regime": reg, "spy_chg": spy.get("chg"), "spread": spread, "atr": self.atr.get(s),
-                   "halted": h if h and not h["resumed"] else None, "name": q.get("shortName") or q.get("longName"),
-                   "watch": s in watch}
+                   "halted": h if h and not h["resumed"] else None,
+                   "name": q.get("shortName") or q.get("longName") or self.names.get(s), "watch": s in watch}
             if h and h["code"] == "T1":
                 ctx["cat"] = {"type": "halt_news", "age": "fresh", "title": f"halt T1 {h['time']}"}
             base[s] = (m, ctx, decide(s, m, ctx))
@@ -480,15 +538,104 @@ class Radar:
         rank = {"COMPRA": 0, "ESPERA": 1, "NO": 2}
         rows.sort(key=lambda r: (rank[r["decision"]], -((r["chg"] or 0) if phase == "pre" else r["score"])))
         self._track(rows, bars, t_et, reg_txt)
-        best = next((r for r in rows if r["decision"] == "COMPRA"), None) or next((r for r in rows if r["decision"] == "ESPERA"), None)
+        # "Mejor opción" solo existe si hay COMPRA: un ESPERA con plan arriba se leía como orden de compra (ACN, 1-oct)
+        best = next((r for r in rows if r["decision"] == "COMPRA"), None)
+        self._arm(rows, reg, phase, t_et.hour * 60 + t_et.minute)
+        if phase == "pre":
+            self._pre_list(rows, t_et)
+        esp = [r for r in rows if r["decision"] == "ESPERA"]
+        watching = [r["t"] for r in esp if r.get("level")] + [r["t"] for r in esp if not r.get("level")]
         self.snapshot = {
             "status": "ok", "ts": now.isoformat(), "et": t_et.strftime("%H:%M:%S"), "phase": phase,
             "regime": reg, "regimeText": reg_txt, "best": best["t"] if best else None, "rows": rows,
+            "watching": watching[:3], "armed": sorted(self.armed), "fast": self.fast_state,
             "counts": {k: sum(1 for r in rows if r["decision"] == k) for k in rank},
             "trades": list(self.trades.values()), "stats": self.stats(), "universe": len(self.universe),
             "halts": {s: h for s, h in halted.items()}, "errors": self.errors[-5:],
         }
         self._save()
+
+    # ---------------- rupturas armadas y lista de apertura ----------------
+    def _arm(self, rows, reg, phase, now_m):
+        """Rupturas listas para dejar la orden puesta: ESPERA con gatillo de ruptura, fuerza ≥ ARM_MIN (+5 con mercado
+        amarillo, igual que la COMPRA), riesgo ≤ RISK_MAX y el precio a ≤ ARM_NEAR % del gatillo. Avisa una vez por
+        ticker y día con la orden completa (compra stop)."""
+        armed = {}
+        need = ARM_MIN + (5 if reg == "amarillo" else 0)
+        if phase == "open" and reg != "rojo" and now_m < min(ENTRY_END_M, LAST_ENTRY_M):
+            for r in rows:
+                lvl, p, px = r.get("level"), r.get("plan"), r.get("px")
+                if (r["decision"] != "ESPERA" or not lvl or not p or not px or r["t"] in self.trades
+                        or (p.get("risk") or 99) > RISK_MAX or r["score"] < need or px < lvl * (1 - ARM_NEAR / 100)):
+                    continue
+                armed[r["t"]] = {"level": lvl, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"], "risk": p["risk"],
+                                 "score": r["score"], "px": px, "chg": r.get("chg"), "reason": r["reason"]}
+        self.armed = armed
+        with self.tg_lock:  # el vigía rápido puede estar agregando avisos en otro hilo
+            n = sum(1 for k in self.sent if k.startswith("arm:"))
+        for t, a in sorted(armed.items(), key=lambda kv: -kv[1]["score"]):
+            if n >= ARM_MAX or f"arm:{t}" in self.sent:
+                continue
+            self.tg(f"arm:{t}", (
+                f"🟡 ARMA {t} · {a['px']:.2f} ({(a['chg'] or 0):+.1f}%) · fuerza {a['score']}\n"
+                f"Gatillo: rompe {a['level']:.2f}. Orden: compra stop {a['entry']:.2f} (límite {a['entry'] * 1.003:.2f}) · "
+                f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
+                f"{a['reason']}. Si no rompe, no pasa nada; si rompe, te aviso al instante."))
+            n += 1
+
+    def _pre_list(self, rows, t_et):
+        """Desde las 9:15 ET: los gaps del pre-market con su referencia, para llegar preparado a la apertura."""
+        if t_et.hour * 60 + t_et.minute < 9 * 60 + 15:
+            return
+        gaps = [r for r in rows if r["decision"] == "ESPERA"][:6]
+        if not gaps:
+            return
+        lines = []
+        for r in gaps:
+            cat = (r.get("cat") or {}).get("type")
+            pmh = f" · máx. pre {r['pmh']:.2f}" if r.get("pmh") else ""
+            lines.append(f"{r['t']} {(r.get('chg') or 0):+.1f}%{pmh}" + (f" · {CAT_NAME.get(cat, cat)}" if cat else ""))
+        self.tg(f"pre:{t_et.date().isoformat()}", "📋 Lista de apertura\n" + "\n".join(lines) +
+                f"\nGatillo: ruptura del rango de los primeros {OR_MINUTES} min con volumen; te aviso cuando se arme cada una.")
+
+    # ---------------- vigía rápido: precio de las rupturas armadas cada FAST_S segundos ----------------
+    def fast_once(self, now: datetime | None = None) -> list[str]:
+        """Si una acción armada cruza su gatillo, avisa al instante y despierta el ciclo completo para que confirme la
+        COMPRA sin esperar su turno. Solo usa la cotización v7 (las descargas de velas de yfinance no son seguras en
+        paralelo con las del ciclo); si Yahoo la niega, el vigía espera y el ciclo de 1 min sigue como siempre. Un fallo
+        aquí no activa el cortacircuito de cotizaciones del ciclo."""
+        now = now or datetime.now(timezone.utc)
+        armed = dict(self.armed)
+        fired: list[str] = []
+        if phase_of(now) == "open" and armed and time.time() >= self.q_off_until:
+            for s, q in (yahoo.batch_quotes(sorted(armed)) or {}).items():
+                a, p = armed.get(s), fnum(q.get("regularMarketPrice"))
+                if not a or not p or p < a["level"] * 1.001:
+                    continue
+                key = f"break:{s}:{a['level']:.2f}"
+                if key in self.sent:
+                    continue
+                if p <= a["entry"] * 1.004:
+                    msg = (f"⚡ {s} rompe {a['level']:.2f} ahora ({p:.2f}). Entrada ≤ {a['entry'] * 1.003:.2f} · "
+                           f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
+                           f"Confirma volumen en tu gráfico; el semáforo lo reevalúa ya.")
+                else:
+                    msg = (f"⚡ {s} rompió {a['level']:.2f} y ya va en {p:.2f}: no persigas. Si dejaste la orden armada, ya "
+                           f"entraste; si no, espera el retesteo que marque el semáforo.")
+                self.tg(key, msg)
+                fired.append(s)
+        if fired:
+            self.wake.set()
+        self.fast_state = {"ts": now.isoformat(), "armed": len(armed), "fired": fired}
+        return fired
+
+    def fast_forever(self):
+        while True:
+            try:
+                self.fast_once()
+            except Exception as e:  # noqa: BLE001
+                log.warning("vigía rápido: %s", e)
+            time.sleep(FAST_S)
 
     # ---------------- posiciones reales ----------------
     def _watch_positions(self, now: datetime, phase: str):
@@ -604,7 +751,7 @@ class Radar:
             return None if d is None or d.empty else d[(d["day"] == day) & (d["m"] <= m)]
 
         trades, taken = [], set()
-        for m in range(OPEN_M + 15, min(ENTRY_END_M, now_m), step):
+        for m in range(OPEN_M + OR_MINUTES, min(ENTRY_END_M, now_m), step):
             t = _dt(day.year, day.month, day.day, m // 60, m % 60, tzinfo=ET)
             spy = session_metrics(cut("SPY", m), self.prev.get("SPY"), self.baseline.get("SPY"), t)
             qqq = session_metrics(cut("QQQ", m), self.prev.get("QQQ"), self.baseline.get("QQQ"), t)
@@ -673,4 +820,6 @@ class Radar:
                 self.snapshot = {**self.snapshot, "status": "error", "errors": self.errors[-5:]}
             phase = self.snapshot.get("phase") or phase_of(datetime.now(timezone.utc))
             wait = CYCLE_S if phase in ("open", "late") else 180 if phase == "pre" else 300
-            time.sleep(max(5, wait - (time.time() - t0)))
+            # Espera su turno, salvo que el vigía rápido vea romper una acción armada: entonces corre ya.
+            self.wake.wait(max(5, wait - (time.time() - t0)))
+            self.wake.clear()
