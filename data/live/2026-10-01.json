@@ -90,11 +90,12 @@
    "score": 70,
    "limit": false,
    "valid_m": null,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.0,
    "mae": -0.43,
-   "last": 3.4749999046325684
+   "last": 3.4749999046325684,
+   "close_pct": -0.43
   },
   {
    "t": "BSTZ",
@@ -109,11 +110,12 @@
    "score": 60,
    "limit": false,
    "valid_m": null,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.35,
    "mae": -0.56,
-   "last": 30.985000610351562
+   "last": 30.985000610351562,
+   "close_pct": -0.34
   },
   {
    "t": "GLOB",
