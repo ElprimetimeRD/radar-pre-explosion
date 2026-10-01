@@ -4,6 +4,7 @@ Todas las horas en Nueva York (ET). La sesión regular va de 9:30 (minuto 570) a
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 import numpy as np
@@ -18,7 +19,7 @@ SESSION_LEN = CLOSE_M - OPEN_M  # 390
 WHALE_K = 3.0            # volumen ≥ K × mediana de los 30 minutos previos
 WHALE_MIN_USD = 100_000  # y al menos este monto en dólares en ese minuto
 WHALE_WINDOW = 15        # minutos hacia atrás que cuentan como "reciente"
-OR_MINUTES = 15          # rango de apertura (9:30–9:45)
+OR_MINUTES = int(os.environ.get("OR_MINUTES", "5"))  # rango de apertura: 9:30–9:35 (antes 15 min; OR_MINUTES=15 lo restaura)
 
 
 def to_et(df: pd.DataFrame) -> pd.DataFrame:
@@ -131,6 +132,10 @@ def session_metrics(bars: pd.DataFrame, prev_close: float | None, baseline: list
     older = reg[reg["m"] < now_m - 15]
     out["breakout"] = max(out["orh"], float(older["High"].max()) if not older.empty else out["orh"])
     out["usd_vol"] = float((reg["Close"] * vol).sum())
+    # Rango típico de una vela de 1 min (%): sirve para descartar bid/ask viejos de Yahoo
+    last = reg.tail(15)
+    if len(last) >= 5:
+        out["rng1m"] = round(float(((last["High"] - last["Low"]) / last["Close"]).median() * 100), 3)
     elapsed = int(min(max(reg["m"].iloc[-1] - OPEN_M, 0), SESSION_LEN - 1))
     if baseline and baseline[elapsed] > 0:
         out["rvol"] = round(float(vol.sum()) / baseline[elapsed], 2)
