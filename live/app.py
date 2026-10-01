@@ -25,6 +25,7 @@ STARTED = time.time()
 async def lifespan(app: FastAPI):
     if os.environ.get("NO_LOOP") != "1":
         threading.Thread(target=radar.run_forever, name="radar", daemon=True).start()
+        threading.Thread(target=radar.fast_forever, name="vigia-rapido", daemon=True).start()
         threading.Thread(target=keepalive.loop, name="keepalive", daemon=True).start()
     yield
 
@@ -110,8 +111,9 @@ def positions_remove(t: str, x_token: str | None = Header(default=None)):
 @app.get("/health")
 def health():
     ts = radar.snapshot.get("ts")
-    return {"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts,
-            "uptime_min": round((time.time() - STARTED) / 60, 1), "now": datetime.now(timezone.utc).isoformat()}
+    return {"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
+            "armed": sorted(radar.armed), "uptime_min": round((time.time() - STARTED) / 60, 1),
+            "now": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/api/news/{t}")
