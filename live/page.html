@@ -52,6 +52,7 @@ small,.foot{color:var(--mute);font-size:12px}
   <h1>Semáforo Radar</h1>
   <div><span id="phase" class="chip">…</span> <span id="reg" class="chip">…</span></div>
 </header>
+<div id="stale" class="err"></div>
 <div id="hero" class="hero"><div class="lbl">Mejor opción ahora</div><div class="big"><span class="t">Cargando…</span></div></div>
 <div class="tabs">
   <button data-f="COMPRA" class="on">Compra <span id="nC"></span></button>
@@ -70,6 +71,7 @@ small,.foot{color:var(--mute);font-size:12px}
 <script>
 const $=s=>document.querySelector(s);let F='COMPRA',D=null;
 const f2=x=>x==null?'—':(x>=100?x.toFixed(1):x.toFixed(2));
+const p2=x=>x==null?'—':x.toFixed(2);  // precios de orden: siempre 2 decimales
 const pc=x=>x==null?'—':`<span class="${x>=0?'up':'down'}">${x>=0?'+':''}${x.toFixed(1)}%</span>`;
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const LBL={COMPRA:'COMPRA',ESPERA:'ESPERA',NO:'NO COMPRES'};
@@ -80,16 +82,24 @@ function meta(r){const w=r.whale||{};const b=[];
  if(r.atr!=null)b.push(`rango diario ${r.atr.toFixed(1)}%`);if(r.spread!=null)b.push(`spread ${r.spread.toFixed(2)}%`);
  if(w.buy||w.sell)b.push(`ballenas ${w.buy||0}↑ ${w.sell||0}↓`);return b.map(x=>`<span>${x}</span>`).join('')}
 function card(r){const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
- return`<div class="row"><div class="top"><span class="dec ${r.decision}">${LBL[r.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(r.t)}" target="_blank" rel="noopener">${esc(r.t)}</a><span>${f2(r.px)} ${pc(r.chg)}</span><span class="name">${esc(r.name||'')}</span><span class="sc">fuerza ${r.score}</span></div>
+ const ifb=r.decision==='ESPERA'&&r.plan?`<div class="trig">Si rompe: compra stop ${p2(r.plan.entry)} · stop ${p2(r.plan.stop)} (−${f2(r.plan.risk)}%) · +2 % ${p2(r.plan.t1)}</div>`:'';
+ return`<div class="row"><div class="top"><span class="dec ${r.decision}">${LBL[r.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(r.t)}" target="_blank" rel="noopener">${esc(r.t)}</a><span>${f2(r.px)} ${pc(r.chg)}</span><span class="name">${esc(r.name||'')}</span>${arm(r)}<span class="sc">fuerza ${r.score}</span></div>
  <div class="reason">${esc(r.reason)}${r.why&&r.why.length?` · <small>${esc(r.why.join(' · '))}</small>`:''}</div>
- ${r.trigger?`<div class="trig">➜ ${esc(r.trigger)}</div>`:''}${cat}${r.decision==='COMPRA'?plan(r.plan):''}<div class="meta">${meta(r)}</div></div>`}
+ ${r.trigger?`<div class="trig">➜ ${esc(r.trigger)}</div>`:''}${ifb}${cat}${r.decision==='COMPRA'?plan(r.plan):''}<div class="meta">${meta(r)}</div></div>`}
+const arm=r=>(D&&(D.armed||[]).includes(r.t))?'<span class="chip">⚡ armada</span>':'';
 function render(){if(!D)return;const rows=D.rows||[];
+ const age=D.ts?(Date.now()-new Date(D.ts))/1000:0,liveP=['pre','open','late'].includes(D.phase);
+ $('#stale').textContent=D.status==='iniciando'?'Arrancando: el primer escaneo tarda cerca de un minuto.'
+  :liveP&&age>180?`⚠ Datos de hace ${Math.round(age/60)} min: el escaneo va atrasado. No operes con esto.`:'';
  $('#phase').textContent=(PH[D.phase]||D.phase||'')+(D.et?' · '+D.et.slice(0,5)+' ET':'');
  const rg=$('#reg');rg.className='chip reg-'+(D.regime||'');rg.textContent=D.regime?`Mercado ${D.regime} · ${D.regimeText||''}`:'Mercado —';
  const c=D.counts||{};$('#nC').textContent=`(${c.COMPRA||0})`;$('#nE').textContent=`(${c.ESPERA||0})`;$('#nN').textContent=`(${c.NO||0})`;
  const b=rows.find(r=>r.t===D.best);
  $('#hero').innerHTML=b?`<div class="lbl">Mejor opción ahora</div><div class="big"><span class="dec ${b.decision}">${LBL[b.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(b.t)}" target="_blank" rel="noopener">${esc(b.t)}</a><span>${f2(b.px)} ${pc(b.chg)}</span><span class="sc">fuerza ${b.score}</span></div><div>${esc(b.reason)}</div>${b.trigger?`<div class="trig">➜ ${esc(b.trigger)}</div>`:''}${plan(b.plan)}<div class="meta">${meta(b)}</div>`
-  :`<div class="lbl">Mejor opción ahora</div><div class="big"><span class="dec NO">NO COMPRES</span><span>Nada cumple ahora. No operar también es una decisión.</span></div>`;
+  :(()=>{const W=(D.watching||[]).map(t=>rows.find(r=>r.t===t)).filter(Boolean);
+   return`<div class="lbl">Ahora</div><div class="big"><span class="dec NO">NADA PARA COMPRAR</span></div>`+(W.length
+    ?`<div class="trig">Vigilando: ${W.map(r=>`<b>${esc(r.t)}</b>${r.level?' rompe '+p2(r.level):''} ${arm(r)}`).join(' · ')}</div>`
+    :`<div class="trig">Nada cumple ahora. No operar también es una decisión.</div>`)})();
  const L=rows.filter(r=>r.decision===F);
  $('#list').innerHTML=L.length?L.map(card).join(''):`<p class="foot">Nada en esta lista ahora.</p>`;
  const s=D.stats||{};$('#stats').innerHTML=`<div><b>${s.filled??s.n??0}<small style="font-size:12px">/${s.n||0}</small></b><small>ejecutadas</small></div><div><b>${s.t1||0}</b><small>tocaron +2 %</small></div><div><b>${s.t2||0}</b><small>tocaron +5 %</small></div><div><b>${s.stop||0}</b><small>stop</small></div>`;
@@ -98,7 +108,7 @@ function render(){if(!D)return;const rows=D.rows||[];
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{F=b.dataset.f;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));render()});
 async function load(){try{const r=await fetch('/api/signals',{cache:'no-store'});D=await r.json();
  if(F==='COMPRA'&&!(D.counts||{}).COMPRA&&(D.counts||{}).ESPERA){F='ESPERA';document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.f===F))}
- render()}catch(e){$('#foot').textContent='Sin conexión con el servidor; reintentando…'}}
+ render()}catch(e){if(D)render();$('#foot').textContent='Sin conexión con el servidor; reintentando…'}}
 async function hist(){try{const r=await fetch('https://raw.githubusercontent.com/ElprimetimeRD/radar-pre-explosion/main/data/live/summary.json?'+Date.now());const h=await r.json();const t=h.total||{};const pct=t.filled?Math.round(100*t.t1/t.filled):0;
  $('#hist').innerHTML=`<b>${h.days||0}</b> días · <b>${t.filled||0}</b> ejecutadas de ${t.n||0} señales · <b>${pct}%</b> tocaron +2 % · ${t.t2||0} llegaron a +5 % · ${t.stop||0} stops<br><small>Meta para subir tamaño: ≥ 50 % tocando +2 % con al menos 40 ejecutadas.</small>`}catch(e){$('#hist').textContent='Sin historial todavía (se guarda al cerrar cada sesión).'}}
 load();hist();setInterval(load,20000);
