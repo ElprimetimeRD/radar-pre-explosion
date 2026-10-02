@@ -30,7 +30,7 @@ jobs:
         run: |
           git config user.name "radar-bot"
           git config user.email "radar-bot@users.noreply.github.com"
-          git add -f data/diag/latencia.json data/diag/latencia.md
+          git add -f data/diag/latencia.json data/diag/latencia.md data/diag/bars_1m.csv.gz data/diag/daily.csv.gz
           git diff --cached --quiet && exit 0
           git commit -m "diagnóstico de retraso $(date -u +%Y-%m-%dT%H:%MZ)"
           git push origin HEAD:diag-velas

@@ -115,7 +115,7 @@ def main():
     except Exception:  # noqa: BLE001
         snap = {}
     rows = {r["t"]: r for r in snap.get("rows") or []}
-    syms = sorted({s["t"] for s in sigs} | set(mov))
+    syms = sorted({s["t"] for s in sigs} | set(mov) | set(rows) | {"SPY", "QQQ"})
     raw = yf.download(syms, period="7d", interval="1m", prepost=True, group_by="ticker", auto_adjust=True,
                       threads=True, progress=False)
     bars = {}
@@ -211,8 +211,34 @@ def main():
             m["left_after_alert_pct"] = round(100 * (m["hod"] / e - 1), 1)
         mv.append(m)
 
-    json.dump({"generated": datetime.now(ET).isoformat(), "signals": res, "movers": mv}, open(f"{OUT}/latencia.json", "w"),
-              indent=1, default=str)
+    json.dump({"generated": datetime.now(ET).isoformat(), "signals": res, "movers": mv,
+               "snapshot": [{k: r.get(k) for k in ("t", "decision", "reason", "score", "rvol", "chg", "src")}
+                            for r in rows.values()], "regime": snap.get("regimeText"), "universe": snap.get("universe")},
+              open(f"{OUT}/latencia.json", "w"), indent=1, default=str)
+    # Velas crudas para simular el semáforo minuto a minuto fuera de GitHub (últimos 5 días, con pre-market)
+    keep = []
+    for s, d in bars.items():
+        if d.empty:
+            continue
+        days = sorted(set(d["day"]))[-5:]
+        x = d[d["day"].isin(days)][["Open", "High", "Low", "Close", "Volume"]].copy()
+        x["ts"] = (x.index.tz_convert("UTC").astype("int64") // 10**9).astype(int)
+        x["t"] = s
+        keep.append(x.reset_index(drop=True))
+    if keep:
+        pd.concat(keep).round(4).to_csv(f"{OUT}/bars_1m.csv.gz", index=False, compression="gzip")
+    dd = yf.download(syms, period="3mo", interval="1d", group_by="ticker", auto_adjust=True, threads=True, progress=False)
+    daily = []
+    for s in syms:
+        try:
+            x = (dd[s] if isinstance(dd.columns, pd.MultiIndex) else dd).dropna(how="all").copy()
+        except KeyError:
+            continue
+        x["date"] = [i.date().isoformat() for i in x.index]
+        x["t"] = s
+        daily.append(x.reset_index(drop=True))
+    if daily:
+        pd.concat(daily).round(4).to_csv(f"{OUT}/daily.csv.gz", index=False, compression="gzip")
     df = pd.DataFrame(res)
     lines = [f"# Diagnóstico de retraso · {datetime.now(ET):%Y-%m-%d %H:%M} ET", ""]
     if not df.empty:
