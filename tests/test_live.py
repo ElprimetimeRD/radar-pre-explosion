@@ -685,8 +685,9 @@ def test_bridge_break():
     try:
         r = runner.Radar(notify=False)
         r.trades, r.arms, r.sent = {}, {}, set()
-        got, real_tg = [], r.tg
-        r.tg = lambda key, text, **kw: (got.append((key, text)), real_tg(key, text, **kw))
+        got, real_emit = [], r._emit
+        r._emit = lambda key, text, wait=True, private=False: (got.append((key, text, private)),
+                                                               real_emit(key, text, wait, private))
         a = {"level": 50.0, "entry": 50.05, "stop": 49.55, "t1": 51.05, "t2": 52.55, "risk": 1.0, "score": 70,
              "px": 49.9, "chg": 6.0, "reason": "debajo del máximo de apertura"}
         r.armed = {"AAA": dict(a), "BBB": dict(a)}
@@ -849,6 +850,275 @@ def test_telegram_state():
                 os.environ[k] = v
 
 
+def test_no_data_keeps_arms():
+    """Si Yahoo no entrega velas (límite), la acción no queda sin precio y la compra stop armada NO se cancela. Un NO
+    del mercado sí la cancela, salvo que el precio ya esté sobre la entrada (pudo activarse y las velas no lo muestran)."""
+    m = metrics.session_metrics(pd.DataFrame(), 9.6, None, DAY.replace(hour=10), live_px=10.2)
+    assert m["px"] == 10.2 and m["chg"] == round(100 * (10.2 / 9.6 - 1), 2), m
+    r0 = D.decide("X", m, ctx())
+    assert r0["decision"] == "NO" and r0.get("nodata"), r0                      # sin curva de volumen: NO por datos
+    assert D.decide("X", {}, ctx()).get("nodata")                                # sin precio: NO por datos
+    r = runner.Radar(notify=False)
+    r.trades, r.arms, r.sent, r.day = {}, {}, set(), DAY.date()
+    a = {"level": 50.0, "entry": 50.05, "stop": 49.55, "t1": 51.05, "t2": 52.55, "risk": 1.0, "score": 70, "px": 49.8}
+    for t in ("AAA", "BBB", "CCC", "DDD"):
+        r.arms[t] = runner.new_arm(t, a, DAY.date().isoformat(), "10:00", 600, 720)
+    flat = bars(DAY, [49.8, 49.8], 50000, start_m=601)
+    rows = [{"t": "AAA", "decision": "NO", "reason": "sin datos de precio", "nodata": True, "px": None},
+            {"t": "BBB", "decision": "NO", "reason": "debajo del VWAP: mandan los vendedores", "px": 49.7},
+            {"t": "CCC", "decision": "NO", "reason": "parabólico (+11.0% sobre VWAP): no persigas", "px": 50.9},
+            {"t": "DDD", "decision": "NO", "reason": "debajo del VWAP: mandan los vendedores", "px": 49.7}]
+    r._track_arms(rows, {"AAA": flat, "BBB": flat, "CCC": flat}, DAY.replace(hour=10, minute=3))
+    assert r.arms["AAA"]["status"] == "pendiente" and "arm-x:AAA" not in r.sent     # falla de datos: sigue armada
+    assert r.arms["BBB"]["status"] == "cancelada" and "arm-x:BBB" in r.sent         # NO del mercado: se cancela
+    assert r.arms["CCC"]["status"] == "pendiente"                                  # ya sobre la entrada: no cancela
+    assert r.arms["DDD"]["status"] == "pendiente"                                  # sin velas este ciclo: no cancela
+
+
+def test_partial_bars():
+    """La última vela de Yahoo llega a medio llenar: se revisa otra vez completa. Un stop tocado en la segunda mitad de
+    ese minuto se avisa; una vela repasada no repite eventos, no marca el +2 % ni el máximo con precios de antes de
+    llenarse la límite, y la vuelta a la entrada solo cuenta después de la vela del +2 %."""
+    r = runner.Radar(notify=False)
+    r.trades, r.arms, r.sent, r.day = {}, {}, set(), DAY.date()
+    sig = {"t": "RUN", "score": 70, "plan": {"entry": 10.0, "stop": 9.9, "t1": 10.2, "t2": 10.5, "risk": 1.0}}
+    r.trades["RUN"] = tr = runner.new_trade(sig, DAY.date().isoformat(), "10:02", 602, seen_m=600)
+    assert tr["m"] == 600 and tr["valid_m"] is None                       # sigue desde la última vela que vio la señal
+    t_et = DAY.replace(hour=10, minute=4)
+    b1 = bars(DAY, [10.0, 10.02, 10.03], 50000, start_m=601)              # 10:01–10:03; la de 10:03 a medio llenar
+    r._track([], {"RUN": b1}, t_et, "verde")
+    assert tr["status"] == "abierta" and tr["m"] == 601, tr               # las 2 últimas se vuelven a mirar
+    b2 = b1.copy()
+    b2.iloc[-1, b2.columns.get_loc("Low")] = 9.85                         # completa: bajó al stop en la 2.ª mitad
+    r._track([], {"RUN": b2}, t_et.replace(minute=5), "verde")
+    assert tr["status"] == "stop" and "stop:RUN" in r.sent, tr
+    # límite llenada en el retesteo: las velas de antes (más arriba) no son de la posición
+    lim = {"t": "LIM", "score": 70, "plan": {"entry": 10.0, "stop": 9.9, "t1": 10.2, "t2": 10.5, "risk": 1.0,
+                                              "limit": True, "valid_min": 10}}
+    o = runner.new_trade(lim, "d", "10:00", 600)
+    path = pd.DataFrame([(10.3, 10.35, 10.25, 10.3), (10.2, 10.22, 9.99, 10.05), (10.05, 10.08, 10.0, 10.06)],
+                        columns=["Open", "High", "Low", "Close"])
+    path["m"] = [601, 602, 603]
+    assert runner.advance(o, path) == ["fill"] and o["fill_m"] == 602 and not o["hit1"], o
+    assert runner.advance(o, path) == [] and not o["hit1"] and o["mfe"] < 1, o   # repaso: sin +2 % ni máximo falso
+    # +2 % en la vela 605; la 604 (antes) tocó la entrada: al repasarla no cierra la operación en la entrada
+    o2 = runner.new_trade(sig, "d", "10:00", 600)
+    p2 = pd.DataFrame([(10.0, 10.05, 9.99, 10.04), (10.04, 10.25, 10.03, 10.2)], columns=["Open", "High", "Low", "Close"])
+    p2["m"] = [604, 605]
+    assert runner.advance(o2, p2) == ["t1"] and o2["t1_m"] == 605
+    assert runner.advance(o2, p2) == [] and o2["status"] == "t1", o2
+
+
+def test_or_waits_for_bars():
+    """El rango de apertura se cierra cuando ya hay una vela posterior, no por el reloj (a las 9:35 con Yahoo atrasado
+    solo había 4 velas). Si la acción abre tarde (halt), el rango empieza en su primera vela y el nivel no sale NaN."""
+    k = metrics.OR_MINUTES
+    base = metrics.baseline_curve(five_days(), DAY.date())
+    b = bars(DAY, runner_path(k - 1), 40000)                                 # 9:30–9:33: falta la vela de 9:34
+    m = metrics.session_metrics(b, 9.6, base, DAY.replace(hour=9, minute=35, second=30))
+    assert not m["or_done"], m
+    b = bars(DAY, runner_path(k + 1), 40000)                                 # ya llegó la de 9:35
+    assert metrics.session_metrics(b, 9.6, base, DAY.replace(hour=9, minute=36))["or_done"]
+    late = bars(DAY, list(np.linspace(10.0, 10.6, 20)), 60000, start_m=600)   # abre a las 10:00
+    m = metrics.session_metrics(late, 9.6, base, DAY.replace(hour=10, minute=19))
+    assert m["or_end"] == 600 + k and m["or_done"] and np.isfinite(m["orh"]) and np.isfinite(m["breakout"]), m
+    r = D.decide("LATE", m, ctx())
+    assert r["level"] is None or np.isfinite(r["level"]), r
+
+
+def test_rvol_recent_and_parabolic():
+    """RVOL sin la vela a medio llenar; RVOL de los últimos 15 min (solo decide con RVOL15_IN_PLAY > 0); un parabólico
+    con noticia fresca y volumen fuerte queda en ESPERA (se sigue para el retroceso) en vez de NO."""
+    base = metrics.baseline_curve(five_days(), DAY.date())
+    n = 60
+    vol = [10000] * 45 + [40000] * 15                                          # volumen nuevo en los últimos 15 min
+    m = metrics.session_metrics(bars(DAY, [10.0] * n, vol), 9.9, base, DAY.replace(hour=10, minute=29))
+    assert 1.5 < m["rvol"] < 2.0 and m["rvol15"] > 3, m                        # acumulado bajo, reciente alto
+    assert D.decide("X", m, ctx())["decision"] == "NO"                         # apagado por defecto
+    old = D.RVOL15_IN_PLAY
+    try:
+        D.RVOL15_IN_PLAY = 3.0
+        assert "volumen relativo" not in D.decide("X", m, ctx())["reason"]
+    finally:
+        D.RVOL15_IN_PLAY = old
+    mm = test_compra()
+    hot = {**mm, "rvol": 6.0, "chg15": 18.0}
+    assert D.decide("X", hot, ctx())["decision"] == "NO"
+    r = D.decide("X", hot, ctx(cat={"type": "contract", "age": "fresh", "title": "x"}))
+    assert r["decision"] == "ESPERA" and "parabólico" in r["reason"] and r["level"] is None, r
+
+
+def test_context_retry_and_quotes_backoff():
+    """La curva de volumen o el cierre previo que fallaron se vuelven a pedir pasados CTX_RETRY_S (antes nunca); un
+    reintento fallido no borra lo bueno. Las cotizaciones v7 descansan 1, 2, 5 y 20 min según los fallos seguidos."""
+    from scanner.sources import yahoo
+    old_h, old_q, old_t = yahoo.history, yahoo.batch_quotes, runner.time.time
+    calls, ok = [], {"v": False}
+    daily = pd.DataFrame({"Open": 10.0, "High": 10.5, "Low": 10.0, "Close": 10.2, "Volume": 1e6},
+                         index=pd.date_range("2026-06-01", periods=60))
+
+    def history(syms, period="1y", interval="1d", prepost=False):
+        calls.append((tuple(syms), period))
+        if not ok["v"]:
+            return {}
+        return {s: (daily if interval == "1d" else five_days()) for s in syms}
+    clock = {"t": 1_000_000.0}
+    try:
+        yahoo.history = history
+        runner.time.time = lambda: clock["t"]
+        r = runner.Radar(notify=False)
+        r.ensure_context(["AAA"], DAY.date())
+        assert r.baseline["AAA"] is None and r.prev["AAA"] is None and len(calls) == 2
+        r.ensure_context(["AAA"], DAY.date())
+        assert len(calls) == 2                                                  # aún no toca reintentar
+        clock["t"] += runner.CTX_RETRY_S
+        ok["v"] = True
+        r.ensure_context(["AAA"], DAY.date())
+        assert r.baseline["AAA"] is not None and r.prev["AAA"] == 10.2 and r.atr["AAA"], (r.baseline.get("AAA"), r.prev)
+        clock["t"] += runner.CTX_RETRY_S
+        r.ensure_context(["AAA"], DAY.date())
+        assert len(calls) == 4                                                  # completo: no se vuelve a pedir
+        # cotizaciones: descanso creciente y vuelve a 0 al primer éxito
+        yahoo.batch_quotes = lambda syms: {}
+        waits = []
+        for _ in range(5):
+            r.q_off_until = 0
+            r.quotes(["AAA"])
+            waits.append(round(r.q_off_until - clock["t"]))
+        assert waits == [60, 120, 300, 1200, 1200], waits
+        yahoo.batch_quotes = lambda syms: {s: {"symbol": s} for s in syms}
+        r.q_off_until = 0
+        assert r.quotes(["AAA"]) and r.q_fail == 0
+    finally:
+        yahoo.history, yahoo.batch_quotes, runner.time.time = old_h, old_q, old_t
+
+
+def test_background_context():
+    """Con el hilo de contexto, el ciclo no espera noticias, SEC ni opciones: deja en cola lo que falta y usa lo último
+    que haya. El hilo lo trae y, si llega una noticia fresca, despierta al ciclo. Un None guardado (sin opciones) cuenta
+    como dato y no se vuelve a pedir en cada ciclo."""
+    from scanner.sources import other, yahoo
+    now = DAY.replace(hour=10, minute=0)
+    fetched = []
+    patches = {(yahoo, "news"): lambda s, count=10: (fetched.append(("news", s)),
+                                                     [{"title": f"{s} wins $50 million contract award", "ts": now.timestamp() - 600}])[1],
+               (yahoo, "option_chains"): lambda s, max_days=30: (fetched.append(("opt", s)), ([], False))[1],
+               (other, "sec_ticker_map"): lambda: {},
+               (halts, "fetch"): lambda: None}
+    old = {k: getattr(*k) for k in patches}
+    for (mod, name), fn in patches.items():
+        setattr(mod, name, fn)
+    try:
+        r = runner.Radar(notify=False)
+        r.bg = True
+        c = {"name": "Acme Corp"}
+        assert r._enrich("ACME", {"px": 12.0}, c, now.timestamp(), DAY.date(), True, True) is True
+        assert fetched == [] and "ACME" in r.enrich_q and not c.get("cat")       # el ciclo no esperó
+        r.wake.clear()
+        done = r.context_once(now)
+        assert done["enriched"] == 1 and ("news", "ACME") in fetched and ("opt", "ACME") in fetched, (done, fetched)
+        assert r.wake.is_set() and done["halts"]                                 # noticia fresca: despierta al ciclo
+        c = {"name": "Acme Corp"}
+        assert r._enrich("ACME", {"px": 12.0}, c, now.timestamp(), DAY.date(), True, True) is False
+        assert c["cat"]["type"] == "contract" and c["callVolOI"] is None
+        n = len(fetched)
+        assert r.opt_ctx("ACME", 12.0) is None and len(fetched) == n            # None en caché: no se vuelve a pedir
+    finally:
+        for (mod, name), fn in old.items():
+            setattr(mod, name, fn)
+
+
+def test_history_retry_and_lock():
+    """yf.download devuelve vacío (sin error) cuando Yahoo limita: el lote se pide una vez más."""
+    from scanner.sources import yahoo
+    old = (yahoo.yf.download, yahoo.time.sleep)
+    calls = []
+
+    def dl(chunk, **k):
+        calls.append(1)
+        return pd.DataFrame() if len(calls) == 1 else bars(DAY, [10.0, 10.1], 1000)
+    try:
+        yahoo.yf.download, yahoo.time.sleep = dl, lambda s: None
+        out = yahoo.history(["AAA"], period="1d", interval="1m")
+        assert len(calls) == 2 and "AAA" in out and len(out["AAA"]) == 2, (calls, out)
+    finally:
+        yahoo.yf.download, yahoo.time.sleep = old
+
+
+def test_breaks_outside_lock_and_private_log():
+    """El aviso de ruptura se manda fuera del candado (el puente no espera a Telegram) y el registro no guarda el precio
+    de IBKR, solo la clave."""
+    import logging
+    now = DAY.replace(hour=10, minute=0)
+    r = runner.Radar(notify=False)
+    r.sent = set()
+    a = {"level": 50.0, "entry": 50.05, "stop": 49.55, "t1": 51.05, "t2": 52.55, "risk": 1.0, "score": 70, "px": 49.9}
+    r.armed = {"AAA": dict(a)}
+    free = []
+    r._send = lambda text: (free.append(not r.brk_lock.locked()), True)[1]
+    seen = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            seen.append(rec.getMessage())
+    h = H()
+    runner.log.addHandler(h)
+    try:
+        assert r._check_breaks({"AAA": 50.1234}, "ibkr", now) == ["AAA"]
+        import time as _t
+        for _ in range(50):
+            if free:
+                break
+            _t.sleep(0.01)
+        assert free == [True], free                                            # sin candado al mandar
+        assert any("break:AAA:50.00" in x for x in seen) and not any("50.12" in x for x in seen), seen
+        assert r._check_breaks({"AAA": 50.2}, "yahoo", now) == []               # una sola vez
+    finally:
+        runner.log.removeHandler(h)
+
+
+def test_replay_and_api_limits():
+    """El replay recalculado va como mucho cada REPLAY_MIN_S; /api/news pide el token; el puente rechaza un cuerpo
+    grande por la cabecera antes de leerlo."""
+    import os
+    os.environ.update(NO_LOOP="1", NO_NOTIFY="1")
+    from fastapi.testclient import TestClient
+    from live import app as A
+    r = runner.Radar(notify=False)
+    r.replay = lambda step=10: {"status": "ok", "n": 1}
+    r.replay_async(10, True)
+    import time as _t
+    for _ in range(100):
+        if r.replay_state.get("status") == "ok":
+            break
+        _t.sleep(0.01)
+    assert r.replay_state["status"] == "ok" and r.replay_ts
+    runs = []
+    r.replay = lambda step=10: (runs.append(1), {"status": "ok"})[1]
+    assert "nota" in r.replay_async(10, True) and runs == [], runs              # muy pronto: devuelve el último
+    cl = TestClient(A.app)
+    os.environ.pop("POSITIONS_TOKEN", None)
+    assert cl.get("/api/news/AAPL").status_code == 503
+    os.environ["POSITIONS_TOKEN"] = "pos"
+    assert cl.get("/api/news/AAPL", headers={"X-Token": "malo"}).status_code == 401
+    os.environ["BRIDGE_TOKEN"] = "b"
+    big = cl.post("/api/bridge", content=b"x" * (A.BRIDGE_MAX + 1), headers={"X-Token": "b"})
+    assert big.status_code == 413, big.status_code
+    h = cl.get("/health").json()
+    assert "cycle_s" in h and h["context"]["on"] in (True, False), h
+    os.environ.pop("BRIDGE_TOKEN", None)
+    os.environ.pop("POSITIONS_TOKEN", None)
+
+
+def test_whale_early():
+    """La ballena de la ruptura del rango (9:35–9:40) ya cuenta: basta la mediana de 5 velas previas."""
+    vol = [20000] * 7
+    vol[6] = 300000
+    b = bars(DAY, list(np.linspace(10.0, 10.3, 7)), vol)
+    w = metrics.whale_bars(metrics.to_et(b).assign(), 576)
+    assert w["buy"] == 1, w
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -878,5 +1148,15 @@ if __name__ == "__main__":
     test_bridge_universe()
     test_bridge_api()
     test_telegram_state()
+    test_no_data_keeps_arms()
+    test_partial_bars()
+    test_or_waits_for_bars()
+    test_rvol_recent_and_parabolic()
+    test_context_retry_and_quotes_backoff()
+    test_background_context()
+    test_history_retry_and_lock()
+    test_breaks_outside_lock_and_private_log()
+    test_replay_and_api_limits()
+    test_whale_early()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})

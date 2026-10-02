@@ -14,6 +14,9 @@ MIN_PRICE = 1.0            # debajo: NO (spreads y dilución)
 MIN_USD_VOL = 3_000_000    # dólares negociados hoy en sesión
 MAX_SPREAD = 0.8           # % (1.5 % si el precio < 5)
 RVOL_IN_PLAY = 2.0         # volumen relativo mínimo a la misma hora
+# RVOL de los últimos 15 min que pone en juego a una acción aunque su RVOL acumulado no llegue (ruptura de media mañana
+# con volumen nuevo). 0 = apagado: se calcula y se muestra, pero no decide hasta medir con los resultados si ayuda.
+RVOL15_IN_PLAY = float(os.environ.get("RVOL15_IN_PLAY", "0"))
 EXT_MAX = 4.0              # % sobre VWAP: más que esto = esperar retroceso
 EXT_PARABOLIC = 10.0       # % sobre VWAP: no perseguir
 CHG15_PARABOLIC = 15.0     # % en 15 minutos: no perseguir
@@ -138,9 +141,18 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
            "whale": m.get("whale"), "cat": ctx.get("cat"), "watch": bool(ctx.get("watch")), "plan": None,
            "trigger": None, "level": None}
 
+    out["rvol15"] = m.get("rvol15")
+
     def res(decision, reason, trigger=None, plan=None, level=None):
         out.update(decision=decision, reason=reason, trigger=trigger, plan=plan, level=round(level, 4) if level else None)
         return out
+
+    def no_data(reason):
+        """NO por falta de datos (Yahoo no entregó velas o la curva de volumen), no por el mercado: el ciclo no cancela
+        con esto una compra stop armada (antes un fallo de Yahoo cancelaba todas por Telegram)."""
+        r = res("NO", reason)
+        r["nodata"] = True
+        return r
 
     def wait_break(reason, lvl):
         """ESPERA con gatillo de ruptura: compra stop un 0.1 % sobre el nivel, con su stop y objetivos."""
@@ -149,7 +161,7 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
 
     # ---- 1. Vetos duros ----
     if not px:
-        return res("NO", "sin datos de precio")
+        return no_data("sin datos de precio")
     if px < MIN_PRICE:
         return res("NO", f"precio < US${MIN_PRICE:g}: spreads y dilución")
     if ctx.get("offer") or ctx.get("offer30"):
@@ -186,8 +198,12 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     # ---- 2. ¿Está en juego? ----
     rv = m.get("rvol")
     cat_fresh = (ctx.get("cat") or {}).get("age") in ("fresh", "d1")
-    if not rv or rv < (1.5 if cat_fresh else RVOL_IN_PLAY):
-        return res("NO", f"sin volumen relativo (RVOL {rv:.1f}×)" if rv else "sin volumen relativo")
+    if rv is None:
+        return no_data("sin volumen relativo (falta la curva de volumen de los días previos)")
+    rv15 = m.get("rvol15") or 0
+    surge = RVOL15_IN_PLAY > 0 and rv >= 1.0 and rv15 >= RVOL15_IN_PLAY
+    if rv < (1.5 if cat_fresh else RVOL_IN_PLAY) and not surge:
+        return res("NO", f"sin volumen relativo (RVOL {rv:.1f}×)")
     if (m.get("usd_vol") or 0) < MIN_USD_VOL and now_m >= OPEN_M + OR_MINUTES:
         return res("NO", "poca liquidez en dólares")
     atr = ctx.get("atr")
@@ -198,11 +214,18 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
         return res("NO", "debajo del VWAP: mandan los vendedores")
     ext = m.get("ext") or 0
     if ext > EXT_PARABOLIC or (m.get("chg15") or 0) > CHG15_PARABOLIC:
-        return res("NO", f"parabólico (+{ext:.1f}% sobre VWAP): no persigas")
+        txt = f"+{ext:.1f}% sobre VWAP" if ext > EXT_PARABOLIC else f"+{m['chg15']:.1f}% en 15 min"
+        if rv >= 5 and cat_fresh:
+            # Con noticia fresca y volumen fuerte, el movimiento es real: no se persigue, pero se sigue mirando para
+            # entrar en el retroceso (antes salía NO y, si estaba armada, se cancelaba justo cuando rompía)
+            return res("ESPERA", f"parabólico ({txt}) con noticia y volumen: no persigas",
+                       f"compra si retrocede hacia {vwap * 1.02:.2f} y rebota" if vwap else "espera el retroceso")
+        return res("NO", f"parabólico ({txt}): no persigas")
 
     # ---- 3. En juego pero falta algo: ESPERA ----
     if not m.get("or_done"):
-        return res("ESPERA", "formando el rango de apertura", f"compra si rompe {orh:.2f} después de las {OPEN_TXT}")
+        end = m.get("or_end") or OPEN_M + OR_MINUTES
+        return res("ESPERA", "formando el rango de apertura", f"compra si rompe {orh:.2f} después de las {end // 60}:{end % 60:02d}")
     if ext > EXT_MAX:
         pull = vwap * 1.01
         return res("ESPERA", f"extendido +{ext:.1f}% sobre VWAP", f"compra si retrocede hacia {pull:.2f} y rebota")
