@@ -1,0 +1,35 @@
+name: Historial para avisos rápidos (rama diag-velas)
+
+on:
+  push:
+    branches: [diag-velas]
+    paths: ["tools/diag_dataset.py", ".github/workflows/diag-dataset.yml", "data/diag/ds_run.txt"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diag-dataset
+  cancel-in-progress: true
+
+jobs:
+  dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Historial
+        run: python tools/diag_dataset.py
+      - name: Commit
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add -f data/diag/ds_bars.csv.gz data/diag/ds_meta.json.gz
+          git diff --cached --quiet && exit 0
+          git commit -m "historial para avisos rápidos $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -X theirs origin diag-velas && git push origin HEAD:diag-velas && exit 0; sleep 5; done
+          exit 1
