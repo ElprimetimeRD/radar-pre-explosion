@@ -362,7 +362,11 @@ class Radar:
         self.bar_want: list[str] = []      # candidatas que el puente sigue con velas de IBKR (IBKR_BARS)
         self.ctx_cache: dict[str, dict] = {}  # contexto del último ciclo por ticker (noticias, mercado, spread, ATR…)
         self.early: dict[str, dict] = {}   # avisos tempranos de COMPRA con velas de IBKR: {ticker: hora y fuente}
-        self.vol_k: dict[str, float] = {}  # factor de volumen IBKR→Yahoo por ticker (se recalcula con cada ciclo)
+        self.vol_k: dict[str, float] = {}  # factor de volumen IBKR→Yahoo por ticker (0 = sin calibrar en este ciclo)
+        self.buy_lock = threading.Lock()   # la COMPRA del ciclo y el aviso temprano no se pisan (ni avisan los dos)
+        self.early_lock = threading.Lock()
+        self.early_pending: set[str] = set()  # acciones con velas nuevas de IBKR por revisar (hilo "temprano")
+        self.early_running = False
         self.reg_txt = ""
         self.tg_lock = threading.Lock()
         self.tg_state: dict = {}          # resultado del último envío a Telegram (para /health; sin el token)
@@ -1079,13 +1083,11 @@ class Radar:
         self.bar_want = (keep + [s for s in top if s not in keep])[:IBKR_BARS]
 
     def _vol_k(self, s: str, rows: list) -> float | None:
-        """Factor de volumen IBKR→Yahoo de un ticker, medido contra las velas de Yahoo del último ciclo."""
-        k = self.vol_k.get(s)
-        if k is None and rows:
-            k = vol_scale(self.last_bars.get(s), rows_frame(rows))
-            if k:
-                self.vol_k[s] = k
-        return k
+        """Factor de volumen IBKR→Yahoo de un ticker, medido contra las velas de Yahoo del último ciclo. Si no se puede
+        calibrar, queda anotado (0) hasta el próximo ciclo: antes se recalculaba en cada envío del puente (cada ~5 s)."""
+        if s not in self.vol_k and rows:
+            self.vol_k[s] = vol_scale(self.last_bars.get(s), rows_frame(rows)) or 0.0
+        return self.vol_k.get(s) or None
 
     def _early(self, syms: list[str], now: datetime) -> list[str]:
         """Las reglas del semáforo con las velas de IBKR (al día cada ~5 s) en vez de las de Yahoo (1–2 min de retraso)
@@ -1111,14 +1113,40 @@ class Radar:
             if r["decision"] != "COMPRA" or not r.get("plan"):
                 continue
             tr = new_trade(r, t_et.date().isoformat(), t_et.strftime("%H:%M"), now_m)
-            self.tg(f"early:{s}", buy_text(r, tr, self.reg_txt, head="🟢⚡ COMPRA", tail=(
+            with self.buy_lock:  # si el ciclo ya dio la COMPRA mientras se calculaba, el aviso temprano sobra
+                if s in self.trades or not self._claim(f"early:{s}"):
+                    continue
+                self.early.setdefault(s, {"early_t": t_et.strftime("%H:%M:%S"), "early_src": "ibkr"})
+            self._emit(f"early:{s}", buy_text(r, tr, self.reg_txt, head="🟢⚡ COMPRA", tail=(
                 "\nVisto con velas de IBKR antes que el semáforo (Yahoo va 1–2 min atrás). Confirma en tu gráfico; "
-                "el semáforo la reevalúa ya.")), wait=False)
-            self.early.setdefault(s, {"early_t": t_et.strftime("%H:%M:%S"), "early_src": "ibkr"})
+                "el semáforo la reevalúa ya.")), wait=False, private=True)
             out.append(s)
         if out:
             self.wake.set()
         return out
+
+    def _early_kick(self, syms: list[str]):
+        """Junta las acciones con velas nuevas y las revisa en un solo hilo: si llegan envíos mientras calcula, la
+        próxima vuelta las toma todas juntas (nunca dos cálculos a la vez ni una cola que crece)."""
+        with self.early_lock:
+            self.early_pending.update(syms)
+            if self.early_running:
+                return
+            self.early_running = True
+        threading.Thread(target=self._early_loop, name="temprano", daemon=True).start()
+
+    def _early_loop(self):
+        while True:
+            with self.early_lock:
+                syms = sorted(self.early_pending)
+                self.early_pending.clear()
+                if not syms:
+                    self.early_running = False
+                    return
+            try:
+                self._early(syms, datetime.now(timezone.utc))
+            except Exception as e:  # noqa: BLE001
+                log.warning("aviso temprano: %s", e)
 
     def on_bridge(self, scan: dict | None = None, quotes: dict | None = None, info: dict | None = None,
                   now: datetime | None = None, bars: dict | None = None) -> dict:
@@ -1134,8 +1162,11 @@ class Radar:
         fired, early = [], []
         if phase == "open":
             fired = self._check_breaks({s: self.bridge.price(s) for s in fresh if s in armed}, "ibkr", now)
-            if changed:
-                early = self._early(changed, now)
+            if changed and IBKR_BARS > 0:
+                if self.bg:
+                    self._early_kick(changed)  # en otro hilo: el puente no espera los cálculos (pandas) de cada envío
+                else:
+                    early = self._early(changed, now)
         t_et = now.astimezone(ET)
         out = {"ok": True, "phase": phase, "fired": fired,
                "armed": {s: {"level": a["level"], "entry": a["entry"]} for s, a in armed.items()},
@@ -1181,7 +1212,9 @@ class Radar:
         for r in rows:
             if r["decision"] != "COMPRA" or r["t"] in self.trades:
                 continue
-            tr = self.trades[r["t"]] = new_trade(r, day, t_et.strftime("%H:%M"), now_m)
+            with self.buy_lock:  # el aviso temprano (otro hilo) mira self.trades y anota self.early
+                tr = self.trades[r["t"]] = new_trade(r, day, t_et.strftime("%H:%M"), now_m)
+                e = dict(self.early.get(r["t"]) or {})
             lvl, late = r.get("level"), ""
             if lvl:
                 # Qué tan tarde llega la señal: minutos desde la ruptura y cuánto sobre el nivel queda la entrada
@@ -1190,7 +1223,6 @@ class Radar:
                 tr["lag_min"] = break_lag(bars.get(r["t"]), lvl, t_et)
                 if tr["lag_min"] is not None:
                     late = f"\nRompió {lvl:.2f} hace {tr['lag_min']} min; la entrada queda {tr['slip']:+.1f}% sobre el nivel."
-            e = self.early.get(r["t"])
             if e:  # ya la avisó el aviso temprano con velas de IBKR: se anota cuándo (sin precios) para medir cuánto adelantó
                 tr.update(e)
                 late += f"\nIBKR la vio a las {e['early_t']} (aviso 🟢⚡)."

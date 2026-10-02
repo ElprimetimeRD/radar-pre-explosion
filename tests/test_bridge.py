@@ -409,7 +409,9 @@ async def _bars_scenario():
         await p.bars_task                                                  # se piden en segundo plano
         assert set(p.bar_subs) == {"AAA", "BBB"} and {"NOPE", "EEE"} <= set(p.bar_bad), (p.bar_subs, p.bar_bad)
         assert ("velas", "AAA", "", "1 D", "1 min", "TRADES", False, 2, True, "SMART") in ib.calls, ib.calls
-        assert p.error == P.NO_VELAS and ("cancelar velas", "EEE") in ib.calls  # la vacía no queda abierta
+        assert p.bars_error == P.NO_VELAS and p.error is None and ("cancelar velas", "EEE") in ib.calls  # aparte
+        p.on_tickers([])                                                   # un precio no borra el problema de velas
+        assert p.bars_error == P.NO_VELAS
         assert p.wake.is_set() and p.bars_pending()
         # 2) Manda el día completo de las dos (desde las 4:00 ET: la vela de ayer no va)
         await p.step()
@@ -439,7 +441,7 @@ async def _bars_scenario():
             await p.step()
             assert ("cancelar velas", "BBB") in ib.calls and "BBB" not in p.bar_subs
             await p.bars_task
-            assert {"CCC", "DDD"} <= set(p.bar_subs) and p.error is None    # volvieron a llegar velas: sin error
+            assert {"CCC", "DDD"} <= set(p.bar_subs) and p.error is None and p.bars_error is None  # volvieron
             await p.step()
             first = srv.got[-1]["bars"]
             await p.step()
@@ -585,8 +587,24 @@ def test_bars_end_to_end():
     asyncio.run(_bars_end_to_end())
 
 
+def test_full_day_backoff():
+    """Si el semáforo no guarda el día completo de una acción (sigue pidiendo desde 0), el puente no lo reenvía cada
+    segundo: espera 15 s, 30 s, 1 min… hasta 5 min. Con el acuse, vuelve a mandar solo lo nuevo."""
+    t4 = datetime(2026, 9, 29, 8, 0, tzinfo=timezone.utc)
+    p = P.Puente(dict(P.DEFAULTS, BRIDGE_TOKEN="t"), FakeIB(), lambda *a: {})
+    p.bar_subs = {"AAA": [_bar(t4 + timedelta(minutes=i), 10.0) for i in range(5)]}
+    p.bar_want, p.bar_t0 = {"AAA": 0}, int(t4.timestamp())
+    assert p.bars_pending() and len(p.bars_payload()["AAA"]) == 5          # primera vez: el día completo
+    assert not p.bars_pending() and p.bars_payload() == {}                  # sin acuse: no lo repite enseguida
+    p.full_try["AAA"] = (p.full_try["AAA"][0], 0.0)                          # pasó la espera
+    assert p.bars_pending() and "AAA" in p.bars_payload()
+    n, nxt = p.full_try["AAA"]
+    assert n == 2 and nxt > time.monotonic() + 25, p.full_try               # la espera crece
+
+
 if __name__ == "__main__":
     test_config()
+    test_full_day_backoff()
     test_http_errors()
     test_bar_row()
     test_quiet_log()

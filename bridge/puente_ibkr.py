@@ -37,7 +37,7 @@ try:
 except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarlo
     IB = ScannerSubscription = Stock = StartupFetch = None
 
-VERSION = "1.2"
+VERSION = "1.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, "puente.env")
 LOG_FILE = os.path.join(HERE, "puente.log")
@@ -189,6 +189,8 @@ class Puente:
         self.bar_subs: dict = {}               # ticker -> velas de 1 min que IBKR mantiene al día (BarDataList)
         self.bar_sent: dict[str, list] = {}    # última vela mandada de cada ticker (no se repite si no cambió)
         self.bar_bad: dict[str, float] = {}    # tickers cuyas velas fallaron -> cuándo reintentar
+        self.full_try: dict[str, tuple[int, float]] = {}  # envíos del día completo sin acuse -> (veces, próximo)
+        self.bars_error: str | None = None     # problema de las velas (162), aparte del de los precios
         self.bars_task: asyncio.Task | None = None
         self.conn_n = 0                        # conexiones hechas (una suscripción de otra conexión ya no sirve)
         self.phase: str | None = None
@@ -225,10 +227,11 @@ class Puente:
             if code != 162 and code not in HINTS:
                 return  # ya quedó en el registro; los de datos (162, 10089…) siguen y marcan el estado
         if code == 162:  # error del servicio de datos históricos (permisos o acción sin datos)
-            if self.error != NO_VELAS:
+            # Se guarda aparte: antes el primer precio que llegaba lo borraba y el estado decía OK con las velas caídas
+            if self.bars_error != NO_VELAS:
                 log.warning("IBKR no dio velas (162): %s. Si habla de permisos, es lo mismo que el 10089: falta la "
                             "suscripción de datos para la API.", text)
-            self.set_error(code, NO_VELAS)
+            self.bars_error = NO_VELAS
             return
         if code in CLEARS:
             if self.error_code in CLEARS[code]:
@@ -475,6 +478,9 @@ class Puente:
                         self.bar_bad[s] = time.monotonic() + 300
                     continue
                 self.bar_subs[s] = bars
+                if self.bars_error:
+                    log.info("IBKR vuelve a mandar velas.")
+                    self.bars_error = None
                 if self.error_code in DATA_ERRORS:
                     log.info("IBKR vuelve a mandar datos.")
                     self.set_error(None, None)
@@ -482,9 +488,14 @@ class Puente:
         except Exception:  # noqa: BLE001
             log.exception("Las velas fallaron; reintento en la próxima vuelta.")
 
+    def full_ok(self, s: str) -> bool:
+        """¿Toca mandar (otra vez) el día completo de s? Si el semáforo no lo guardó (sigue en 0), espera 15 s, 30 s,
+        1 min… hasta 5 min entre intentos: antes lo reenviaba cada segundo sin fin (~130 KB cada vez)."""
+        return time.monotonic() >= self.full_try.get(s, (0, 0.0))[1]
+
     def bars_pending(self) -> bool:
-        """¿Hay una acción con velas cuyo día completo el semáforo todavía no tiene?"""
-        return any(len(b) and not self.bar_want.get(s) for s, b in list(self.bar_subs.items()))
+        """¿Hay una acción con velas cuyo día completo el semáforo todavía no tiene (y toca mandarlo)?"""
+        return any(len(b) and not self.bar_want.get(s) and self.full_ok(s) for s, b in list(self.bar_subs.items()))
 
     def bars_payload(self) -> dict:
         """Velas para el semáforo: de cada acción, desde la última que ya tiene (la que se está formando puede haber
@@ -493,6 +504,8 @@ class Puente:
         out, left = {}, BAR_BUDGET
         for s in sorted(self.bar_subs, key=lambda s: not self.bar_want.get(s)):
             have = self.bar_want.get(s, 0)
+            if not have and not self.full_ok(s):
+                continue
             frm = max(have, self.bar_t0)
             rows = []
             for b in reversed(list(self.bar_subs[s])):
@@ -511,6 +524,12 @@ class Puente:
                 continue
             out[s] = rows
             left -= len(rows)
+            if not have:
+                n = self.full_try.get(s, (0, 0.0))[0]
+                if n >= 2:
+                    log.warning("El semáforo no guardó las velas de %s (%d envíos); reintento en %d s.", s, n,
+                                min(300, 15 * 2 ** n))
+                self.full_try[s] = (n + 1, time.monotonic() + min(300, 15 * 2 ** n))
         return out
 
     # ---------------- semáforo ----------------
@@ -529,7 +548,8 @@ class Puente:
         bars = self.bars_payload()
         sent_scan = self.scan if scan else None
         payload = {"v": 1, "quotes": q, "info": {"ib": self.state, "error": self.error, "lines": len(self.tickers),
-                                                 "bars": len(self.bar_subs), "ver": VERSION}}
+                                                 "bars": len(self.bar_subs), "bars_error": self.bars_error,
+                                                 "ver": VERSION}}
         if scan:
             payload["scan"] = sent_scan
         if bars:
@@ -567,6 +587,9 @@ class Puente:
             log.info("El semáforo avisó la ruptura de %s por Telegram.", s)
         for s in resp.get("early") or []:
             log.info("El semáforo avisó la COMPRA de %s por Telegram con velas de IBKR.", s)
+        for s, t in want.items():
+            if t:
+                self.full_try.pop(s, None)  # el semáforo ya tiene su día: los envíos vuelven a ser solo lo nuevo
         self.phase, self.armed, self.bar_want = phase, armed, want
         self.bar_t0 = int(num(resp.get("bars_t0")) or 0)
         return "ok"

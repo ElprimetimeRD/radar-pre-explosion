@@ -1024,6 +1024,8 @@ def test_background_context():
         n = len(fetched)
         assert r.opt_ctx("ACME", 12.0) is None and len(fetched) == n            # None en caché: no se vuelve a pedir
     finally:
+        for (mod, name), fn in old.items():
+            setattr(mod, name, fn)
 
 
 def test_bridge_bars_state():
@@ -1096,8 +1098,8 @@ def test_early_ibkr():
     try:
         r = runner.Radar(notify=False)
         r.trades, r.arms, r.sent = {}, {}, set()
-        got, real_tg = [], r.tg
-        r.tg = lambda key, text, **kw: (got.append((key, text)), real_tg(key, text, **kw))
+        got, real_emit = [], r._emit
+        r._emit = lambda key, text, wait=True, private=False: (got.append((key, text)), real_emit(key, text, wait, private))
         r.universe, r.universe_ts = ["RUN"], 1e18
         r.cycle(now.astimezone(ET))
         row = next(x for x in r.snapshot["rows"] if x["t"] == "RUN")
@@ -1275,6 +1277,64 @@ def test_armed_survives_missing_data():
     gate.set()
 
 
+def test_early_async_and_race():
+    """En el servicio, el aviso temprano corre en su hilo: el puente no espera los cálculos y los envíos que llegan
+    mientras tanto se juntan. Si el ciclo dio la COMPRA mientras se calculaba, el temprano no avisa. Una calibración de
+    volumen imposible queda anotada hasta el próximo ciclo (no se recalcula en cada envío)."""
+    import threading as th
+    r = runner.Radar(notify=False)
+    r.sent, r.trades = set(), {}
+    gate, calls = th.Event(), []
+
+    def slow(syms, now):
+        calls.append(list(syms))
+        gate.wait(2)
+        return []
+    r._early = slow
+    r._early_kick(["AAA"])
+    import time as _t
+    for _ in range(100):
+        if calls:
+            break
+        _t.sleep(0.01)
+    r._early_kick(["BBB"])
+    r._early_kick(["CCC", "BBB"])                                            # llegan mientras calcula: se juntan
+    gate.set()
+    for _ in range(200):
+        if not r.early_running:
+            break
+        _t.sleep(0.01)
+    assert calls == [["AAA"], ["BBB", "CCC"]] and not r.early_running, calls
+    # carrera: el ciclo crea la COMPRA mientras el temprano calcula (aquí, dentro de decide)
+    r2 = runner.Radar(notify=False)
+    r2.sent, r2.trades = set(), {}
+    r2.bar_want, r2.ctx_cache = ["RUN"], {"RUN": {"ctx": {}, "prev": 10.0}}
+    r2.bridge.bar_rows = lambda s: [[1_790_000_000, 10, 10, 10, 10, 100]]
+    r2._vol_k = lambda s, rows: 1.0
+    plan = {"entry": 10.0, "stop": 9.9, "t1": 10.2, "t2": 10.5, "risk": 1.0}
+    olds = (runner.IBKR_BARS, runner.session_metrics, runner.decide, runner.phase_of)
+
+    def cycle_wins(s, m, ctx):
+        r2.trades["RUN"] = {"t": "RUN"}
+        return {"t": "RUN", "decision": "COMPRA", "plan": plan, "why": [], "score": 70, "px": 10.0}
+    try:
+        runner.IBKR_BARS, runner.session_metrics, runner.decide = 5, lambda *a, **k: {}, cycle_wins
+        runner.phase_of = lambda now: "open"
+        assert r2._early(["RUN"], DAY.replace(hour=10)) == [] and "early:RUN" not in r2.sent and not r2.early
+    finally:
+        runner.IBKR_BARS, runner.session_metrics, runner.decide, runner.phase_of = olds
+    del r2._vol_k
+    calc = []
+    r2.last_bars = {"ZZZ": None}
+    assert r2._vol_k("ZZZ", [[1_790_000_000, 1, 1, 1, 1, 1]]) is None and r2.vol_k["ZZZ"] == 0.0
+    old = runner.vol_scale
+    runner.vol_scale = lambda *a: (calc.append(1), 5.0)[1]
+    try:
+        assert r2._vol_k("ZZZ", [[1_790_000_000, 1, 1, 1, 1, 1]]) is None and calc == []   # anotado: no recalcula
+    finally:
+        runner.vol_scale = old
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -1318,5 +1378,6 @@ if __name__ == "__main__":
     test_armed_survives_missing_data()
     test_bridge_bars_state()
     test_early_ibkr()
+    test_early_async_and_race()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})

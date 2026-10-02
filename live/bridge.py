@@ -191,4 +191,4 @@ class Bridge:
                     "scan": {k: len(v) for k, v in self.scan.items()} if scan_ok else {},
                     "quotes": sum(1 for q in self.quotes.values() if now - q["ts"] <= QUOTE_TTL),
                     "bars": sum(1 for s, ts in self.bars_ts.items() if now - ts <= BARS_TTL and self.bars.get(s)),
-                    "ib": self.info.get("ib"), "error": self.info.get("error")}
+                    "ib": self.info.get("ib"), "error": self.info.get("error"), "bars_error": self.info.get("bars_error")}
