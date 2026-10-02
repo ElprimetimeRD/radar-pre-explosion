@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-02T13:45:38.517392-04:00",
+ "generated": "2026-10-02T13:47:45.621164-04:00",
  "signals": [
   {
    "day": "2026-09-29",
@@ -514,9 +514,9 @@
    "low_m": "09:32",
    "run_before_pct": 13.69,
    "min_since_low": 55,
-   "ignition": "09:37",
-   "min_after_ignition": 50,
-   "entry_vs_ignition_pct": 9.21,
+   "ignition": "09:41",
+   "min_after_ignition": 46,
+   "entry_vs_ignition_pct": 7.1,
    "max_60m_pct": 12.05,
    "min_60m_pct": -7.83,
    "move_done_pct": 50.0,
@@ -728,9 +728,9 @@
    "ignition": "13:01",
    "min_after_ignition": 31,
    "entry_vs_ignition_pct": 0.6,
-   "max_60m_pct": 0.52,
+   "max_60m_pct": 0.67,
    "min_60m_pct": -0.08,
-   "move_done_pct": 83.0,
+   "move_done_pct": 79.0,
    "first_touch": null,
    "first_touch_m": null
   },
@@ -944,8 +944,8 @@
  "movers": [
   {
    "t": "NNBR",
-   "chg": 28.8,
-   "usd_vol_m": 36.5,
+   "chg": 28.5,
+   "usd_vol_m": 37.3,
    "open": 3.77,
    "hod": 4.7,
    "hod_m": "13:44",
@@ -953,7 +953,7 @@
    "or_break": "09:46",
    "radar_first": "ARMA 11:59",
    "now_decision": "NO",
-   "now_reason": "parab\u00f3lico (+13.4% sobre VWAP): no persigas",
+   "now_reason": "parab\u00f3lico (+13.2% sobre VWAP): no persigas",
    "ignition": "09:38",
    "left_after_alert_pct": 14.2
   },
@@ -972,9 +972,23 @@
    "ignition": "09:38"
   },
   {
+   "t": "NFE",
+   "chg": 18.9,
+   "usd_vol_m": 3.0,
+   "open": 5.87,
+   "hod": 7.0851,
+   "hod_m": "13:20",
+   "open_to_hod_pct": 20.7,
+   "or_break": "09:44",
+   "radar_first": null,
+   "now_decision": "NO",
+   "now_reason": "sin volumen relativo (RVOL 1.9\u00d7)",
+   "ignition": "09:46"
+  },
+  {
    "t": "FEAM",
    "chg": 15.5,
-   "usd_vol_m": 5.5,
+   "usd_vol_m": 5.6,
    "open": 3.27,
    "hod": 3.88,
    "hod_m": "12:04",
@@ -988,7 +1002,7 @@
   {
    "t": "IMOS",
    "chg": 13.8,
-   "usd_vol_m": 15.6,
+   "usd_vol_m": 15.7,
    "open": 79.88,
    "hod": 83.08,
    "hod_m": "13:08",
@@ -1003,7 +1017,7 @@
   {
    "t": "SYNA",
    "chg": 13.7,
-   "usd_vol_m": 725.7,
+   "usd_vol_m": 726.6,
    "open": 121.66,
    "hod": 121.98,
    "hod_m": "09:31",
@@ -1017,23 +1031,23 @@
   },
   {
    "t": "VSH",
-   "chg": 13.4,
-   "usd_vol_m": 171.9,
+   "chg": 13.3,
+   "usd_vol_m": 172.9,
    "open": 35.73,
-   "hod": 38.88,
-   "hod_m": "13:44",
-   "open_to_hod_pct": 8.8,
+   "hod": 38.94,
+   "hod_m": "13:46",
+   "open_to_hod_pct": 9.0,
    "or_break": "09:45",
    "radar_first": "ARMA 11:59",
    "now_decision": "COMPRA",
    "now_reason": "en juego, sobre VWAP y rompiendo con impulso",
    "ignition": "09:45",
-   "left_after_alert_pct": 0.4
+   "left_after_alert_pct": 0.5
   },
   {
    "t": "MXL",
-   "chg": 13.0,
-   "usd_vol_m": 317.3,
+   "chg": 13.1,
+   "usd_vol_m": 319.2,
    "open": 94.455,
    "hod": 105.55,
    "hod_m": "10:09",
@@ -1047,8 +1061,8 @@
   },
   {
    "t": "WOLF",
-   "chg": 12.5,
-   "usd_vol_m": 181.8,
+   "chg": 12.6,
+   "usd_vol_m": 182.4,
    "open": 32.35,
    "hod": 36.4896,
    "hod_m": "10:47",
@@ -1061,8 +1075,8 @@
   },
   {
    "t": "WNC",
-   "chg": 12.3,
-   "usd_vol_m": 11.4,
+   "chg": 12.6,
+   "usd_vol_m": 11.5,
    "open": 12.95,
    "hod": 14.12,
    "hod_m": "11:57",
@@ -1076,8 +1090,8 @@
   },
   {
    "t": "AZTA",
-   "chg": 11.4,
-   "usd_vol_m": 89.2,
+   "chg": 11.5,
+   "usd_vol_m": 89.3,
    "open": 35.05,
    "hod": 41.995,
    "hod_m": "10:44",
@@ -1089,24 +1103,9 @@
    "ignition": "09:42"
   },
   {
-   "t": "RXO",
-   "chg": 11.0,
-   "usd_vol_m": 33.3,
-   "open": 21.79,
-   "hod": 23.78,
-   "hod_m": "13:36",
-   "open_to_hod_pct": 9.1,
-   "or_break": "09:42",
-   "radar_first": "COMPRA 12:45",
-   "now_decision": "ESPERA",
-   "now_reason": "a\u00fan no rompe 23.75 (m\u00e1ximo previo)",
-   "ignition": "09:44",
-   "left_after_alert_pct": 0.2
-  },
-  {
    "t": "PENG",
-   "chg": 10.7,
-   "usd_vol_m": 99.2,
+   "chg": 11.1,
+   "usd_vol_m": 100.0,
    "open": 57.22,
    "hod": 61.39,
    "hod_m": "13:39",
@@ -1117,6 +1116,21 @@
    "now_reason": "a\u00fan no rompe 61.05 (m\u00e1ximo previo)",
    "ignition": "10:45",
    "left_after_alert_pct": 0.5
+  },
+  {
+   "t": "RXO",
+   "chg": 10.9,
+   "usd_vol_m": 33.9,
+   "open": 21.79,
+   "hod": 23.78,
+   "hod_m": "13:36",
+   "open_to_hod_pct": 9.1,
+   "or_break": "09:42",
+   "radar_first": "COMPRA 12:45",
+   "now_decision": "ESPERA",
+   "now_reason": "sin impulso ahora",
+   "ignition": "09:44",
+   "left_after_alert_pct": 0.2
   },
   {
    "t": "EVGO",
@@ -1133,9 +1147,23 @@
    "ignition": "09:52"
   },
   {
+   "t": "SILC",
+   "chg": 9.5,
+   "usd_vol_m": 6.5,
+   "open": 54.99,
+   "hod": 58.735,
+   "hod_m": "13:46",
+   "open_to_hod_pct": 6.8,
+   "or_break": "09:49",
+   "radar_first": null,
+   "now_decision": "fuera del universo",
+   "now_reason": null,
+   "ignition": "10:04"
+  },
+  {
    "t": "IBRX",
-   "chg": 9.3,
-   "usd_vol_m": 213.9,
+   "chg": 9.4,
+   "usd_vol_m": 214.5,
    "open": 9.42,
    "hod": 10.55,
    "hod_m": "11:21",
@@ -1147,51 +1175,9 @@
    "ignition": "09:52"
   },
   {
-   "t": "INIO",
-   "chg": 9.0,
-   "usd_vol_m": 46.4,
-   "open": 18.8,
-   "hod": 19.97,
-   "hod_m": "12:22",
-   "open_to_hod_pct": 6.2,
-   "or_break": "09:43",
-   "radar_first": null,
-   "now_decision": "fuera del universo",
-   "now_reason": null,
-   "ignition": "10:03"
-  },
-  {
-   "t": "VECO",
-   "chg": 9.0,
-   "usd_vol_m": 51.6,
-   "open": 55.5,
-   "hod": 59.99,
-   "hod_m": "09:39",
-   "open_to_hod_pct": 8.1,
-   "or_break": "09:35",
-   "radar_first": null,
-   "now_decision": "NO",
-   "now_reason": "debajo del VWAP: mandan los vendedores",
-   "ignition": "10:39"
-  },
-  {
-   "t": "SILC",
-   "chg": 8.9,
-   "usd_vol_m": 6.2,
-   "open": 54.99,
-   "hod": 58.67,
-   "hod_m": "13:40",
-   "open_to_hod_pct": 6.7,
-   "or_break": "09:49",
-   "radar_first": null,
-   "now_decision": "fuera del universo",
-   "now_reason": null,
-   "ignition": "10:04"
-  },
-  {
    "t": "ALGM",
-   "chg": 8.7,
-   "usd_vol_m": 117.9,
+   "chg": 9.1,
+   "usd_vol_m": 119.8,
    "open": 38.15,
    "hod": 39.9,
    "hod_m": "11:34",
@@ -1204,8 +1190,36 @@
    "left_after_alert_pct": -0.1
   },
   {
+   "t": "VECO",
+   "chg": 9.0,
+   "usd_vol_m": 51.7,
+   "open": 55.5,
+   "hod": 59.99,
+   "hod_m": "09:39",
+   "open_to_hod_pct": 8.1,
+   "or_break": "09:35",
+   "radar_first": null,
+   "now_decision": "NO",
+   "now_reason": "debajo del VWAP: mandan los vendedores",
+   "ignition": "10:39"
+  },
+  {
+   "t": "INIO",
+   "chg": 8.9,
+   "usd_vol_m": 46.5,
+   "open": 18.8,
+   "hod": 19.97,
+   "hod_m": "12:22",
+   "open_to_hod_pct": 6.2,
+   "or_break": "09:43",
+   "radar_first": null,
+   "now_decision": "fuera del universo",
+   "now_reason": null,
+   "ignition": "10:03"
+  },
+  {
    "t": "SOC",
-   "chg": 8.5,
+   "chg": 8.4,
    "usd_vol_m": 22.1,
    "open": 3.51,
    "hod": 3.7,
@@ -1219,8 +1233,8 @@
   },
   {
    "t": "PL",
-   "chg": 8.2,
-   "usd_vol_m": 139.2,
+   "chg": 8.3,
+   "usd_vol_m": 140.9,
    "open": 16.55,
    "hod": 17.7069,
    "hod_m": "10:52",
@@ -1232,23 +1246,9 @@
    "ignition": "09:46"
   },
   {
-   "t": "UWMC",
-   "chg": 8.2,
-   "usd_vol_m": 12.7,
-   "open": 1.25,
-   "hod": 1.33,
-   "hod_m": "09:36",
-   "open_to_hod_pct": 6.4,
-   "or_break": "09:36",
-   "radar_first": null,
-   "now_decision": "fuera del universo",
-   "now_reason": null,
-   "ignition": "10:44"
-  },
-  {
    "t": "HPE",
-   "chg": 8.0,
-   "usd_vol_m": 1229.5,
+   "chg": 8.2,
+   "usd_vol_m": 1235.0,
    "open": 66.88,
    "hod": 70.185,
    "hod_m": "12:57",
@@ -1261,8 +1261,8 @@
   },
   {
    "t": "MTSI",
-   "chg": 8.0,
-   "usd_vol_m": 239.4,
+   "chg": 8.1,
+   "usd_vol_m": 240.4,
    "open": 311.5,
    "hod": 326.53,
    "hod_m": "13:32",
@@ -1276,7 +1276,7 @@
   {
    "t": "TER",
    "chg": 7.9,
-   "usd_vol_m": 940.2,
+   "usd_vol_m": 944.2,
    "open": 428.49,
    "hod": 450.61,
    "hod_m": "11:56",
@@ -1289,23 +1289,23 @@
    "left_after_alert_pct": 0.2
   },
   {
-   "t": "KRMN",
+   "t": "UWMC",
    "chg": 7.8,
-   "usd_vol_m": 48.8,
-   "open": 32.15,
-   "hod": 34.42,
-   "hod_m": "13:43",
-   "open_to_hod_pct": 7.1,
-   "or_break": "09:46",
+   "usd_vol_m": 12.7,
+   "open": 1.25,
+   "hod": 1.33,
+   "hod_m": "09:36",
+   "open_to_hod_pct": 6.4,
+   "or_break": "09:36",
    "radar_first": null,
    "now_decision": "fuera del universo",
    "now_reason": null,
-   "ignition": "10:02"
+   "ignition": "10:44"
   },
   {
    "t": "ACLS",
    "chg": 7.7,
-   "usd_vol_m": 40.1,
+   "usd_vol_m": 40.2,
    "open": 142.18,
    "hod": 149.95,
    "hod_m": "10:57",
@@ -1317,9 +1317,23 @@
    "ignition": "10:39"
   },
   {
+   "t": "KRMN",
+   "chg": 7.7,
+   "usd_vol_m": 48.9,
+   "open": 32.15,
+   "hod": 34.42,
+   "hod_m": "13:43",
+   "open_to_hod_pct": 7.1,
+   "or_break": "09:46",
+   "radar_first": null,
+   "now_decision": "fuera del universo",
+   "now_reason": null,
+   "ignition": "10:02"
+  },
+  {
    "t": "NTAP",
    "chg": 7.6,
-   "usd_vol_m": 562.0,
+   "usd_vol_m": 563.1,
    "open": 216.43,
    "hod": 231.51,
    "hod_m": "13:44",
@@ -1329,20 +1343,6 @@
    "now_decision": "fuera del universo",
    "now_reason": null,
    "ignition": "10:24"
-  },
-  {
-   "t": "VIRT",
-   "chg": 7.5,
-   "usd_vol_m": 46.0,
-   "open": 55.11,
-   "hod": 59.84,
-   "hod_m": "13:42",
-   "open_to_hod_pct": 8.6,
-   "or_break": "09:35",
-   "radar_first": null,
-   "now_decision": "fuera del universo",
-   "now_reason": null,
-   "ignition": "09:55"
   },
   {
    "t": "CAMT",
@@ -1359,18 +1359,855 @@
    "ignition": "09:38"
   },
   {
-   "t": "POWI",
-   "chg": 7.2,
-   "usd_vol_m": 25.2,
-   "open": 53.57,
-   "hod": 55.845,
-   "hod_m": "13:11",
-   "open_to_hod_pct": 4.2,
+   "t": "VIRT",
+   "chg": 7.4,
+   "usd_vol_m": 46.2,
+   "open": 55.11,
+   "hod": 59.84,
+   "hod_m": "13:42",
+   "open_to_hod_pct": 8.6,
    "or_break": "09:35",
    "radar_first": null,
    "now_decision": "fuera del universo",
    "now_reason": null,
-   "ignition": "09:52"
+   "ignition": "09:55"
   }
- ]
+ ],
+ "snapshot": [
+  {
+   "t": "VSH",
+   "decision": "COMPRA",
+   "reason": "en juego, sobre VWAP y rompiendo con impulso",
+   "score": 73,
+   "rvol": 4.22,
+   "chg": 13.13,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "ALGM",
+   "decision": "ESPERA",
+   "reason": "debajo del m\u00e1ximo del d\u00eda 39.90: la primera ruptura no aguant\u00f3",
+   "score": 81,
+   "rvol": 3.9,
+   "chg": 8.81,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "WNC",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 14.12 (m\u00e1ximo previo)",
+   "score": 74,
+   "rvol": 2.39,
+   "chg": 12.28,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "HPE-PC",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 179.41 (m\u00e1ximo previo)",
+   "score": 72,
+   "rvol": 4.56,
+   "chg": 7.9,
+   "src": []
+  },
+  {
+   "t": "TBCH",
+   "decision": "ESPERA",
+   "reason": "extendido +4.9% sobre VWAP",
+   "score": 66,
+   "rvol": 5.19,
+   "chg": 10.95,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "CABO",
+   "decision": "ESPERA",
+   "reason": "extendido +4.0% sobre VWAP",
+   "score": 64,
+   "rvol": 2.95,
+   "chg": 23.65,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "PENG",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 61.05 (m\u00e1ximo previo)",
+   "score": 64,
+   "rvol": 2.92,
+   "chg": 10.91,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "WOLF",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 36.49 (m\u00e1ximo previo)",
+   "score": 62,
+   "rvol": 3.81,
+   "chg": 12.26,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "XRPNW",
+   "decision": "ESPERA",
+   "reason": "extendido +7.2% sobre VWAP",
+   "score": 61,
+   "rvol": 4.64,
+   "chg": 30.52,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "IMOS",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 83.08 (m\u00e1ximo previo)",
+   "score": 60,
+   "rvol": 3.6,
+   "chg": 13.81,
+   "src": [
+    "day_gainers"
+   ]
+  },
+  {
+   "t": "QGEN",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 45.60 (m\u00e1ximo previo)",
+   "score": 60,
+   "rvol": 2.32,
+   "chg": 6.64,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "CYCU",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 4.95 (m\u00e1ximo previo)",
+   "score": 57,
+   "rvol": 354.39,
+   "chg": 51.3,
+   "src": [
+    "ibkr",
+    "subidas"
+   ]
+  },
+  {
+   "t": "STX",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 844.00 (m\u00e1ximo previo)",
+   "score": 56,
+   "rvol": 5.58,
+   "chg": -12.02,
+   "src": [
+    "escaneo",
+    "most_actives",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "NAKA",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 10.35 (m\u00e1ximo previo)",
+   "score": 52,
+   "rvol": 3.94,
+   "chg": 10.81,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "MXL",
+   "decision": "ESPERA",
+   "reason": "a\u00fan no rompe 105.55 (m\u00e1ximo previo)",
+   "score": 49,
+   "rvol": 2.2,
+   "chg": 13.29,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "FEAM",
+   "decision": "ESPERA",
+   "reason": "debajo del m\u00e1ximo del d\u00eda 3.88: la primera ruptura no aguant\u00f3",
+   "score": 46,
+   "rvol": 2.92,
+   "chg": 15.63,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "XRPN",
+   "decision": "ESPERA",
+   "reason": "extendido +7.2% sobre VWAP",
+   "score": 45,
+   "rvol": 5.01,
+   "chg": 79.26,
+   "src": [
+    "ibkr",
+    "subidas"
+   ]
+  },
+  {
+   "t": "RXO",
+   "decision": "ESPERA",
+   "reason": "sin impulso ahora",
+   "score": 45,
+   "rvol": 2.29,
+   "chg": 11.14,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "WDC",
+   "decision": "ESPERA",
+   "reason": "debajo del m\u00e1ximo del d\u00eda 427.71: la primera ruptura no aguant\u00f3",
+   "score": 42,
+   "rvol": 4.45,
+   "chg": -11.28,
+   "src": [
+    "most_actives",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "NNBR",
+   "decision": "NO",
+   "reason": "parab\u00f3lico (+13.2% sobre VWAP): no persigas",
+   "score": 100,
+   "rvol": 10.15,
+   "chg": 28.79,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "TSLA",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.6\u00d7)",
+   "score": 93,
+   "rvol": 1.59,
+   "chg": 5.31,
+   "src": [
+    "ibkr"
+   ]
+  },
+  {
+   "t": "GOW",
+   "decision": "NO",
+   "reason": "diluci\u00f3n reciente (424B3 2026-09-24)",
+   "score": 91,
+   "rvol": 13.53,
+   "chg": 31.55,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "OM",
+   "decision": "NO",
+   "reason": "poca liquidez en d\u00f3lares",
+   "score": 91,
+   "rvol": 4.22,
+   "chg": 7.73,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "SSM",
+   "decision": "NO",
+   "reason": "diluci\u00f3n reciente (424B5 2026-09-02)",
+   "score": 86,
+   "rvol": 20.99,
+   "chg": 21.22,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "RGC",
+   "decision": "NO",
+   "reason": "poca liquidez en d\u00f3lares",
+   "score": 79,
+   "rvol": 3.25,
+   "chg": 9.67,
+   "src": [
+    "day_gainers"
+   ]
+  },
+  {
+   "t": "AIXI",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 73,
+   "rvol": 176.07,
+   "chg": 40.74,
+   "src": [
+    "ibkr",
+    "subidas"
+   ]
+  },
+  {
+   "t": "ZNB",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 70,
+   "rvol": 1253.36,
+   "chg": 17.45,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "OCG",
+   "decision": "NO",
+   "reason": "poca liquidez en d\u00f3lares",
+   "score": 69,
+   "rvol": 8.43,
+   "chg": 14.29,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "NFE",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.9\u00d7)",
+   "score": 66,
+   "rvol": 1.9,
+   "chg": 18.87,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "ATRA",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.1\u00d7)",
+   "score": 64,
+   "rvol": 1.06,
+   "chg": 11.23,
+   "src": [
+    "small_cap_gainers"
+   ]
+  },
+  {
+   "t": "NCT",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 62,
+   "rvol": 6.81,
+   "chg": 4.86,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "QTEX",
+   "decision": "NO",
+   "reason": "parab\u00f3lico (+11.5% sobre VWAP): no persigas",
+   "score": 59,
+   "rvol": 25.01,
+   "chg": 52.96,
+   "src": [
+    "ibkr",
+    "subidas"
+   ]
+  },
+  {
+   "t": "SGRX",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 59,
+   "rvol": 66.19,
+   "chg": 5.75,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "CTNT",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 58,
+   "rvol": 13.31,
+   "chg": 4.08,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "TRAD",
+   "decision": "NO",
+   "reason": "poca liquidez en d\u00f3lares",
+   "score": 55,
+   "rvol": 3333.47,
+   "chg": -0.1,
+   "src": [
+    "ibkr"
+   ]
+  },
+  {
+   "t": "AZTA",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 55,
+   "rvol": 9.21,
+   "chg": 11.47,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "TOST",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 0.9\u00d7)",
+   "score": 55,
+   "rvol": 0.93,
+   "chg": 2.69,
+   "src": [
+    "ibkr"
+   ]
+  },
+  {
+   "t": "TNMG",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 53,
+   "rvol": 183.35,
+   "chg": 9.16,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "PMVP",
+   "decision": "NO",
+   "reason": "diluci\u00f3n reciente (424B5 2026-09-02)",
+   "score": 53,
+   "rvol": 3.28,
+   "chg": 6.29,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "SNDQ",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.0\u00d7)",
+   "score": 52,
+   "rvol": 1.0,
+   "chg": 7.47,
+   "src": [
+    "watchlist"
+   ]
+  },
+  {
+   "t": "SYNA",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 51,
+   "rvol": 27.72,
+   "chg": 13.69,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "NEOV",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.7\u00d7)",
+   "score": 49,
+   "rvol": 1.7,
+   "chg": 14.48,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "RKT",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.2\u00d7)",
+   "score": 49,
+   "rvol": 1.17,
+   "chg": -1.13,
+   "src": [
+    "ibkr",
+    "most_actives"
+   ]
+  },
+  {
+   "t": "VACI",
+   "decision": "NO",
+   "reason": "sin volumen relativo (falta la curva de volumen de los d\u00edas previos)",
+   "score": 48,
+   "rvol": null,
+   "chg": 10.28,
+   "src": [
+    "small_cap_gainers"
+   ]
+  },
+  {
+   "t": "SPCX",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.7\u00d7)",
+   "score": 46,
+   "rvol": 1.67,
+   "chg": 6.57,
+   "src": [
+    "ibkr"
+   ]
+  },
+  {
+   "t": "SMX",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 45,
+   "rvol": 37.82,
+   "chg": -37.18,
+   "src": [
+    "ibkr"
+   ]
+  },
+  {
+   "t": "AMOD",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 44,
+   "rvol": 671.79,
+   "chg": 173.44,
+   "src": [
+    "ibkr",
+    "subidas"
+   ]
+  },
+  {
+   "t": "SDEV",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.5\u00d7)",
+   "score": 44,
+   "rvol": 1.52,
+   "chg": 69.4,
+   "src": [
+    "ibkr",
+    "subidas"
+   ]
+  },
+  {
+   "t": "AZ",
+   "decision": "NO",
+   "reason": "poca liquidez en d\u00f3lares",
+   "score": 44,
+   "rvol": 2.08,
+   "chg": 8.42,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "BAC",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.1\u00d7)",
+   "score": 44,
+   "rvol": 1.05,
+   "chg": -0.16,
+   "src": [
+    "ibkr",
+    "most_actives"
+   ]
+  },
+  {
+   "t": "NAUT",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 0.9\u00d7)",
+   "score": 42,
+   "rvol": 0.92,
+   "chg": 16.88,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "CINT",
+   "decision": "NO",
+   "reason": "poca liquidez en d\u00f3lares",
+   "score": 41,
+   "rvol": 3.64,
+   "chg": 4.78,
+   "src": [
+    "small_cap_gainers"
+   ]
+  },
+  {
+   "t": "ARM",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.1\u00d7)",
+   "score": 41,
+   "rvol": 1.14,
+   "chg": 6.09,
+   "src": [
+    "day_gainers",
+    "subidas",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "RDY",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 0.9\u00d7)",
+   "score": 40,
+   "rvol": 0.88,
+   "chg": -0.57,
+   "src": [
+    "ibkr"
+   ]
+  },
+  {
+   "t": "IBRX",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 37,
+   "rvol": 2.33,
+   "chg": 9.27,
+   "src": [
+    "day_gainers",
+    "most_actives",
+    "subidas"
+   ]
+  },
+  {
+   "t": "BIRD",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 37,
+   "rvol": 2.79,
+   "chg": 5.59,
+   "src": [
+    "small_cap_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "MVLL",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.5\u00d7)",
+   "score": 37,
+   "rvol": 1.53,
+   "chg": 3.81,
+   "src": [
+    "watchlist"
+   ]
+  },
+  {
+   "t": "AXTI",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 0.9\u00d7)",
+   "score": 31,
+   "rvol": 0.95,
+   "chg": 4.97,
+   "src": [
+    "day_gainers",
+    "subidas",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "VECO",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 29,
+   "rvol": 2.57,
+   "chg": 8.99,
+   "src": [
+    "day_gainers",
+    "subidas"
+   ]
+  },
+  {
+   "t": "ORBS",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 29,
+   "rvol": 2.97,
+   "chg": 5.75,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "INDP",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 0.9\u00d7)",
+   "score": 28,
+   "rvol": 0.93,
+   "chg": 11.56,
+   "src": [
+    "subidas"
+   ]
+  },
+  {
+   "t": "CTVA",
+   "decision": "NO",
+   "reason": "debajo del VWAP: mandan los vendedores",
+   "score": 24,
+   "rvol": 2.96,
+   "chg": -4.06,
+   "src": [
+    "ibkr"
+   ]
+  },
+  {
+   "t": "AXTX",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 0.9\u00d7)",
+   "score": 22,
+   "rvol": 0.88,
+   "chg": 10.24,
+   "src": [
+    "watchlist"
+   ]
+  },
+  {
+   "t": "AMD",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.2\u00d7)",
+   "score": 20,
+   "rvol": 1.19,
+   "chg": 2.38,
+   "src": [
+    "most_actives",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "MRVL",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.1\u00d7)",
+   "score": 19,
+   "rvol": 1.15,
+   "chg": 1.73,
+   "src": [
+    "escaneo",
+    "most_actives",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "NVDA",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.4\u00d7)",
+   "score": 19,
+   "rvol": 1.43,
+   "chg": 1.62,
+   "src": [
+    "ibkr",
+    "most_actives",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "SNDK",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.3\u00d7)",
+   "score": 18,
+   "rvol": 1.33,
+   "chg": -3.81,
+   "src": [
+    "watchlist"
+   ]
+  },
+  {
+   "t": "MUU",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.2\u00d7)",
+   "score": 18,
+   "rvol": 1.17,
+   "chg": -3.58,
+   "src": [
+    "watchlist"
+   ]
+  },
+  {
+   "t": "MU",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.1\u00d7)",
+   "score": 13,
+   "rvol": 1.1,
+   "chg": -1.76,
+   "src": [
+    "escaneo",
+    "most_actives",
+    "watchlist"
+   ]
+  },
+  {
+   "t": "SNXX",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.7\u00d7)",
+   "score": 13,
+   "rvol": 1.68,
+   "chg": -7.66,
+   "src": [
+    "watchlist"
+   ]
+  },
+  {
+   "t": "BEG",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 1.0\u00d7)",
+   "score": 4,
+   "rvol": 0.96,
+   "chg": 4.95,
+   "src": [
+    "watchlist"
+   ]
+  },
+  {
+   "t": "BE",
+   "decision": "NO",
+   "reason": "sin volumen relativo (RVOL 0.8\u00d7)",
+   "score": 2,
+   "rvol": 0.83,
+   "chg": 2.77,
+   "src": [
+    "escaneo",
+    "watchlist"
+   ]
+  }
+ ],
+ "regime": "SPY +0.7% \u00b7 QQQ +0.9%",
+ "universe": 72
 }
