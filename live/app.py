@@ -28,6 +28,7 @@ async def lifespan(app: FastAPI):
     if os.environ.get("NO_LOOP") != "1":
         threading.Thread(target=radar.run_forever, name="radar", daemon=True).start()
         threading.Thread(target=radar.fast_forever, name="vigia-rapido", daemon=True).start()
+        threading.Thread(target=radar.context_forever, name="contexto", daemon=True).start()
         threading.Thread(target=keepalive.loop, name="keepalive", daemon=True).start()
     yield
 
@@ -115,26 +116,36 @@ def positions_remove(t: str, x_token: str | None = Header(default=None)):
     return {"removed": radar.positions.remove(t)}
 
 
+BRIDGE_MAX = 400_000  # bytes por envío del puente: a lo más ~2500 velas (~130 KB) más precios y escáneres
+
+
 class BridgeIn(BaseModel):
     v: int = 1
     scan: dict[str, list[str]] | None = None   # {código de escáner de IBKR: [tickers en orden]}
     quotes: dict[str, dict] | None = None      # {ticker: {last, high, bid, ask}} de las acciones armadas
     info: dict | None = None                   # estado del programa (conexión con IBKR, último error)
+    bars: dict[str, list[list[float]]] | None = None  # {ticker: [[hora, o, h, l, c, v], …]} velas de 1 min (IBKR_BARS)
 
 
 @app.post("/api/bridge")
 async def bridge_feed(request: Request, x_token: str | None = Header(default=None)):
-    """Puente IBKR (bridge/puente_ibkr.py en la PC de Priamo): recibe escáneres y precios al instante, avisa rupturas
-    y responde qué acciones vigilar. Exige BRIDGE_TOKEN; el cuerpo se lee solo después de validar la clave."""
+    """Puente IBKR (bridge/puente_ibkr.py en la PC de Priamo): recibe escáneres, precios al instante y velas, avisa
+    rupturas y COMPRA tempranas, y responde qué vigilar. Exige BRIDGE_TOKEN; el cuerpo se lee solo después de validar
+    la clave."""
     _auth(x_token, "BRIDGE_TOKEN")
+    try:  # por la cabecera, antes de leer el cuerpo
+        if int(request.headers.get("content-length") or 0) > BRIDGE_MAX:
+            raise HTTPException(413, "cuerpo demasiado grande")
+    except ValueError:
+        raise HTTPException(400, "Content-Length inválido")
     raw = await request.body()
-    if len(raw) > 200_000:
+    if len(raw) > BRIDGE_MAX:
         raise HTTPException(413, "cuerpo demasiado grande")
     try:
         b = BridgeIn.model_validate_json(raw or b"{}")
     except ValidationError as e:
         raise HTTPException(422, str(e)[:300])
-    return clean(await run_in_threadpool(radar.on_bridge, b.scan, b.quotes, b.info))
+    return clean(await run_in_threadpool(radar.on_bridge, b.scan, b.quotes, b.info, None, b.bars))
 
 
 @app.get("/health")
@@ -143,6 +154,8 @@ def health():
     rss = memory.rss_mb()
     return clean({"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
             "armed": sorted(radar.armed), "uptime_min": round((time.time() - STARTED) / 60, 1),
+            "cycle_s": radar.cycle_s, "context": {"on": radar.bg, "queue": len(radar.enrich_q),
+                                                  "halts_age_s": round(time.time() - radar.halts_ts) if radar.halts_ts else None},
             "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB}, "bridge": radar.bridge.status(),
             "telegram": {"configured": bool(radar.notify and os.environ.get("TELEGRAM_BOT_TOKEN")
                                             and os.environ.get("TELEGRAM_CHAT_ID")), **radar.tg_state},
@@ -150,8 +163,10 @@ def health():
 
 
 @app.get("/api/news/{t}")
-def news_check(t: str):
-    """Diagnóstico: qué devuelve cada fuente de titulares desde este servidor."""
+def news_check(t: str, x_token: str | None = Header(default=None)):
+    """Diagnóstico: qué devuelve cada fuente de titulares desde este servidor. Con el token de posiciones: cada llamada
+    hace varias peticiones externas de hasta 10 s, y abierta servía para saturar el servicio."""
+    _auth(x_token)
     import requests
     from scanner.sources import yahoo
     from .runner import rss_news

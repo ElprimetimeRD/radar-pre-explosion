@@ -1,6 +1,7 @@
 """Yahoo Finance vía yfinance (versión fijada en requirements.txt)."""
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -90,13 +91,25 @@ def prune_tasks() -> int:
     return len(dead)
 
 
+_DL_LOCK = threading.Lock()  # yf.download guarda sus resultados en un diccionario global: dos descargas a la vez se mezclan
+
+
 def history(symbols: list[str], period="1y", interval="1d", prepost=False) -> dict[str, pd.DataFrame]:
+    """Velas de varios tickers (lotes de 80). Cuando Yahoo limita, yf.download no lanza error: devuelve una tabla vacía
+    y `retry` no reintentaba. Ahora un lote que vuelve vacío entero se pide una vez más. Una descarga a la vez."""
     out = {}
     for i in range(0, len(symbols), 80):
         chunk = symbols[i:i + 80]
-        df = retry(lambda: yf.download(chunk, period=period, interval=interval, group_by="ticker", auto_adjust=True,
-                                       threads=True, progress=False, prepost=prepost), what=f"download {interval}")
-        prune_tasks()
+
+        def dl():
+            return retry(lambda: yf.download(chunk, period=period, interval=interval, group_by="ticker", auto_adjust=True,
+                                             threads=True, progress=False, prepost=prepost), what=f"download {interval}")
+        with _DL_LOCK:
+            df = dl()
+            if df is not None and df.empty:  # vacía sin error (límite de Yahoo); si fue error, retry ya insistió
+                time.sleep(2)
+                df = dl()
+            prune_tasks()
         out.update(_split(df, chunk))
         time.sleep(1)
     return out

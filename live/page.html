@@ -66,7 +66,7 @@ small,.foot{color:var(--mute);font-size:12px}
 <h2>Acumulado</h2>
 <div id="hist" class="foot">Cargando historial…</div>
 <p class="foot" id="foot"></p>
-<p class="foot">Datos de Yahoo con 1–2 min de retraso (las rupturas armadas, al instante cuando el puente IBKR está conectado); confirma en tu bróker antes de entrar. Stop siempre puesto. Herramienta personal, no es asesoría financiera.</p>
+<p class="foot">Datos de Yahoo con 1–2 min de retraso; con el puente IBKR conectado, las rupturas armadas (y la COMPRA temprana, si está activada) llegan antes por Telegram. Confirma en tu bróker antes de entrar. Stop siempre puesto. Herramienta personal, no es asesoría financiera.</p>
 </main>
 <script>
 const $=s=>document.querySelector(s);let F='COMPRA',D=null;
@@ -103,12 +103,12 @@ function render(){if(!D)return;const rows=D.rows||[];
  const L=rows.filter(r=>r.decision===F);
  $('#list').innerHTML=L.length?L.map(card).join(''):`<p class="foot">Nada en esta lista ahora.</p>`;
  const s=D.stats||{};$('#stats').innerHTML=`<div><b>${s.filled??s.n??0}<small style="font-size:12px">/${s.n||0}</small></b><small>ejecutadas</small></div><div><b>${s.t1||0}</b><small>tocaron +2 %</small></div><div><b>${s.t2||0}</b><small>tocaron +5 %</small></div><div><b>${s.stop||0}</b><small>stop</small></div>`;
- const row=(t,ic)=>`<div class="meta"><span>${ic}<b>${esc(t.t)}</b> ${t.time}</span><span>entrada ${f2(t.entry)}</span><span>máx ${pc(t.mfe)}</span><span>mín ${pc(t.mae)}</span>${t.lag_min!=null?`<span>retraso ${t.lag_min} min</span>`:''}${t.break_t?`<span>rompió ${esc(t.break_t)}${t.break_src==='ibkr'?' (IBKR)':''}</span>`:''}<span>${esc(t.status)}${t.close_pct!=null?' '+pc(t.close_pct):''}</span></div>`;
+ const row=(t,ic)=>`<div class="meta"><span>${ic}<b>${esc(t.t)}</b> ${t.time}</span><span>entrada ${f2(t.entry)}</span><span>máx ${pc(t.mfe)}</span><span>mín ${pc(t.mae)}</span>${t.lag_min!=null?`<span>retraso ${t.lag_min} min</span>`:''}${t.break_t?`<span>rompió ${esc(t.break_t)}${t.break_src==='ibkr'?' (IBKR)':''}</span>`:''}${t.early_t?`<span>aviso IBKR ${esc(t.early_t)}</span>`:''}<span>${esc(t.status)}${t.close_pct!=null?' '+pc(t.close_pct):''}</span></div>`;
  const A=D.armadas||[],a=D.armStats||{};
  $('#trades').innerHTML=(D.trades||[]).map(t=>row(t,'')).join('')
   +(s.lag!=null?`<div class="trig">La COMPRA llegó ${s.lag} min después de la ruptura en promedio, ${s.slip>=0?'+':''}${(s.slip??0).toFixed(2)} % sobre el nivel.</div>`:'')
   +(A.length?`<div class="trig" style="margin-top:8px"><b>Armadas</b> (compra stop en la ruptura): ${a.filled||0} de ${a.n||0} se activaron · ${a.t1||0} tocaron +2 % · ${a.stop||0} stop · ${a.cancelled||0} canceladas</div>`+A.map(t=>row(t,'⚡ ')).join(''):'');
- $('#foot').innerHTML=`${D.universe||0} acciones en seguimiento · actualizado ${D.ts?new Date(D.ts).toLocaleTimeString():'—'}${D.mem&&D.mem.pct!=null?` · memoria ${Math.round(D.mem.pct)} %`:''}${D.bridge&&D.bridge.age_s!=null?` · IBKR ${D.bridge.on?'conectado':'desconectado'}${D.bridge.error?' ('+esc(D.bridge.error)+')':''}`:''}${(D.errors||[]).length?`<div class="err">${esc(D.errors.slice(-1)[0])}</div>`:''}`}
+ $('#foot').innerHTML=`${D.universe||0} acciones en seguimiento · actualizado ${D.ts?new Date(D.ts).toLocaleTimeString():'—'}${D.mem&&D.mem.pct!=null?` · memoria ${Math.round(D.mem.pct)} %`:''}${D.bridge&&D.bridge.age_s!=null?` · IBKR ${D.bridge.on?'conectado':'desconectado'}${D.bridge.bars?` · velas IBKR: ${D.bridge.bars} ${D.bridge.bars===1?'acción':'acciones'}`:''}${D.bridge.error?' ('+esc(D.bridge.error)+')':''}`:''}${(D.errors||[]).length?`<div class="err">${esc(D.errors.slice(-1)[0])}</div>`:''}`}
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{F=b.dataset.f;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));render()});
 async function load(){try{const r=await fetch('/api/signals',{cache:'no-store'});D=await r.json();
  if(F==='COMPRA'&&!(D.counts||{}).COMPRA&&(D.counts||{}).ESPERA){F='ESPERA';document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.f===F))}
