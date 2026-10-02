@@ -3,7 +3,9 @@
 - cada 30 s le pasa al semáforo lo que ven los escáneres de IBKR (los que más suben, volumen inusual y ritmo de
   operaciones), que detectan una acción que arranca antes que las listas de Yahoo;
 - se suscribe al precio al instante de las acciones armadas (las que el semáforo le dice) y, si una cruza su
-  gatillo, se lo manda en el acto para que llegue el aviso ⚡ por Telegram.
+  gatillo, se lo manda en el acto para que llegue el aviso ⚡ por Telegram;
+- si el semáforo lo pide (IBKR_BARS en Render), sigue con velas de 1 min de IBKR a las candidatas principales (el día
+  completo y después al día cada ~5 s) para que el semáforo avise la COMPRA sin esperar las velas de Yahoo.
 
 No manda órdenes: se conecta como solo lectura y no tiene código para operar.
 
@@ -35,7 +37,7 @@ try:
 except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarlo
     IB = ScannerSubscription = Stock = StartupFetch = None
 
-VERSION = "1.1"
+VERSION = "1.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, "puente.env")
 LOG_FILE = os.path.join(HERE, "puente.log")
@@ -51,7 +53,10 @@ DEFAULTS = {
     "SCAN_EVERY": "30",          # s entre escaneos (pre-market y sesión)
     "SCAN_TIMEOUT": "20",        # s máximos de espera por cada escáner
     "MAX_LINES": "40",           # tope de precios al instante a la vez (IBKR da 100 líneas)
+    "MAX_BARS": "15",            # tope de acciones con velas de 1 min a la vez (IBKR permite 50 pedidos abiertos)
 }
+BAR_BUDGET = 2500  # velas por envío (~130 KB): la historia de una acción nunca se parte, la que no cabe va después
+SYM = re.compile(r"[A-Z]{1,5}")
 # Errores y avisos de IBKR: (texto corto para el semáforo, qué hacer)
 HINTS = {
     354: ("sin datos en vivo (354)", "IBKR dice que no tienes datos en vivo por la API. En Client Portal > Settings > "
@@ -71,7 +76,8 @@ HINTS = {
     2105: ("escáneres de IBKR caídos (2105)", "TWS/IB Gateway perdió el servidor de datos históricos; suele volver solo."),
 }
 CLEARS = {1101: (1100, 2110), 1102: (1100, 2110), 2104: (2103,), 2106: (2105,)}  # aviso de OK -> errores que limpia
-DATA_ERRORS = {354, 10089, 10090, 10167, 10168, 10197, 2103}  # se limpian solos cuando vuelven a llegar precios
+DATA_ERRORS = {162, 354, 10089, 10090, 10167, 10168, 10197, 2103}  # se limpian solos cuando vuelven a llegar datos
+NO_VELAS = "sin velas de IBKR (162)"
 
 log = logging.getLogger("puente")
 
@@ -138,6 +144,31 @@ def last_price(t) -> float | None:
     return num(getattr(t, "last", None))
 
 
+def bar_row(b) -> list | None:
+    """Vela de 1 min de ib_async -> [hora en s, apertura, máximo, mínimo, cierre, volumen], redondeada (menos bytes).
+    None si no sirve. La hora llega en UTC (formatDate=2), así que no depende del reloj ni de la zona de la PC."""
+    stamp = getattr(getattr(b, "date", None), "timestamp", None)
+    o, h, lo, c = (num(getattr(b, k, None)) for k in ("open", "high", "low", "close"))
+    try:
+        t, v = int(stamp()), float(getattr(b, "volume", None))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (o and h and lo and c) or not math.isfinite(v) or v < 0:
+        return None
+    return [t, round(o, 4), round(h, 4), round(lo, 4), round(c, 4), round(v)]
+
+
+class Quiet(logging.Filter):
+    """Saca del registro dos avisos normales de la librería: IBKR confirmando cada escaneo que el puente cancela (162,
+    'scanner subscription cancelled') y la respuesta a cancelar velas que IBKR ya había cerrado (366)."""
+
+    def filter(self, rec: logging.LogRecord) -> bool:
+        if not rec.name.startswith("ib_async"):
+            return True
+        m = rec.getMessage().lower()
+        return "scanner subscription cancelled" not in m and "error 366" not in m
+
+
 class Puente:
     def __init__(self, cfg: dict, ib=None, post=http_post):
         self.cfg = cfg
@@ -153,6 +184,13 @@ class Puente:
         self.bad: dict[str, float] = {}        # tickers que IBKR no reconoce -> cuándo reintentar
         self.tickers: dict = {}                # ticker -> Ticker con precio al instante
         self.armed: dict[str, dict] = {}       # lo que el semáforo dice vigilar: {ticker: {level, entry}}
+        self.bar_want: dict[str, int] = {}     # velas que pide el semáforo: {ticker: hora de la última que ya tiene}
+        self.bar_t0 = 0                        # desde qué hora mandar velas (4:00 ET de hoy; lo dice el semáforo)
+        self.bar_subs: dict = {}               # ticker -> velas de 1 min que IBKR mantiene al día (BarDataList)
+        self.bar_sent: dict[str, list] = {}    # última vela mandada de cada ticker (no se repite si no cambió)
+        self.bar_bad: dict[str, float] = {}    # tickers cuyas velas fallaron -> cuándo reintentar
+        self.bars_task: asyncio.Task | None = None
+        self.conn_n = 0                        # conexiones hechas (una suscripción de otra conexión ya no sirve)
         self.phase: str | None = None
         self.sent_px: dict[str, float] = {}
         self.crossed: set[str] = set()
@@ -173,6 +211,24 @@ class Puente:
         try:
             code = int(code)
         except (TypeError, ValueError):
+            return
+        text = str(msg or "")
+        if code == 162 and "scanner subscription cancelled" in text.lower():
+            return  # normal: el puente cancela cada escaneo al terminarlo y IBKR lo confirma así
+        if code == 366:
+            return  # cancelar velas que IBKR ya había cerrado: sin importancia
+        s = next((s for s, b in self.bar_subs.items() if getattr(b, "reqId", None) == req_id), None)
+        if s and not (2100 <= code < 2200):
+            log.warning("IBKR cortó las velas de %s (%s: %s); las vuelvo a pedir en 2 min.", s, code, text)
+            self.drop_bar(s)
+            self.bar_bad[s] = time.monotonic() + 120
+            if code != 162 and code not in HINTS:
+                return  # ya quedó en el registro; los de datos (162, 10089…) siguen y marcan el estado
+        if code == 162:  # error del servicio de datos históricos (permisos o acción sin datos)
+            if self.error != NO_VELAS:
+                log.warning("IBKR no dio velas (162): %s. Si habla de permisos, es lo mismo que el 10089: falta la "
+                            "suscripción de datos para la API.", text)
+            self.set_error(code, NO_VELAS)
             return
         if code in CLEARS:
             if self.error_code in CLEARS[code]:
@@ -208,6 +264,7 @@ class Puente:
 
     def on_disconnect(self):
         self.state, self.tickers, self.sent_px = "desconectado", {}, {}
+        self.bar_subs, self.bar_sent = {}, {}  # las suscripciones mueren con la conexión: al volver se piden de nuevo
         if not self.stopping:
             log.warning("Se cortó la conexión con TWS/IB Gateway; reintento en unos segundos.")
 
@@ -218,6 +275,20 @@ class Puente:
             except Exception:  # noqa: BLE001 (desconectado o ya cancelada)
                 pass
         self.tickers, self.sent_px = {}, {}
+        for s in list(self.bar_subs):
+            self.drop_bar(s)
+
+    def drop_bar(self, s: str):
+        b = self.bar_subs.pop(s, None)
+        self.bar_sent.pop(s, None)
+        if b is not None:
+            self._cancel_bars(b)
+
+    def _cancel_bars(self, b):
+        try:
+            self.ib.cancelHistoricalData(b)
+        except Exception:  # noqa: BLE001 (desconectado o ya cerrada)
+            pass
 
     async def connect(self) -> bool:
         if not self._hooked:
@@ -240,6 +311,8 @@ class Puente:
             return False
         self.ib.reqMarketDataType(1)  # en vivo
         self.state, self.tickers, self.sent_px = "conectado", {}, {}
+        self.bar_subs, self.bar_sent = {}, {}
+        self.conn_n += 1
         self.set_error(None, None)
         log.info("Conectado a IBKR en %s:%s (solo lectura).", host, port)
         if self.codes is None:
@@ -362,6 +435,84 @@ class Puente:
                 return
         self.crossed &= set(self.armed)
 
+    def sync_bars(self):
+        """Velas de 1 min solo para lo que pide el semáforo: suelta lo que ya no pide y pide lo nuevo en segundo plano
+        (cada pedido tarda 1–2 s y no debe atrasar el aviso de una ruptura)."""
+        if not self.ib.isConnected():
+            return
+        for s in [s for s in self.bar_subs if s not in self.bar_want]:
+            self.drop_bar(s)
+        now = time.monotonic()
+        need = [s for s in self.bar_want if s not in self.bar_subs and now >= self.bar_bad.get(s, 0)]
+        if need and (self.bars_task is None or self.bars_task.done()):
+            self.bars_task = asyncio.create_task(self.sub_bars(need))
+
+    async def sub_bars(self, syms: list[str]):
+        """Pide, una por una, las velas de 1 min de hoy (con pre-market) que IBKR mantiene al día: la que se está
+        formando se actualiza cada ~5 s. Si IBKR no las da (permisos, acción sin datos), reintenta en 5 min."""
+        try:
+            for s in syms:
+                if s not in self.bar_want or s in self.bar_subs or not self.ib.isConnected():
+                    continue
+                n = self.conn_n
+                c = await self.contract_for(s)
+                if c is None:
+                    log.warning("IBKR no encuentra %s; reintento sus velas en 5 min.", s)
+                    self.bar_bad[s] = time.monotonic() + 300
+                    continue
+                try:
+                    bars = await self.ib.reqHistoricalDataAsync(
+                        c, endDateTime="", durationStr="1 D", barSizeSetting="1 min", whatToShow="TRADES",
+                        useRTH=False, formatDate=2, keepUpToDate=True, timeout=30)
+                except Exception as e:  # noqa: BLE001 (se cortó la conexión en medio)
+                    log.warning("No pude pedir las velas de %s (%s).", s, type(e).__name__)
+                    self.bar_bad[s] = time.monotonic() + 60
+                    continue
+                if not bars or s not in self.bar_want or not self.ib.isConnected() or n != self.conn_n:
+                    self._cancel_bars(bars)  # vacía (error o tiempo agotado), ya no se pide o de una conexión anterior
+                    if not bars:
+                        log.warning("IBKR no mandó velas de %s; reintento en 5 min.", s)
+                        self.bar_bad[s] = time.monotonic() + 300
+                    continue
+                self.bar_subs[s] = bars
+                if self.error_code in DATA_ERRORS:
+                    log.info("IBKR vuelve a mandar datos.")
+                    self.set_error(None, None)
+                self.wake.set()  # el día completo sale en el próximo envío
+        except Exception:  # noqa: BLE001
+            log.exception("Las velas fallaron; reintento en la próxima vuelta.")
+
+    def bars_pending(self) -> bool:
+        """¿Hay una acción con velas cuyo día completo el semáforo todavía no tiene?"""
+        return any(len(b) and not self.bar_want.get(s) for s, b in list(self.bar_subs.items()))
+
+    def bars_payload(self) -> dict:
+        """Velas para el semáforo: de cada acción, desde la última que ya tiene (la que se está formando puede haber
+        cambiado) o el día completo si no tiene ninguna. Primero lo que es solo una actualización; una historia que no
+        cabe en este envío va en el siguiente (nunca se parte)."""
+        out, left = {}, BAR_BUDGET
+        for s in sorted(self.bar_subs, key=lambda s: not self.bar_want.get(s)):
+            have = self.bar_want.get(s, 0)
+            frm = max(have, self.bar_t0)
+            rows = []
+            for b in reversed(list(self.bar_subs[s])):
+                r = bar_row(b)
+                if r is None:
+                    continue
+                if r[0] < frm:
+                    break
+                rows.append(r)
+                if len(rows) >= 1000:  # un día con pre y after-hours tiene 960
+                    break
+            rows.reverse()
+            if not rows or (have and rows == [self.bar_sent.get(s)]):
+                continue  # sin nada nuevo
+            if len(rows) > left and out:
+                continue
+            out[s] = rows
+            left -= len(rows)
+        return out
+
     # ---------------- semáforo ----------------
     def quotes(self) -> dict:
         out = {}
@@ -373,13 +524,16 @@ class Puente:
         return out
 
     async def push(self, scan: bool = False) -> str:
-        """Manda precios nuevos (y el último escaneo) y recibe qué vigilar. Devuelve 'ok', 'auth' o 'net'."""
+        """Manda precios y velas nuevas (y el último escaneo) y recibe qué vigilar. Devuelve 'ok', 'auth' o 'net'."""
         q = self.quotes()
+        bars = self.bars_payload()
         sent_scan = self.scan if scan else None
         payload = {"v": 1, "quotes": q, "info": {"ib": self.state, "error": self.error, "lines": len(self.tickers),
-                                                 "ver": VERSION}}
+                                                 "bars": len(self.bar_subs), "ver": VERSION}}
         if scan:
             payload["scan"] = sent_scan
+        if bars:
+            payload["bars"] = bars
         try:
             resp = await asyncio.to_thread(self.post, self.url, self.cfg["BRIDGE_TOKEN"], payload)
         except PermissionError as e:
@@ -392,17 +546,29 @@ class Puente:
         if scan and self.scan is sent_scan:
             self.scan_new = False
         self.sent_px.update({s: v["last"] for s, v in q.items()})
+        self.bar_sent.update({s: rows[-1] for s, rows in bars.items() if s in self.bar_subs})
         phase = resp.get("phase")
         armed = {str(s): a for s, a in (resp.get("armed") or {}).items() if isinstance(a, dict) and num(a.get("level"))}
+        raw = resp.get("bars") if isinstance(resp.get("bars"), dict) else {}
+        want = {}
+        for s, t in list(raw.items())[: int(self.cfg["MAX_BARS"])]:
+            s = str(s).upper()
+            if SYM.fullmatch(s):
+                want[s] = int(num(t) or 0)
         if phase != self.phase:
             log.info("Mercado: %s", {"pre": "pre-market", "open": "sesión", "late": "última media hora",
                                      "closed": "cerrado"}.get(phase, phase))
         if set(armed) != set(self.armed):
             log.info("Vigilando: %s", ", ".join(f"{s} (gatillo {float(a['level']):.2f})" for s, a in armed.items())
                      or "nada armado")
+        if set(want) != set(self.bar_want):
+            log.info("Velas de 1 min: %s", ", ".join(want) or "ninguna")
         for s in resp.get("fired") or []:
             log.info("El semáforo avisó la ruptura de %s por Telegram.", s)
-        self.phase, self.armed = phase, armed
+        for s in resp.get("early") or []:
+            log.info("El semáforo avisó la COMPRA de %s por Telegram con velas de IBKR.", s)
+        self.phase, self.armed, self.bar_want = phase, armed, want
+        self.bar_t0 = int(num(resp.get("bars_t0")) or 0)
         return "ok"
 
     # ---------------- bucle ----------------
@@ -413,6 +579,7 @@ class Puente:
         self.wake.clear()
         if not self.ib.isConnected():
             self.tickers, self.sent_px = {}, {}
+            self.bar_subs, self.bar_sent = {}, {}
             if not await self.connect():
                 await self.push()  # el semáforo ve "desconectado" y el motivo
                 return 15
@@ -420,15 +587,18 @@ class Puente:
             self.scan_at = time.monotonic()
             self.scan_task = asyncio.create_task(self.run_scans())
         await self.sync_lines()
+        self.sync_bars()
         live = self.phase in ("pre", "open")
-        if self.scan_new or woke or self.quotes() or time.monotonic() - self.last_push >= (5 if live else 30):
+        if (self.scan_new or woke or self.quotes() or self.bars_pending()
+                or time.monotonic() - self.last_push >= (5 if live else 30)):
             res = await self.push(self.scan_new)
             if res == "auth":
                 return 30
             if res == "net":
                 return 3 if live else 15
             await self.sync_lines()  # lo recién armado se suscribe ya, sin esperar otra vuelta
-        if self.phase == "open" and self.armed:
+            self.sync_bars()
+        if (self.phase == "open" and self.armed) or self.bars_pending():
             return 1
         return 5 if self.phase in ("pre", "open") else 30
 
@@ -489,6 +659,8 @@ def main(argv=None):
                                                              encoding="utf-8"))
     except OSError:
         pass
+    for h in handlers:
+        h.addFilter(Quiet())  # en el manejador: los filtros de un logger no se aplican a sus hijos (ib_async.wrapper)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", handlers=handlers)
     logging.getLogger("ib_async").setLevel(logging.WARNING)  # sin el ruido informativo de la librería
     if args.crear_clave:

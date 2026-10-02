@@ -3,11 +3,14 @@ Uso: NO_LOOP=1 NO_NOTIFY=1 PYTHONPATH=. python tests/test_bridge.py"""
 import asyncio
 import http.server
 import json
+import logging
 import math
 import os
 import sys
 import tempfile
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bridge"))
@@ -33,6 +36,12 @@ class FakeScan(list):
         self.reqId, self.updateEvent = req_id, Ev()
 
 
+class FakeBars(list):
+    def __init__(self, req_id, contract):
+        super().__init__()
+        self.reqId, self.contract, self.updateEvent = req_id, contract, Ev()
+
+
 class FakeIB:
     """Lo mínimo de ib_async.IB que usa el puente, con sus mañas: sin conexión, pedir datos revienta
     (ConnectionError, como la librería real). placeOrder revienta siempre: el puente nunca debe operar."""
@@ -43,6 +52,7 @@ class FakeIB:
         self.scans, self.lines, self.calls = scans or {}, {}, []
         self.silent, self.scan_delay = set(), 0.0
         self.active_scans, self.cancelled, self._rid = set(), [], 0
+        self.hist, self.hist_fail, self.bar_reqs = {}, set(), {}  # velas: lo que devuelve, las que fallan, las abiertas
 
     def isConnected(self):
         return self.connected
@@ -96,14 +106,42 @@ class FakeIB:
             raise ConnectionError("Not connected")
         self.lines.pop(c.symbol, None)
 
+    async def reqHistoricalDataAsync(self, contract, endDateTime, durationStr, barSizeSetting, whatToShow, useRTH,
+                                     formatDate=1, keepUpToDate=False, chartOptions=(), timeout=60):
+        """Como ib_async: si IBKR da error, avisa por errorEvent y devuelve la lista vacía."""
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        self.calls.append(("velas", contract.symbol, endDateTime, durationStr, barSizeSetting, whatToShow, useRTH,
+                           formatDate, keepUpToDate, contract.exchange))
+        self._rid += 1
+        b = FakeBars(self._rid, contract)
+        if contract.symbol in self.hist_fail:
+            self.errorEvent.emit(b.reqId, 162, "Historical Market Data Service error message:No market data "
+                                 "permissions for NASDAQ STK", contract)
+            return b
+        b.extend(self.hist.get(contract.symbol, []))
+        if keepUpToDate:
+            self.bar_reqs[b.reqId] = b
+        return b
+
+    def cancelHistoricalData(self, b):
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        self.bar_reqs.pop(b.reqId, None)
+        self.calls.append(("cancelar velas", b.contract.symbol))
+
     def placeOrder(self, *a):
         raise AssertionError("el puente nunca debe mandar órdenes")
 
 
 class Server:
+    """El semáforo falso: guarda lo recibido y, como el de verdad, responde la hora de la última vela que ya tiene de
+    cada acción que pide."""
+
     def __init__(self):
         self.got, self.fail, self.during = [], None, None
         self.resp = {"ok": True, "phase": "open", "armed": {}, "fired": []}
+        self.bars: dict[str, dict] = {}
 
     def __call__(self, url, token, payload):
         if self.during:
@@ -112,6 +150,12 @@ class Server:
             raise self.fail
         json.dumps(payload, allow_nan=False)  # lo mismo que hace http_post: nada de NaN
         self.got.append(payload)
+        for s, rows in (payload.get("bars") or {}).items():
+            self.bars.setdefault(s, {}).update({r[0]: r for r in rows})
+        want = self.resp.get("bars")
+        if isinstance(want, dict):
+            for s in want:
+                want[s] = max(self.bars.get(s) or [0])
         return json.loads(json.dumps(self.resp))
 
 
@@ -310,6 +354,127 @@ def test_scenario():
     asyncio.run(_scenario())
 
 
+def _bar(t, c, v=1000):
+    return NS(date=t, open=c, high=round(c + 0.05, 4), low=round(c - 0.05, 4), close=c, volume=v)
+
+
+def test_bar_row():
+    t = datetime(2026, 9, 29, 13, 30, tzinfo=timezone.utc)
+    assert P.bar_row(_bar(t, 10.123456, 1234.6)) == [int(t.timestamp()), 10.1235, 10.1735, 10.0735, 10.1235, 1235]
+    assert P.bar_row(NS(date=t, open=math.nan, high=1, low=1, close=1, volume=1)) is None
+    assert P.bar_row(NS(date=t.date(), open=1, high=1, low=1, close=1, volume=1)) is None    # vela diaria: no
+    assert P.bar_row(NS(date=t, open=1, high=1, low=1, close=1, volume=None)) is None
+    assert P.bar_row(NS()) is None
+
+
+def test_quiet_log():
+    """El filtro del registro solo saca los dos avisos normales de la librería."""
+    q = P.Quiet()
+
+    def rec(name, msg):
+        return logging.LogRecord(name, logging.ERROR, __file__, 1, msg, None, None)
+    assert not q.filter(rec("ib_async.wrapper", "Error 162, reqId 5: API scanner subscription cancelled: 5"))
+    assert not q.filter(rec("ib_async.wrapper", "Error 366, reqId 9: No historical data query found for ticker id:9"))
+    assert q.filter(rec("ib_async.wrapper", "Error 162, reqId 9: Historical Market Data Service error message:No "
+                                            "market data permissions for NASDAQ STK"))
+    assert q.filter(rec("puente", "API scanner subscription cancelled"))
+
+
+async def _bars_scenario():
+    """Velas de 1 min: solo las que pide el semáforo; el día completo una vez y después solo lo nuevo; una historia
+    nunca se parte; suelta lo que ya no se pide; errores de IBKR con reintento; el aviso 162 de los escáneres no es un
+    error ni ensucia el registro."""
+    t4 = datetime(2026, 9, 29, 8, 0, tzinfo=timezone.utc)                     # 4:00 ET
+    t0 = int(t4.timestamp())
+
+    def day(c):
+        return [_bar(t4 + timedelta(minutes=i), c) for i in range(360)]       # 4:00–9:59 ET
+    ib = FakeIB()
+    ib.hist = {"AAA": [_bar(t4 - timedelta(hours=12), 9.0)] + day(10.0), "BBB": day(20.0), "CCC": day(30.0),
+               "DDD": day(40.0)}
+    ib.hist_fail = {"EEE"}
+    srv = Server()
+    p = P.Puente(dict(P.DEFAULTS, BRIDGE_TOKEN="t", SCAN_EVERY="999", MAX_BARS="4"), ib, srv)
+    seen = []
+    h = logging.Handler()
+    h.emit = lambda rec: seen.append(rec.getMessage())
+    P.log.addHandler(h)
+    try:
+        await p.step()                                                     # conecta; aún no se piden velas
+        assert p.bar_subs == {} and "bars" not in srv.got[-1]
+        # 1) El semáforo pide AAA y BBB, una que IBKR no encuentra y una sin permiso de datos (162)
+        srv.resp.update(bars={"AAA": 0, "BBB": 0, "NOPE": 0, "EEE": 0, "bad sym": 0}, bars_t0=t0)
+        p.last_push = -1e9
+        await p.step()
+        await p.bars_task                                                  # se piden en segundo plano
+        assert set(p.bar_subs) == {"AAA", "BBB"} and {"NOPE", "EEE"} <= set(p.bar_bad), (p.bar_subs, p.bar_bad)
+        assert ("velas", "AAA", "", "1 D", "1 min", "TRADES", False, 2, True, "SMART") in ib.calls, ib.calls
+        assert p.error == P.NO_VELAS and ("cancelar velas", "EEE") in ib.calls  # la vacía no queda abierta
+        assert p.wake.is_set() and p.bars_pending()
+        # 2) Manda el día completo de las dos (desde las 4:00 ET: la vela de ayer no va)
+        await p.step()
+        got = srv.got[-1]["bars"]
+        assert set(got) == {"AAA", "BBB"} and len(got["AAA"]) == 360 and got["AAA"][0][0] == t0, list(got)
+        assert got["AAA"][-1] == [t0 + 359 * 60, 10.0, 10.05, 9.95, 10.0, 1000], got["AAA"][-1]
+        assert p.bar_want["AAA"] == t0 + 359 * 60 and not p.bars_pending()
+        # 3) Sin cambios no repite nada; cambia la vela que se forma: va solo esa; llega una nueva: van las dos
+        p.last_push = -1e9
+        await p.step()
+        assert "bars" not in srv.got[-1]
+        aaa = p.bar_subs["AAA"]
+        aaa[-1] = _bar(t4 + timedelta(minutes=359), 10.2, 1500)
+        p.last_push = -1e9
+        await p.step()
+        assert srv.got[-1]["bars"] == {"AAA": [[t0 + 359 * 60, 10.2, 10.25, 10.15, 10.2, 1500]]}, srv.got[-1]["bars"]
+        aaa.append(_bar(t4 + timedelta(minutes=360), 10.3, 700))
+        p.last_push = -1e9
+        await p.step()
+        assert [r[0] for r in srv.got[-1]["bars"]["AAA"]] == [t0 + 359 * 60, t0 + 360 * 60], srv.got[-1]["bars"]
+        # 4) Cambia lo que pide: suelta BBB; con poco espacio por envío, una historia entera por envío
+        old_budget = P.BAR_BUDGET
+        P.BAR_BUDGET = 500
+        try:
+            srv.resp["bars"] = {"AAA": 0, "CCC": 0, "DDD": 0}
+            p.last_push = -1e9
+            await p.step()
+            assert ("cancelar velas", "BBB") in ib.calls and "BBB" not in p.bar_subs
+            await p.bars_task
+            assert {"CCC", "DDD"} <= set(p.bar_subs) and p.error is None    # volvieron a llegar velas: sin error
+            await p.step()
+            first = srv.got[-1]["bars"]
+            await p.step()
+            second = srv.got[-1]["bars"]
+            assert set(first) == {"CCC"} and set(second) == {"DDD"} and len(second["DDD"]) == 360, (first, second)
+        finally:
+            P.BAR_BUDGET = old_budget
+        # 5) IBKR corta las velas de una acción: se sueltan y se reintentan a los 2 min
+        ib.errorEvent.emit(p.bar_subs["CCC"].reqId, 10182, "Failed to request live updates (disconnected).", None)
+        assert "CCC" not in p.bar_subs and p.bar_bad["CCC"] > time.monotonic() + 100
+        assert ("cancelar velas", "CCC") in ib.calls
+        # 6) El aviso 162 de cada escaneo cancelado: ni error ni línea en el registro
+        n = len(seen)
+        ib.errorEvent.emit(7, 162, "API scanner subscription cancelled: 7", None)
+        assert len(seen) == n and p.error is None, seen[n:]
+        # 7) Se cae la conexión: las velas mueren con ella y al volver se piden de nuevo
+        ib.connected = False
+        ib.disconnectedEvent.emit()
+        assert p.bar_subs == {}
+        await p.step()
+        await p.bars_task
+        assert set(p.bar_subs) == {"AAA", "DDD"}, p.bar_subs                # CCC espera sus 2 min
+        # 8) El semáforo ya no pide velas (mercado cerrado o IBKR_BARS=0): las suelta todas
+        srv.resp["bars"] = {}
+        p.last_push = -1e9
+        await p.step()
+        assert p.bar_subs == {} and ib.calls.count(("cancelar velas", "AAA")) == 1, ib.calls
+    finally:
+        P.log.removeHandler(h)
+
+
+def test_bars_scenario():
+    asyncio.run(_bars_scenario())
+
+
 async def _end_to_end():
     """El puente contra el servidor de verdad (FastAPI en memoria): escáner al universo, ⚡ al cruzar y sin publicar
     el precio de IBKR."""
@@ -370,9 +535,63 @@ def test_end_to_end():
     asyncio.run(_end_to_end())
 
 
+async def _bars_end_to_end():
+    """Velas contra el servidor de verdad: el semáforo pide las de su candidata, el puente manda el día y después lo
+    nuevo, y /health solo cuenta acciones (ni las velas ni sus precios salen en lo público)."""
+    os.environ.update(NO_LOOP="1", NO_NOTIFY="1", BRIDGE_TOKEN="clave-prueba")
+    from fastapi.testclient import TestClient
+
+    from live import app as A
+    from live import runner
+    from scanner.util import ET
+    old = (runner.phase_of, runner.IBKR_BARS)
+    runner.phase_of = lambda now: "open"
+    runner.IBKR_BARS = 3
+    r = A.radar
+    try:
+        cl = TestClient(A.app)
+        r.bar_want, r.armed = ["AAA"], {}
+        r.bridge.reset_bars()
+        e = datetime.now(timezone.utc).astimezone(ET)
+        t4 = datetime(e.year, e.month, e.day, 4, 0, tzinfo=ET)          # lo que el servidor manda como bars_t0
+        ib = FakeIB()
+        ib.hist = {"AAA": [_bar(t4 + timedelta(minutes=i), 10.4321) for i in range(120)]}
+
+        def post(url, token, payload):
+            return cl.post("/api/bridge", json=payload, headers={"X-Token": token}).json()
+        p = P.Puente(dict(P.DEFAULTS, BRIDGE_TOKEN="clave-prueba", SCAN_EVERY="999"), ib, post)
+        await p.step()                                   # conecta y aprende qué velas quiere el semáforo
+        assert p.bar_want == {"AAA": 0} and p.bar_t0 == int(t4.timestamp()), (p.bar_want, p.bar_t0)
+        await p.bars_task
+        await p.step()                                   # manda el día completo
+        last = int((t4 + timedelta(minutes=119)).timestamp())
+        assert len(r.bridge.bars["AAA"]) == 120 and p.bar_want == {"AAA": last}, p.bar_want
+        p.bar_subs["AAA"].append(_bar(t4 + timedelta(minutes=120), 10.4321))
+        p.last_push = -1e9
+        await p.step()                                   # solo lo nuevo
+        assert len(r.bridge.bars["AAA"]) == 121 and len(p.bar_sent) == 1
+        assert cl.get("/health").json()["bridge"]["bars"] == 1
+        r.snapshot = {**r.snapshot, "bridge": r.bridge.status()}
+        for path in ("/health", "/api/signals", "/api/trades"):
+            assert "10.4321" not in cl.get(path).text, path      # ni velas ni precios de IBKR en lo público
+    finally:
+        runner.phase_of, runner.IBKR_BARS = old
+        r.bar_want = []
+        r.bridge.reset_bars()
+        os.environ.pop("BRIDGE_TOKEN", None)
+
+
+def test_bars_end_to_end():
+    asyncio.run(_bars_end_to_end())
+
+
 if __name__ == "__main__":
     test_config()
     test_http_errors()
+    test_bar_row()
+    test_quiet_log()
     test_scenario()
+    test_bars_scenario()
     test_end_to_end()
+    test_bars_end_to_end()
     print("OK · puente IBKR")
