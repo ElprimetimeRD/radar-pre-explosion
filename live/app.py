@@ -9,9 +9,10 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from . import keepalive, memory
 from .runner import Radar
@@ -41,13 +42,14 @@ def page():
 
 
 def clean(o):
-    """NaN/inf → None (JSON estricto no los acepta y la API respondía 500)."""
+    """NaN/inf → None (JSON estricto no los acepta y la API respondía 500). Copia cada dict/lista de una vez antes de
+    recorrerlo: el ciclo puede estar agregando campos a una señal en otro hilo ("dictionary changed size")."""
     if isinstance(o, float):
         return o if math.isfinite(o) else None
     if isinstance(o, dict):
-        return {k: clean(v) for k, v in o.items()}
+        return {k: clean(v) for k, v in list(o.items())}
     if isinstance(o, (list, tuple)):
-        return [clean(v) for v in o]
+        return [clean(v) for v in list(o)]
     return o
 
 
@@ -74,11 +76,12 @@ def trades():
                         headers={"Cache-Control": "no-store"})
 
 
-def _auth(token: str | None):
-    """Las posiciones son privadas: exigen POSITIONS_TOKEN (cabecera X-Token). Sin la variable, el acceso queda cerrado."""
-    want = os.environ.get("POSITIONS_TOKEN") or ""
+def _auth(token: str | None, var: str = "POSITIONS_TOKEN"):
+    """Las posiciones y el puente IBKR son privados: exigen su token (cabecera X-Token). Sin la variable configurada,
+    el acceso queda cerrado."""
+    want = os.environ.get(var) or ""
     if not want:
-        raise HTTPException(503, "POSITIONS_TOKEN no está configurado en el servicio")
+        raise HTTPException(503, f"{var} no está configurado en el servicio")
     if not token or not hmac.compare_digest(token.encode(), want.encode()):
         raise HTTPException(401, "token inválido")
 
@@ -112,14 +115,36 @@ def positions_remove(t: str, x_token: str | None = Header(default=None)):
     return {"removed": radar.positions.remove(t)}
 
 
+class BridgeIn(BaseModel):
+    v: int = 1
+    scan: dict[str, list[str]] | None = None   # {código de escáner de IBKR: [tickers en orden]}
+    quotes: dict[str, dict] | None = None      # {ticker: {last, high, bid, ask}} de las acciones armadas
+    info: dict | None = None                   # estado del programa (conexión con IBKR, último error)
+
+
+@app.post("/api/bridge")
+async def bridge_feed(request: Request, x_token: str | None = Header(default=None)):
+    """Puente IBKR (bridge/puente_ibkr.py en la PC de Priamo): recibe escáneres y precios al instante, avisa rupturas
+    y responde qué acciones vigilar. Exige BRIDGE_TOKEN; el cuerpo se lee solo después de validar la clave."""
+    _auth(x_token, "BRIDGE_TOKEN")
+    raw = await request.body()
+    if len(raw) > 200_000:
+        raise HTTPException(413, "cuerpo demasiado grande")
+    try:
+        b = BridgeIn.model_validate_json(raw or b"{}")
+    except ValidationError as e:
+        raise HTTPException(422, str(e)[:300])
+    return clean(await run_in_threadpool(radar.on_bridge, b.scan, b.quotes, b.info))
+
+
 @app.get("/health")
 def health():
     ts = radar.snapshot.get("ts")
     rss = memory.rss_mb()
-    return {"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
+    return clean({"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
             "armed": sorted(radar.armed), "uptime_min": round((time.time() - STARTED) / 60, 1),
-            "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB},
-            "now": datetime.now(timezone.utc).isoformat()}
+            "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB}, "bridge": radar.bridge.status(),
+            "now": datetime.now(timezone.utc).isoformat()})
 
 
 @app.get("/api/news/{t}")

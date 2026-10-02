@@ -648,6 +648,162 @@ def test_watch_positions(tmp="/tmp/claude-0/positions_watch_test.json"):
             os.remove(tmp)
 
 
+def test_bridge_state():
+    """Puente IBKR: limpia lo que llega, los precios caducan a los 10 s y el escaneo a los 3 min; el estado que se
+    publica no lleva precios."""
+    from live.bridge import Bridge
+    b = Bridge()
+    t0 = 1_000_000.0
+    fresh = b.update(scan={"TOP_PERC_GAIN": ["aaa", "BBB", "BRK B", "toolongx", "AAA"], "HOT_BY_VOLUME": ["CCC", "BBB"]},
+                     quotes={"AAA": {"last": 10.5, "high": 10.6}, "BAD": {"last": float("nan")}, "NEG": {"last": -1},
+                             "x y": {"last": 3}, "CCC": "no es un dict"},
+                     info={"ib": "conectado", "error": None}, now=t0)
+    assert fresh == ["AAA"], fresh
+    assert b.scan["TOP_PERC_GAIN"] == ["AAA", "BBB"], b.scan                 # mayúsculas, sin clases ni repetidos
+    assert b.scan_symbols(3, now=t0 + 5) == ["AAA", "CCC", "BBB"]           # intercalados: el 1.º de cada escaneo…
+    assert b.scan_symbols(10, now=t0 + 181) == []                           # escaneo viejo: ya no alimenta el universo
+    assert b.price("AAA", now=t0 + 9) == 10.5 and b.price("AAA", now=t0 + 11) is None
+    st = b.status(now=t0 + 5)
+    assert st["on"] and st["quotes"] == 1 and st["scan"] == {"TOP_PERC_GAIN": 2, "HOT_BY_VOLUME": 2}, st
+    assert "10.5" not in str(st) and not b.status(now=t0 + 61)["on"]
+    assert b.scan_symbols(0, now=t0) == []                                   # IBKR_TOP=0 apaga los agregados
+    b.update(info={"lines": float("nan"), "big": "x" * 999}, now=t0)
+    assert b.info["lines"] is None and len(b.info["big"]) == 200            # nada de NaN ni textos enormes
+    b.update(quotes={f"Q{chr(65 + i // 26)}{chr(65 + i % 26)}": {"last": 1 + i} for i in range(100)}, now=t0 + 1)
+    for k in range(4):
+        b.update(quotes={f"R{k}{chr(65 + i // 26)}{chr(65 + i % 26)}"[:5]: {"last": 2} for i in range(100)}, now=t0 + 2 + k)
+    assert len(b.quotes) <= 300, len(b.quotes)                              # memoria acotada
+
+
+def test_bridge_break():
+    """Con el puente conectado, la ruptura de una acción armada se avisa al llegar el precio (sin esperar los 15 s del
+    vigía), una sola vez, y la armada guarda la hora y la fuente de la ruptura (sin el precio)."""
+    from scanner.sources import yahoo
+    now = DAY.replace(hour=10, minute=0)
+    old_q = yahoo.batch_quotes
+    asked = []
+    try:
+        r = runner.Radar(notify=False)
+        r.trades, r.arms, r.sent = {}, {}, set()
+        got, real_tg = [], r.tg
+        r.tg = lambda key, text, **kw: (got.append((key, text)), real_tg(key, text, **kw))
+        a = {"level": 50.0, "entry": 50.05, "stop": 49.55, "t1": 51.05, "t2": 52.55, "risk": 1.0, "score": 70,
+             "px": 49.9, "chg": 6.0, "reason": "debajo del máximo de apertura"}
+        r.armed = {"AAA": dict(a), "BBB": dict(a)}
+        r.arms["AAA"] = runner.new_arm("AAA", a, DAY.date().isoformat(), "09:58", 598, 720)
+        out = r.on_bridge(quotes={"AAA": {"last": 49.98}}, now=now)
+        assert out["fired"] == [] and set(out["armed"]) == {"AAA", "BBB"} and out["armed"]["AAA"]["level"] == 50.0, out
+        out = r.on_bridge(quotes={"AAA": {"last": 50.08}}, now=now)
+        assert out["fired"] == ["AAA"] and r.wake.is_set() and "break:AAA:50.00" in r.sent, out
+        assert "(50.08, IBKR)" in got[-1][1], got
+        assert r.breaks["AAA"] == {"break_t": "10:00:00", "break_src": "ibkr"}, r.breaks  # sin el precio de IBKR
+        assert r.on_bridge(quotes={"AAA": {"last": 50.2}}, now=now)["fired"] == []                       # no repite
+        assert r.on_bridge(quotes={"BBB": {"last": 51}}, now=now.replace(hour=16, minute=5))["fired"] == []  # fuera de sesión
+        # El vigía rápido toma el precio del puente y solo le pregunta a Yahoo por las que no lo tienen
+        yahoo.batch_quotes = lambda syms: (asked.append(list(syms)), {})[1]
+        r.q_off_until = 0
+        r.bridge.update(quotes={"BBB": {"last": 50.3}})
+        r.wake.clear()
+        assert r.fast_once(now) == ["BBB"] and asked == [] and r.wake.is_set(), asked
+        assert "no persigas" in got[-1][1] and "IBKR" in got[-1][1], got[-1]
+        r.armed["CCC"] = dict(a)
+        r.fast_once(now)
+        assert asked == [["CCC"]] and r.fast_state["ibkr"] == 2, (asked, r.fast_state)
+        # En el siguiente ciclo la ruptura avisada queda en la armada (para medir cuánto adelanta el puente)
+        r._track_arms([], {}, now.astimezone(ET))
+        assert r.arms["AAA"]["break_t"] == "10:00:00" and r.arms["AAA"]["break_src"] == "ibkr", r.arms["AAA"]
+        assert "50.08" not in str(r.arms) and "50.3" not in str(r.arms)        # el precio de IBKR no se guarda
+    finally:
+        yahoo.batch_quotes = old_q
+
+
+def test_bridge_universe():
+    """Lo que ven los escáneres de IBKR entra al universo: en sesión directo aunque Yahoo no lo liste; en pre-market
+    solo compite en el ranking. Entre refrescos del universo, el ciclo lo agrega en el acto."""
+    from scanner.sources import yahoo
+    old = (yahoo.retry, yahoo.batch_quotes)
+    try:
+        yahoo.retry = lambda fn, tries=3, what="": None                      # las pantallas de Yahoo no traen nada
+        yahoo.batch_quotes = lambda syms: {}
+        r = runner.Radar(notify=False)
+        r.bridge.update(scan={"HOT_BY_VOLUME": ["NEWB", "NEWC"], "TOP_PERC_GAIN": ["NEWD"]})
+        now = DAY.replace(hour=10, minute=0)
+        r.refresh_universe(now, "open", {})
+        assert {"NEWB", "NEWC", "NEWD"} <= set(r.universe) and r.sources["NEWB"] == ["ibkr"], (r.universe, r.sources)
+        r.premarket_rank = lambda syms: {}
+        r.refresh_universe(now.replace(hour=8), "pre", {})
+        assert "NEWB" not in r.universe, r.universe
+    finally:
+        yahoo.retry, yahoo.batch_quotes = old
+    n = 40
+    now = DAY.replace(hour=9, minute=30) + timedelta(minutes=n - 1)
+    today = {"RUN": bars(DAY, [10.0] * n, 40000), "SPY": bars(DAY, list(np.linspace(500, 502, n)), 50000),
+             "QQQ": bars(DAY, list(np.linspace(400, 402, n)), 50000), "HOT": bars(DAY, [5.0] * n, 30000)}
+    old = _fake_sources(today, now)
+    try:
+        r = runner.Radar(notify=False)
+        r.trades, r.arms, r.sent = {}, {}, set()
+        r.universe, r.universe_ts = ["RUN"], 1e18                            # sin refresco del universo en este ciclo
+        r.bridge.update(scan={"HOT_BY_VOLUME": ["HOT"]})
+        r.cycle(now.astimezone(ET))
+        row = next((x for x in r.snapshot["rows"] if x["t"] == "HOT"), None)
+        assert row and row["src"] == ["ibkr"] and r.snapshot["bridge"]["on"], (row, r.snapshot.get("bridge"))
+        sizes = []
+        for k in range(3):                                                    # escaneos que rotan
+            r.bridge.update(scan={"HOT_BY_VOLUME": [f"X{chr(65 + k)}{chr(65 + i)}" for i in range(runner.IBKR_TOP + 3)]})
+            r.cycle(now.astimezone(ET))
+            sizes.append(len(r.universe))
+        assert sizes == [1 + runner.IBKR_TOP] * 3 and "XAA" not in r.universe and "HOT" not in r.universe, (sizes, r.universe)
+    finally:
+        for (mod, name), fn in old.items():
+            setattr(mod, name, fn)
+
+
+def test_bridge_api():
+    """API del puente: cerrada sin BRIDGE_TOKEN, 401 con token malo; con el bueno guarda y responde qué vigilar.
+    /health dice si está conectado sin mostrar precios."""
+    import os
+    os.environ.update(NO_LOOP="1", NO_NOTIFY="1")
+    from fastapi.testclient import TestClient
+    from live import app as A
+    cl = TestClient(A.app)
+    body = {"scan": {"TOP_PERC_GAIN": ["AAA"]}, "quotes": {"AAA": {"last": 10.25, "bid": None}}, "info": {"ib": "conectado"}}
+    os.environ.pop("BRIDGE_TOKEN", None)
+    assert cl.post("/api/bridge", json=body, headers={"X-Token": "x"}).status_code == 503
+    os.environ["BRIDGE_TOKEN"] = "otro-secreto"
+    assert cl.post("/api/bridge", json=body).status_code == 401
+    assert cl.post("/api/bridge", json=body, headers={"X-Token": "malo"}).status_code == 401
+    ok = cl.post("/api/bridge", json=body, headers={"X-Token": "otro-secreto"})
+    assert ok.status_code == 200 and ok.json()["ok"] and "armed" in ok.json() and "phase" in ok.json(), ok.text
+    h = cl.get("/health").json()
+    assert h["bridge"]["on"] and h["bridge"]["scan"] == {"TOP_PERC_GAIN": 1} and h["bridge"]["ib"] == "conectado", h
+    assert "10.25" not in str(h)
+    assert cl.post("/api/bridge", content=b"{no es json", headers={"X-Token": "otro-secreto"}).status_code == 422
+    assert cl.post("/api/bridge", content=b"x" * 300_000, headers={"X-Token": "malo"}).status_code == 401  # clave antes
+    A.radar.bridge.update(info={"lines": float("nan")})
+    assert cl.get("/health").status_code == 200                               # un NaN del puente no tumba /health
+    # Una ruptura vista por IBKR: el aviso sale, pero su precio no llega a /api/trades ni a /api/signals (públicas)
+    r, old_phase = A.radar, runner.phase_of
+    runner.phase_of = lambda now: "open"
+    try:
+        a = {"level": 7.0, "entry": 7.01, "stop": 6.93, "t1": 7.15, "t2": 7.36, "risk": 1.1, "score": 70, "px": 6.95}
+        r.sent, r.breaks, r.armed = set(), {}, {"PRC": dict(a)}
+        r.arms = {"PRC": runner.new_arm("PRC", a, DAY.date().isoformat(), "10:00", 600, 720)}
+        out = cl.post("/api/bridge", json={"quotes": {"PRC": {"last": 7.0137, "bid": 7.0111}}},
+                      headers={"X-Token": "otro-secreto"}).json()
+        assert out["fired"] == ["PRC"], out
+        r._track_arms([], {}, DAY.replace(hour=10, minute=1).astimezone(ET))
+        r.snapshot = {**r.snapshot, "armadas": list(r.arms.values()), "bridge": r.bridge.status()}
+        for path in ("/api/trades", "/api/signals", "/health"):
+            txt = cl.get(path).text
+            assert "7.0137" not in txt and "7.0111" not in txt, (path, txt[:300])
+        assert r.arms["PRC"]["break_src"] == "ibkr"
+    finally:
+        runner.phase_of = old_phase
+        r.armed, r.arms = {}, {}
+    os.environ.pop("BRIDGE_TOKEN", None)
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -672,5 +828,9 @@ if __name__ == "__main__":
     test_positions_api()
     test_watch_positions()
     test_follow_outside_universe()
+    test_bridge_state()
+    test_bridge_break()
+    test_bridge_universe()
+    test_bridge_api()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})

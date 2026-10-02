@@ -20,6 +20,7 @@ from scanner.util import DATA, ET, fnum, log, read_json, write_json
 
 from . import halts as halts_src
 from . import memory
+from .bridge import Bridge
 from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, RISK_MAX, T2, decide, regime
 from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
 from .positions import Positions
@@ -31,6 +32,7 @@ FAST_S = int(os.environ.get("FAST_S", "15"))         # s entre vistazos del vig�
 ARM_MIN = int(os.environ.get("ARM_MIN", "55"))        # fuerza mínima para armar (60 con mercado amarillo): la ruptura suma 5
 ARM_NEAR = float(os.environ.get("ARM_NEAR", "1.0"))   # % máximo debajo del gatillo para armarla
 ARM_MAX = int(os.environ.get("ARM_MAX", "8"))         # avisos de "arma" por día (no saturar Telegram)
+IBKR_TOP = int(os.environ.get("IBKR_TOP", "12"))     # tickers de los escáneres de IBKR (puente) que entran al universo
 ENRICH_N = 20
 STATE_DIR = os.path.join(DATA, "live")
 HIST_DAYS = 5
@@ -315,6 +317,10 @@ class Radar:
         self.fast_state: dict = {}
         self.mem: dict = {}               # memoria del proceso tras el último ciclo (RSS y % de MEM_LIMIT_MB)
         self.wake = threading.Event()     # el vigía rápido despierta el ciclo completo cuando algo rompe
+        self.bridge = Bridge()            # puente IBKR (programa en la PC de Priamo): escáneres y precios al instante
+        self.breaks: dict[str, dict] = {}  # hora y fuente de cada ruptura avisada (el ciclo la pasa a la armada)
+        self.brk_lock = threading.Lock()   # el puente (petición web) y el vigía rápido revisan rupturas a la vez
+        self.base_universe: list[str] | None = None  # universo del último refresco, sin los agregados de IBKR
         self.tg_lock = threading.Lock()
         self._load()
 
@@ -379,13 +385,21 @@ class Radar:
                     del dst[old]
 
     # ---------------- Telegram ----------------
-    def tg(self, key: str, text: str):
+    def tg(self, key: str, text: str, wait: bool = True):
+        """Avisa una sola vez por clave. wait=False manda en otro hilo: la petición del puente IBKR no espera a
+        Telegram (si tarda, el puente se quedaría sin enviar precios de las demás armadas)."""
         with self.tg_lock:  # el ciclo y el vigía rápido avisan desde hilos distintos
             if key in self.sent:
                 return
             self.sent.add(key)
-        tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
         log.info("ALERTA %s", text.replace("\n", " | "))
+        if wait:
+            self._send(text)
+        else:
+            threading.Thread(target=self._send, args=(text,), name="telegram", daemon=True).start()
+
+    def _send(self, text: str):
+        tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
         if not (self.notify and tok and chat):
             return
         try:
@@ -451,6 +465,11 @@ class Radar:
                 sq[str(q.get("symbol")).upper()] = q
         for s in watch:
             add(s, "watchlist")
+        # Escáneres de IBKR (puente): ven moverse una acción antes que las listas de Yahoo. En sesión entran directo
+        # (como la lista de seguimiento); en pre-market compiten en el ranking como cualquier candidato.
+        ib_top = self.bridge.scan_symbols(IBKR_TOP)
+        for s in ib_top:
+            add(s, "ibkr")
         for s, h in halted.items():
             add(s, "halt")
         scan_url = os.environ.get("RADAR_SCAN_URL")
@@ -489,8 +508,8 @@ class Radar:
             ranked.append((math.log1p(rv) * 2 + max(chg, 0) / 4, s))
         ranked.sort(reverse=True)
         top = [s for _, s in ranked[:UNIVERSE_N]]
-        uni = list(dict.fromkeys(top + watch + list(halted)))
-        self.universe = uni
+        uni = list(dict.fromkeys(top + watch + list(halted) + (ib_top if phase == "open" else [])))
+        self.universe, self.base_universe = uni, list(uni)
         self.sources = {s: sorted(cand.get(s, [])) for s in uni}
         self.universe_ts = time.time()
         log.info("universo: %d candidatos, %d cotizados → %d en seguimiento", len(cand), len(quotes), len(uni))
@@ -541,6 +560,7 @@ class Radar:
         phase = phase_of(now)
         if self.day != today:
             self.day, self.baseline, self.atr, self.prev = today, {}, {}, {}
+            self.breaks = {}
             self.cache = TTLCache()  # noticias, SEC y opciones de ayer ya no sirven: sin esto la caché crece cada día
             iso = today.isoformat()
             if any(x.get("day") != iso for x in list(self.trades.values()) + list(self.arms.values())):
@@ -558,7 +578,8 @@ class Radar:
             self.armed = {}
             self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat(),
                              "trades": list(self.trades.values()), "stats": self.stats(), "armed": [], "watching": [],
-                             "armadas": list(self.arms.values()), "armStats": self.arm_stats()}
+                             "armadas": list(self.arms.values()), "armStats": self.arm_stats(),
+                             "bridge": self.bridge.status()}
             return
         try:  # el monitor de posiciones va antes de lo pesado: si el escaneo falla, los avisos de tus posiciones siguen
             self._watch_positions(now, phase)
@@ -567,6 +588,16 @@ class Radar:
         halted = halts_src.parse(halts_src.fetch(), now)
         if not self.universe or time.time() - self.universe_ts > (UNIVERSE_TTL if phase == "open" else 600):
             self.refresh_universe(now, phase, halted)
+        if phase == "open":
+            # Lo que los escáneres de IBKR ven AHORA entra ya, sin esperar el próximo refresco del universo. Reemplaza
+            # a los agregados del ciclo anterior (no se acumulan: cada uno pide 5 días de velas y la memoria es justa).
+            if self.base_universe is None:
+                self.base_universe = list(self.universe)
+            base = set(self.base_universe)
+            extra = [s for s in self.bridge.scan_symbols(IBKR_TOP) if s not in base]
+            self.universe = self.base_universe + extra
+            for s in extra:
+                self.sources.setdefault(s, ["ibkr"])
         # Las señales y órdenes armadas abiertas se siguen aunque su acción salga del universo (antes, SITC dejó de
         # seguirse a los 6 minutos de su COMPRA del 1-oct: sin avisos de stop ni de objetivo).
         active = [s for s, x in list(self.trades.items()) + list(self.arms.items())
@@ -637,7 +668,7 @@ class Radar:
             "counts": {k: sum(1 for r in rows if r["decision"] == k) for k in rank},
             "trades": list(self.trades.values()), "stats": self.stats(), "universe": len(self.universe),
             "armadas": list(self.arms.values()), "armStats": self.arm_stats(),
-            "halts": {s: h for s, h in halted.items()}, "errors": self.errors[-5:],
+            "halts": {s: h for s, h in halted.items()}, "errors": self.errors[-5:], "bridge": self.bridge.status(),
         }
         self._save()
 
@@ -683,6 +714,9 @@ class Radar:
         now_m = t_et.hour * 60 + t_et.minute
         by_t = {r["t"]: r for r in rows}
         for s, o in self.arms.items():
+            b = self.breaks.get(s)
+            if b and "break_t" not in o:
+                o.update(b)  # cuándo y con qué datos se avisó la ruptura (⚡): mide cuánto adelanta el puente IBKR
             if o.get("status") not in ("pendiente", "abierta", "t1"):
                 continue
             d = to_et(bars.get(s))
@@ -724,36 +758,71 @@ class Radar:
         self.tg(f"pre:{t_et.date().isoformat()}", "📋 Lista de apertura\n" + "\n".join(lines) +
                 f"\nGatillo: ruptura del rango de los primeros {OR_MINUTES} min con volumen; te aviso cuando se arme cada una.")
 
-    # ---------------- vigía rápido: precio de las rupturas armadas cada FAST_S segundos ----------------
-    def fast_once(self, now: datetime | None = None) -> list[str]:
-        """Si una acción armada cruza su gatillo, avisa al instante y despierta el ciclo completo para que confirme la
-        COMPRA sin esperar su turno. Solo usa la cotización v7 (las descargas de velas de yfinance no son seguras en
-        paralelo con las del ciclo); si Yahoo la niega, el vigía espera y el ciclo de 1 min sigue como siempre. Un fallo
-        aquí no activa el cortacircuito de cotizaciones del ciclo."""
-        now = now or datetime.now(timezone.utc)
+    # ---------------- vigía rápido: precio de las rupturas armadas (IBKR al instante o Yahoo cada FAST_S s) -------
+    def _check_breaks(self, prices: dict, src: str, now: datetime) -> list[str]:
+        """Avisa una sola vez cada acción armada cuyo precio cruzó el gatillo y despierta el ciclo completo para que
+        confirme la COMPRA sin esperar su turno. Guarda hora y fuente de la ruptura (no el precio: los datos de IBKR
+        son de uso personal y las armadas se publican en /api/trades y en GitHub) para medir cuánto adelanta."""
         armed = dict(self.armed)
         fired: list[str] = []
-        if phase_of(now) == "open" and armed and time.time() >= self.q_off_until:
-            for s, q in (yahoo.batch_quotes(sorted(armed)) or {}).items():
-                a, p = armed.get(s), fnum(q.get("regularMarketPrice"))
+        with self.brk_lock:
+            for s, p in prices.items():
+                a = armed.get(s)
                 if not a or not p or p < a["level"] * 1.001:
                     continue
                 key = f"break:{s}:{a['level']:.2f}"
                 if key in self.sent:
                     continue
+                ib = src == "ibkr"
                 if p <= a["entry"] * 1.004:
-                    msg = (f"⚡ {s} rompe {a['level']:.2f} ahora ({p:.2f}). Entrada ≤ {a['entry'] * 1.003:.2f} · "
-                           f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
+                    msg = (f"⚡ {s} rompe {a['level']:.2f} ahora ({p:.2f}{', IBKR' if ib else ''}). Entrada ≤ "
+                           f"{a['entry'] * 1.003:.2f} · stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
                            f"Confirma volumen en tu gráfico; el semáforo lo reevalúa ya.")
                 else:
-                    msg = (f"⚡ {s} rompió {a['level']:.2f} y ya va en {p:.2f}: no persigas. Si dejaste la orden armada, ya "
-                           f"entraste; si no, espera el retesteo que marque el semáforo.")
-                self.tg(key, msg)
+                    msg = (f"⚡ {s} rompió {a['level']:.2f} y ya va en {p:.2f}{' (IBKR)' if ib else ''}: no persigas. "
+                           f"Si dejaste la orden armada, ya entraste; si no, espera el retesteo que marque el semáforo.")
+                self.tg(key, msg, wait=not ib)
+                self.breaks.setdefault(s, {"break_t": now.astimezone(ET).strftime("%H:%M:%S"), "break_src": src})
                 fired.append(s)
         if fired:
             self.wake.set()
-        self.fast_state = {"ts": now.isoformat(), "armed": len(armed), "fired": fired}
         return fired
+
+    def fast_once(self, now: datetime | None = None) -> list[str]:
+        """Revisa las acciones armadas. Con el puente IBKR conectado, su precio (al instante) manda; Yahoo solo cubre
+        las que no tengan precio fresco del puente. De Yahoo usa solo la cotización v7 (las descargas de velas de
+        yfinance no son seguras en paralelo con las del ciclo); si Yahoo la niega, el vigía espera y el ciclo de 1 min
+        sigue como siempre. Un fallo aquí no activa el cortacircuito de cotizaciones del ciclo."""
+        now = now or datetime.now(timezone.utc)
+        armed = dict(self.armed)
+        fired: list[str] = []
+        ib = {}
+        if phase_of(now) == "open" and armed:
+            for s in armed:
+                p = self.bridge.price(s)
+                if p:
+                    ib[s] = p
+            fired += self._check_breaks(ib, "ibkr", now)
+            rest = sorted(s for s in armed if s not in ib)
+            if rest and time.time() >= self.q_off_until:
+                yq = {s: fnum(q.get("regularMarketPrice")) for s, q in (yahoo.batch_quotes(rest) or {}).items()}
+                fired += self._check_breaks(yq, "yahoo", now)
+        self.fast_state = {"ts": now.isoformat(), "armed": len(armed), "fired": fired, "ibkr": len(ib)}
+        return fired
+
+    def on_bridge(self, scan: dict | None = None, quotes: dict | None = None, info: dict | None = None,
+                  now: datetime | None = None) -> dict:
+        """Datos del puente IBKR: guarda escáneres y precios y, si una acción armada cruzó su gatillo, avisa en el
+        acto. Responde qué vigilar: las acciones armadas con su gatillo (el puente se suscribe a su precio)."""
+        now = now or datetime.now(timezone.utc)
+        fresh = self.bridge.update(scan, quotes, info)
+        phase = phase_of(now)
+        armed = dict(self.armed)
+        fired = []
+        if phase == "open":
+            fired = self._check_breaks({s: self.bridge.price(s) for s in fresh if s in armed}, "ibkr", now)
+        return {"ok": True, "phase": phase, "fired": fired,
+                "armed": {s: {"level": a["level"], "entry": a["entry"]} for s, a in armed.items()}}
 
     def fast_forever(self):
         while True:
