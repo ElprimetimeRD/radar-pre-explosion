@@ -10,23 +10,27 @@ import os
 from .metrics import OPEN_M, OR_MINUTES
 
 # ---------- Umbrales ----------
+# Perfil de riesgo (RIESGO en Render): "alto" avisa antes a cambio de más avisos que fallan; "normal" es el de siempre.
+RIESGO = "normal" if os.environ.get("RIESGO", "alto").strip().lower() == "normal" else "alto"
+ALTO = RIESGO == "alto"
 MIN_PRICE = 1.0            # debajo: NO (spreads y dilución)
 MIN_USD_VOL = 3_000_000    # dólares negociados hoy en sesión
 MAX_SPREAD = 0.8           # % (1.5 % si el precio < 5)
-RVOL_IN_PLAY = 2.0         # volumen relativo mínimo a la misma hora
+RVOL_IN_PLAY = 1.5 if ALTO else 2.0  # volumen relativo mínimo a la misma hora
+RVOL_NEWS = 1.2 if ALTO else 1.5     # ...con noticia fresca
 # RVOL de los últimos 15 min que pone en juego a una acción aunque su RVOL acumulado no llegue (ruptura de media mañana
 # con volumen nuevo). 0 = apagado: se calcula y se muestra, pero no decide hasta medir con los resultados si ayuda.
-RVOL15_IN_PLAY = float(os.environ.get("RVOL15_IN_PLAY", "0"))
-EXT_MAX = 4.0              # % sobre VWAP: más que esto = esperar retroceso
+RVOL15_IN_PLAY = float(os.environ.get("RVOL15_IN_PLAY", "3" if ALTO else "0"))
+EXT_MAX = 5.0 if ALTO else 4.0  # % sobre VWAP: más que esto = esperar retroceso
 EXT_PARABOLIC = 10.0       # % sobre VWAP: no perseguir
 CHG15_PARABOLIC = 15.0     # % en 15 minutos: no perseguir
-RISK_MAX = 2.5             # % máximo entre entrada y stop
+RISK_MAX = 3.0 if ALTO else 2.5  # % máximo entre entrada y stop (alto: admite acciones más volátiles)
 RISK_MIN = 0.7             # stop nunca más cerca que esto (ruido)
 MIN_ATR = 2.0              # % rango diario típico; debajo difícilmente da +2 %
-BUY_MIN = 60               # fuerza mínima para COMPRA (65 con mercado amarillo)
+BUY_MIN = 55 if ALTO else 60  # fuerza mínima para COMPRA (+5 con mercado amarillo)
 LAST_ENTRY_M = 15 * 60 + 30  # 15:30 ET: fin de la fase de seguimiento
 ENTRY_END_M = int(os.environ.get("ENTRY_END_M", str(12 * 60)))  # 12:00 ET: sin COMPRA nuevas después
-CHASE_MAX = 0.5            # % sobre el nivel roto: más que esto = orden límite en el retesteo
+CHASE_MAX = 1.0 if ALTO else 0.5  # % sobre el nivel roto: más que esto = orden límite en el retesteo
 LIMIT_VALID_MIN = 10       # minutos que vale la orden límite
 T1, T2 = 2.0, 5.0          # objetivos %
 EVENT_CAP = 35             # RVOL + noticia + calls juntos: son el mismo evento visto tres veces, no tres pruebas
@@ -202,7 +206,7 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
         return no_data("sin volumen relativo (falta la curva de volumen de los días previos)")
     rv15 = m.get("rvol15") or 0
     surge = RVOL15_IN_PLAY > 0 and rv >= 1.0 and rv15 >= RVOL15_IN_PLAY
-    if rv < (1.5 if cat_fresh else RVOL_IN_PLAY) and not surge:
+    if rv < (RVOL_NEWS if cat_fresh else RVOL_IN_PLAY) and not surge:
         return res("NO", f"sin volumen relativo (RVOL {rv:.1f}×)")
     if (m.get("usd_vol") or 0) < MIN_USD_VOL and now_m >= OPEN_M + OR_MINUTES:
         return res("NO", "poca liquidez en dólares")

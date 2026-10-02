@@ -22,6 +22,7 @@ from . import halts as halts_src
 from . import memory
 from .bridge import Bridge
 from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, RISK_MAX, T2, decide, regime
+from .decide import ALTO, RIESGO, RVOL_NEWS
 from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
 from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
 from .positions import Positions
@@ -29,10 +30,12 @@ from .positions import Positions
 UNIVERSE_N = int(os.environ.get("UNIVERSE_N", "50"))
 CYCLE_S = int(os.environ.get("CYCLE_S", "60"))
 UNIVERSE_TTL = int(os.environ.get("UNIVERSE_TTL", "180"))  # s entre refrescos del universo en sesión (pre-market: 600)
-FAST_S = int(os.environ.get("FAST_S", "15"))         # s entre vistazos del vigía rápido a las acciones armadas
-ARM_MIN = int(os.environ.get("ARM_MIN", "55"))        # fuerza mínima para armar (60 con mercado amarillo): la ruptura suma 5
-ARM_NEAR = float(os.environ.get("ARM_NEAR", "1.0"))   # % máximo debajo del gatillo para armarla
-ARM_MAX = int(os.environ.get("ARM_MAX", "8"))         # avisos de "arma" por día (no saturar Telegram)
+# Con RIESGO=alto (por defecto) los valores de la izquierda; con RIESGO=normal, los de siempre. Cada variable de Render
+# con su nombre manda sobre el perfil.
+FAST_S = int(os.environ.get("FAST_S", "10" if ALTO else "15"))      # s entre vistazos del vigía rápido a las armadas
+ARM_MIN = int(os.environ.get("ARM_MIN", "50" if ALTO else "55"))    # fuerza mínima para armar (+5 con mercado amarillo)
+ARM_NEAR = float(os.environ.get("ARM_NEAR", "2.5" if ALTO else "1.0"))  # % máximo debajo del gatillo para armarla
+ARM_MAX = int(os.environ.get("ARM_MAX", "12" if ALTO else "8"))     # avisos de "arma" por día (no saturar Telegram)
 IBKR_TOP = int(os.environ.get("IBKR_TOP", "12"))     # tickers de los escáneres de IBKR (puente) que entran al universo
 ENRICH_N = 20
 CTX_RETRY_S = 300     # s antes de volver a pedir la curva de volumen o el cierre previo de una acción que falló
@@ -297,6 +300,14 @@ LOG_BASE = os.environ.get("LOG_BASE", "https://raw.githubusercontent.com/Elprime
 MISS = object()  # TTLCache.get sin dato vigente (un None guardado también es un dato: "esa acción no tiene opciones")
 
 
+def perfil() -> dict:
+    """Umbrales activos (para /health): así se ve qué perfil de riesgo y qué variables de Render están mandando."""
+    from . import decide as D
+    return {"riesgo": RIESGO, "arm_near": ARM_NEAR, "arm_min": ARM_MIN, "arm_max": ARM_MAX, "fast_s": FAST_S,
+            "rvol": D.RVOL_IN_PLAY, "rvol_noticia": D.RVOL_NEWS, "rvol15": D.RVOL15_IN_PLAY, "fuerza_compra": D.BUY_MIN,
+            "perseguir_max": D.CHASE_MAX, "ext_max": D.EXT_MAX, "riesgo_max": D.RISK_MAX}
+
+
 class TTLCache:
     def __init__(self):
         self.d: dict = {}
@@ -471,7 +482,7 @@ class Radar:
     def hello(self):
         """Al arrancar el servicio: confirma por Telegram que el semáforo está en línea (y deja ver los reinicios)."""
         t = datetime.now(timezone.utc).astimezone(ET)
-        self._send(f"✅ Semáforo en línea ({t:%H:%M} ET). Te aviso aquí: 📋 lista de apertura desde las 9:15 y "
+        self._send(f"✅ Semáforo en línea ({t:%H:%M} ET, riesgo {RIESGO}). Te aviso aquí: 📋 lista de apertura desde las 9:15 y "
                    f"🟡 ARMA · 🟢 COMPRA · ⚡ rupturas desde las {(OPEN_M + OR_MINUTES) // 60}:{(OPEN_M + OR_MINUTES) % 60:02d}.")
 
     def quotes(self, syms: list[str]) -> dict[str, dict]:
@@ -823,7 +834,7 @@ class Radar:
         # fresca pondría en juego (RVOL 1.5–2: el umbral baja a 1.5 con noticia), aunque hoy salgan NO.
         def prio(s):
             r = base[s][2]
-            near = r["decision"] == "NO" and 1.5 <= (r.get("rvol") or 0) < D_RVOL_IN_PLAY
+            near = r["decision"] == "NO" and RVOL_NEWS <= (r.get("rvol") or 0) < D_RVOL_IN_PLAY
             return (r["decision"] != "NO" or near, r["score"])
         order = sorted(base, key=prio, reverse=True)
         now_ts = now.timestamp()
