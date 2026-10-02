@@ -23,7 +23,7 @@ from . import memory
 from .bridge import Bridge
 from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, RISK_MAX, T2, decide, regime
 from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
-from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
+from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, rows_frame, session_metrics, to_et, vol_scale
 from .positions import Positions
 
 UNIVERSE_N = int(os.environ.get("UNIVERSE_N", "50"))
@@ -34,6 +34,9 @@ ARM_MIN = int(os.environ.get("ARM_MIN", "55"))        # fuerza mínima para arma
 ARM_NEAR = float(os.environ.get("ARM_NEAR", "1.0"))   # % máximo debajo del gatillo para armarla
 ARM_MAX = int(os.environ.get("ARM_MAX", "8"))         # avisos de "arma" por día (no saturar Telegram)
 IBKR_TOP = int(os.environ.get("IBKR_TOP", "12"))     # tickers de los escáneres de IBKR (puente) que entran al universo
+# Velas de 1 min de IBKR (al día cada ~5 s) para las N candidatas principales: con ellas el semáforo avisa la COMPRA
+# por Telegram antes que con las de Yahoo. 0 = apagado. Requiere los datos de IBKR por la API funcionando (sin 10089).
+IBKR_BARS = int(os.environ.get("IBKR_BARS", "0"))
 ENRICH_N = 20
 CTX_RETRY_S = 300     # s antes de volver a pedir la curva de volumen o el cierre previo de una acción que falló
 PARTIAL_BARS = 2      # las últimas velas de Yahoo pueden estar a medio llenar: se vuelven a revisar en el ciclo siguiente
@@ -258,6 +261,18 @@ def new_trade(r: dict, day: str, t_str: str, m: int) -> dict:
             "status": "pendiente" if lim else "abierta", "hit1": False, "mfe": 0.0, "mae": 0.0, "last": p["entry"]}
 
 
+def buy_text(r: dict, tr: dict, reg_txt: str, head: str = "🟢 COMPRA", tail: str = "") -> str:
+    """Texto del aviso de COMPRA (el del ciclo y el temprano con velas de IBKR): orden, fuerza, stop y objetivos."""
+    why = ", ".join(r["why"][:3])
+    if tr["limit"]:
+        vm = tr["valid_m"]
+        how = f"orden LÍMITE {tr['entry']:.2f} válida hasta {vm // 60}:{vm % 60:02d} ET (no persigas {r['px']:.2f})"
+    else:
+        how = f"a {tr['entry']:.2f}, no pagues más de {tr['entry'] * 1.003:.2f}"
+    return (f"{head} {r['t']} {how}\nFuerza {r['score']}/100 · {why}\n"
+            f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}{tail}")
+
+
 def new_arm(t: str, a: dict, day: str | None, t_str: str, m: int, valid_m: int) -> dict:
     """La compra stop que pide el aviso 🟡 ARMA, como orden virtual: así se mide si entrar en la ruptura (rápido)
     rinde mejor que esperar la COMPRA confirmada. Se sigue desde la vela posterior al aviso (ver new_trade)."""
@@ -344,6 +359,11 @@ class Radar:
         self.breaks: dict[str, dict] = {}  # hora y fuente de cada ruptura avisada (el ciclo la pasa a la armada)
         self.brk_lock = threading.Lock()   # el puente (petición web) y el vigía rápido revisan rupturas a la vez
         self.base_universe: list[str] | None = None  # universo del último refresco, sin los agregados de IBKR
+        self.bar_want: list[str] = []      # candidatas que el puente sigue con velas de IBKR (IBKR_BARS)
+        self.ctx_cache: dict[str, dict] = {}  # contexto del último ciclo por ticker (noticias, mercado, spread, ATR…)
+        self.early: dict[str, dict] = {}   # avisos tempranos de COMPRA con velas de IBKR: {ticker: hora y fuente}
+        self.vol_k: dict[str, float] = {}  # factor de volumen IBKR→Yahoo por ticker (se recalcula con cada ciclo)
+        self.reg_txt = ""
         self.tg_lock = threading.Lock()
         self.tg_state: dict = {}          # resultado del último envío a Telegram (para /health; sin el token)
         self.ctx_try: dict[str, float] = {}  # última vez que se pidió el contexto (5 días + diario) de cada acción
@@ -741,7 +761,8 @@ class Radar:
         if self.day != today:
             self.day, self.baseline, self.atr, self.prev = today, {}, {}, {}
             self.ctx_try = {}
-            self.breaks = {}
+            self.breaks, self.early, self.vol_k, self.ctx_cache = {}, {}, {}, {}
+            self.bridge.reset_bars()
             self.cache = TTLCache()  # noticias, SEC y opciones de ayer ya no sirven: sin esto la caché crece cada día
             iso = today.isoformat()
             if any(x.get("day") != iso for x in list(self.trades.values()) + list(self.arms.values())):
@@ -756,7 +777,7 @@ class Radar:
                 self.sent_day = iso
         if phase == "closed":
             self._eod(t_et)
-            self.armed = {}
+            self.armed, self.bar_want = {}, []
             self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat(),
                              "trades": list(self.trades.values()), "stats": self.stats(), "armed": [], "watching": [],
                              "armadas": list(self.arms.values()), "armStats": self.arm_stats(),
@@ -797,12 +818,15 @@ class Radar:
         bars = yahoo.history(syms, period="1d", interval="1m", prepost=True)
         quotes = self.quotes(syms)
         self.last_bars = bars
+        self.vol_k = {}  # con velas de Yahoo nuevas, la calibración del volumen de IBKR se rehace
+
+        def prev_of(s):
+            return fnum(quotes.get(s, {}).get("regularMarketPreviousClose")) or self.prev.get(s)
 
         def mets(s):
             q = quotes.get(s, {})
-            prev = fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
             live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
-            return session_metrics(bars.get(s), prev, self.baseline.get(s), now, live)
+            return session_metrics(bars.get(s), prev_of(s), self.baseline.get(s), now, live)
 
         spy, qqq = mets("SPY"), mets("QQQ")
         reg, reg_txt = regime(spy, qqq) if phase != "pre" else ("verde", "pre-market")
@@ -852,12 +876,16 @@ class Radar:
                         r = {**r, "decision": "ESPERA", "reason": "sin noticias ni SEC todavía: no sé si hay dilución",
                              "plan": None, "level": None, "trigger": "se reevalúa en el próximo ciclo"}
             base[s] = (m, ctx, r)
+        if IBKR_BARS > 0:  # lo que el aviso temprano necesita del ciclo para decidir con las velas de IBKR
+            self.ctx_cache = {s: {"ctx": dict(base[s][1]), "prev": prev_of(s)} for s in base}
+        self.reg_txt = reg_txt
         rows = [base[s][2] for s in base]
         for r in rows:
             r["src"] = self.sources.get(r["t"], [])
         rank = {"COMPRA": 0, "ESPERA": 1, "NO": 2}
         rows.sort(key=lambda r: (rank[r["decision"]], -((r["chg"] or 0) if phase == "pre" else r["score"])))
         self._track(rows, bars, t_et, reg_txt)
+        self._want_bars(rows, phase)
         # "Mejor opción" solo existe si hay COMPRA: un ESPERA con plan arriba se leía como orden de compra (ACN, 1-oct)
         best = next((r for r in rows if r["decision"] == "COMPRA"), None)
         self._track_arms(rows, bars, t_et)
@@ -1038,19 +1066,84 @@ class Radar:
         self.fast_state = {"ts": now.isoformat(), "armed": len(armed), "fired": fired, "ibkr": len(ib)}
         return fired
 
+    # ---------------- velas de IBKR: aviso temprano de COMPRA (privado, por Telegram) ----------------
+    def _want_bars(self, rows, phase):
+        """Candidatas que el puente sigue con velas de IBKR: las ESPERA de más fuerza que aún no dieron COMPRA (en
+        pre-market, los gaps, para llegar a la apertura con el día cargado). Una que ya se sigue conserva su lugar
+        mientras siga entre las 2×N mejores: cada cambio es una suscripción nueva en IBKR."""
+        if IBKR_BARS <= 0 or phase not in ("pre", "open"):
+            self.bar_want = []
+            return
+        top = [r["t"] for r in rows if r["decision"] == "ESPERA" and r["t"] not in self.trades][:2 * IBKR_BARS]
+        keep = [s for s in self.bar_want if s in top]
+        self.bar_want = (keep + [s for s in top if s not in keep])[:IBKR_BARS]
+
+    def _vol_k(self, s: str, rows: list) -> float | None:
+        """Factor de volumen IBKR→Yahoo de un ticker, medido contra las velas de Yahoo del último ciclo."""
+        k = self.vol_k.get(s)
+        if k is None and rows:
+            k = vol_scale(self.last_bars.get(s), rows_frame(rows))
+            if k:
+                self.vol_k[s] = k
+        return k
+
+    def _early(self, syms: list[str], now: datetime) -> list[str]:
+        """Las reglas del semáforo con las velas de IBKR (al día cada ~5 s) en vez de las de Yahoo (1–2 min de retraso)
+        y el resto del contexto del último ciclo (noticias, mercado, spread, ATR). Si da COMPRA antes que el ciclo,
+        avisa por Telegram en el acto y despierta el ciclo. El aviso es privado: la COMPRA pública (página, API,
+        GitHub) la sigue dando el ciclo con datos de Yahoo, y a esa señal solo se le anota la hora del aviso temprano."""
+        if IBKR_BARS <= 0 or phase_of(now) != "open":
+            return []
+        t_et = now.astimezone(ET)
+        now_m = t_et.hour * 60 + t_et.minute
+        want = set(self.bar_want)
+        out = []
+        for s in syms:
+            c = self.ctx_cache.get(s)
+            if not c or s not in want or s in self.trades or f"early:{s}" in self.sent:
+                continue
+            rows = self.bridge.bar_rows(s)
+            k = self._vol_k(s, rows) if rows else None
+            if not k:
+                continue
+            m = session_metrics(rows_frame(rows, k), c["prev"], self.baseline.get(s), now, self.bridge.price(s))
+            r = decide(s, m, {**c["ctx"], "phase": "open"})
+            if r["decision"] != "COMPRA" or not r.get("plan"):
+                continue
+            tr = new_trade(r, t_et.date().isoformat(), t_et.strftime("%H:%M"), now_m)
+            self.tg(f"early:{s}", buy_text(r, tr, self.reg_txt, head="🟢⚡ COMPRA", tail=(
+                "\nVisto con velas de IBKR antes que el semáforo (Yahoo va 1–2 min atrás). Confirma en tu gráfico; "
+                "el semáforo la reevalúa ya.")), wait=False)
+            self.early.setdefault(s, {"early_t": t_et.strftime("%H:%M:%S"), "early_src": "ibkr"})
+            out.append(s)
+        if out:
+            self.wake.set()
+        return out
+
     def on_bridge(self, scan: dict | None = None, quotes: dict | None = None, info: dict | None = None,
-                  now: datetime | None = None) -> dict:
-        """Datos del puente IBKR: guarda escáneres y precios y, si una acción armada cruzó su gatillo, avisa en el
-        acto. Responde qué vigilar: las acciones armadas con su gatillo (el puente se suscribe a su precio)."""
+                  now: datetime | None = None, bars: dict | None = None) -> dict:
+        """Datos del puente IBKR: guarda escáneres, precios y velas; si una acción armada cruzó su gatillo o una
+        candidata da COMPRA con las velas de IBKR, avisa en el acto. Responde qué vigilar: las acciones armadas con su
+        gatillo (el puente se suscribe a su precio) y las candidatas que quiere con velas, con la hora de la última
+        vela que ya tiene de cada una (el puente manda desde ahí)."""
         now = now or datetime.now(timezone.utc)
         fresh = self.bridge.update(scan, quotes, info)
+        changed = self.bridge.put_bars(bars) if bars else []
         phase = phase_of(now)
         armed = dict(self.armed)
-        fired = []
+        fired, early = [], []
         if phase == "open":
             fired = self._check_breaks({s: self.bridge.price(s) for s in fresh if s in armed}, "ibkr", now)
-        return {"ok": True, "phase": phase, "fired": fired,
-                "armed": {s: {"level": a["level"], "entry": a["entry"]} for s, a in armed.items()}}
+            if changed:
+                early = self._early(changed, now)
+        t_et = now.astimezone(ET)
+        out = {"ok": True, "phase": phase, "fired": fired,
+               "armed": {s: {"level": a["level"], "entry": a["entry"]} for s, a in armed.items()},
+               "bars": self.bridge.bars_have(list(self.bar_want)) if IBKR_BARS > 0 else {},
+               "bars_t0": int(datetime(t_et.year, t_et.month, t_et.day, 4, 0, tzinfo=ET).timestamp())}
+        if early:
+            out["early"] = early
+        return out
 
     def fast_forever(self):
         while True:
@@ -1097,16 +1190,12 @@ class Radar:
                 tr["lag_min"] = break_lag(bars.get(r["t"]), lvl, t_et)
                 if tr["lag_min"] is not None:
                     late = f"\nRompió {lvl:.2f} hace {tr['lag_min']} min; la entrada queda {tr['slip']:+.1f}% sobre el nivel."
-            why = ", ".join(r["why"][:3])
-            if tr["limit"]:
-                vm = tr["valid_m"]
-                how = f"orden LÍMITE {tr['entry']:.2f} válida hasta {vm // 60}:{vm % 60:02d} ET (no persigas {r['px']:.2f})"
-            else:
-                how = f"a {tr['entry']:.2f}, no pagues más de {tr['entry'] * 1.003:.2f}"
-            self.tg(f"buy:{r['t']}", (
-                f"🟢 COMPRA {r['t']} {how}\nFuerza {r['score']}/100 · {why}\n"
-                f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}{late}\n"
-                f"Para operarla dime: «ejecuta {r['t']} $monto, vender a +3%»"))
+            e = self.early.get(r["t"])
+            if e:  # ya la avisó el aviso temprano con velas de IBKR: se anota cuándo (sin precios) para medir cuánto adelantó
+                tr.update(e)
+                late += f"\nIBKR la vio a las {e['early_t']} (aviso 🟢⚡)."
+            self.tg(f"buy:{r['t']}", buy_text(r, tr, reg_txt, tail=late) +
+                    f"\nPara operarla dime: «ejecuta {r['t']} $monto, vender a +3%»")
         for s, tr in self.trades.items():
             if tr["status"] not in ("pendiente", "abierta", "t1"):
                 continue
@@ -1182,6 +1271,9 @@ class Radar:
             for x in self.arms.values():
                 fin = f" {x['close_pct']:+.1f}%" if x.get("close_pct") is not None else ""
                 lines.append(f"⚡ {x['t']} {x['time']} · máx {x['mfe']:+.1f}% · mín {x['mae']:+.1f}% · {x['status']}{fin}")
+        if self.early:
+            ok = sum(1 for s in list(self.early) if s in self.trades)
+            lines.append(f"Avisos tempranos con velas de IBKR: {len(self.early)} · {ok} los confirmó el semáforo después")
         self.tg(f"eod:{day}", "\n".join(lines))
         path = os.path.join(STATE_DIR, f"log-{day}.json")
         if not os.path.exists(path):

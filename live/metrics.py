@@ -41,6 +41,44 @@ def to_et(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def rows_frame(rows: list | None, vol_k: float = 1.0) -> pd.DataFrame:
+    """Velas [(hora en s UTC, o, h, l, c, v), …] (las del puente IBKR) → el mismo formato que las de Yahoo. vol_k lleva
+    el volumen a la escala de Yahoo."""
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame([r[1:] for r in rows], columns=["Open", "High", "Low", "Close", "Volume"],
+                      index=pd.to_datetime([int(r[0]) for r in rows], unit="s", utc=True))
+    df["Volume"] = df["Volume"] * vol_k
+    return df
+
+
+def vol_scale(yahoo: pd.DataFrame | None, ib: pd.DataFrame | None, min_bars: int = 3) -> float | None:
+    """Factor que lleva el volumen de las velas de IBKR a la escala de Yahoo (la de la curva base del RVOL): suma de
+    Yahoo / suma de IBKR en los minutos de sesión regular que los dos ya cerraron. IBKR manda el volumen en acciones o
+    en lotes de 100 según una opción de TWS/IB Gateway: así da igual cuál esté puesta. Antes de tener 3 minutos de
+    sesión (a las 9:35, cuando se completa el rango de apertura, Yahoo aún no los muestra) usa el pre-market, que en
+    Yahoo viene incompleto: solo sirve para saber la escala (×1 o ×100). None si no hay con qué comparar o si la
+    diferencia no tiene sentido (otra acción, datos rotos)."""
+    y, i = to_et(yahoo), to_et(ib)
+    if y.empty or i.empty:
+        return None
+    y, i = y.iloc[:-2], i.iloc[:-1]  # las últimas de Yahoo pueden estar a medio llenar; la última de IBKR se está formando
+    y, i = y[y["Volume"] > 0], i[i["Volume"] > 0]
+    common = y.index.intersection(i.index)
+    m = common.hour * 60 + common.minute
+    reg = common[(m >= OPEN_M) & (m < CLOSE_M)]
+
+    def ratio(ix):
+        return float(y.loc[ix, "Volume"].sum()) / float(i.loc[ix, "Volume"].sum())
+    if len(reg) >= min_bars:
+        k = ratio(reg)
+        return k if 0.2 <= k <= 500 else None
+    if len(common) >= min_bars:
+        k = ratio(common)
+        return 1.0 if 0.3 <= k <= 3 else 100.0 if 30 <= k <= 300 else None
+    return None
+
+
 def baseline_curve(df5d: pd.DataFrame, today) -> array | None:
     """Volumen acumulado promedio por minuto de sesión (0..389) de los días previos a `today`. Como array de floats
     (≈3 KB por acción en vez de ≈12 KB de una lista): el servicio guarda una por cada acción que vio en el día."""

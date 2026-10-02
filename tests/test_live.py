@@ -1024,6 +1024,114 @@ def test_background_context():
         n = len(fetched)
         assert r.opt_ctx("ACME", 12.0) is None and len(fetched) == n            # None en caché: no se vuelve a pedir
     finally:
+
+
+def test_bridge_bars_state():
+    """Velas del puente: se limpian; la primera vez llega el día y después solo lo nuevo (lo que llega manda desde su
+    primera vela); una historia que no cabe en un envío no se guarda a medias; memoria acotada; el estado público
+    solo cuenta acciones, sin precios."""
+    from live.bridge import MAX_BAR_SYMS, Bridge
+    b = Bridge()
+    t0 = int(DAY.replace(hour=9, minute=30).timestamp())
+    day = [[t0 + 60 * i, 10 + i / 100, 10.05 + i / 100, 9.95 + i / 100, 10.01 + i / 100, 1000 + i] for i in range(30)]
+    bad = [[t0, float("nan"), 1, 1, 1, 1], [t0, 1, 1, 2, 1, 1], ["x"], [5, 1, 1, 1, 1, 1], [t0, 1, 1, 1, 1, -5], "no"]
+    assert b.put_bars({"AAA": day + bad, "bad sym": day, "BBB": "no es lista"}, now=1000.0) == ["AAA"]
+    assert len(b.bars["AAA"]) == 30 and b.bars["AAA"][0][1] == 10.0, b.bars["AAA"][:2]
+    assert b.bars_have(["AAA", "CCC"]) == {"AAA": t0 + 60 * 29, "CCC": 0}
+    upd = [[t0 + 60 * 29, 10.29, 10.4, 10.24, 10.3817, 5000], [t0 + 60 * 30, 10.38, 10.39, 10.37, 10.38, 100]]
+    assert b.put_bars({"AAA": upd}, now=1005.0) == ["AAA"]                     # la que se formaba cambió + una nueva
+    assert len(b.bars["AAA"]) == 31 and b.bars["AAA"][29][4] == 10.3817 and b.bars_have(["AAA"])["AAA"] == t0 + 1800
+    assert b.put_bars({"AAA": upd}, now=1010.0) == []                          # repetido: nada cambió
+    assert b.bar_rows("AAA", now=1039.0) and b.bar_rows("AAA", now=1041.0) is None  # sin noticias en 30 s: vieja
+    st = b.status(now=1012.0)
+    assert st["bars"] == 1 and "10.3817" not in str(st), st
+    big = [[t0 + 60 * i, 10, 10, 10, 10, 1] for i in range(5000)]
+    assert b.put_bars({"ZZZ": big}, now=1013.0) == [] and "ZZZ" not in b.bars  # no cabe: no se guarda a medias
+    many = {f"{chr(65 + i // 26)}{chr(65 + i % 26)}X": day[:2] for i in range(60)}
+    b.put_bars(many, now=2000.0)
+    assert len(b.bars) == MAX_BAR_SYMS and "AAA" not in b.bars, len(b.bars)     # memoria acotada: sale la más vieja
+    b.reset_bars()
+    assert b.bars == {} and b.status()["bars"] == 0
+
+
+def _early_path():
+    """9:30–9:35 rango de apertura hasta ~10.30; 9:36–9:59 base con mínimos crecientes bajo 10.31; 10:00–10:01 rompe."""
+    p = list(np.linspace(10.0, 10.3, 6))
+    p += list(10.12 + 0.006 * np.arange(24) + 0.02 * np.sin(np.arange(24) / 1.5))
+    return p + [10.33, 10.345]
+
+
+def test_early_ibkr():
+    """Aviso temprano con velas de IBKR: con las velas de Yahoo (2 min atrás) el semáforo aún dice ESPERA; las de IBKR
+    ya muestran la ruptura con volumen y el aviso 🟢⚡ COMPRA sale en el acto. El volumen de IBKR (en lotes de 100)
+    se calibra contra Yahoo. Nada de IBKR llega a lo público: la COMPRA del ciclo (con Yahoo) solo anota la hora del
+    aviso temprano."""
+    from scanner.sources import yahoo
+    p = _early_path()
+    n = len(p)
+    vol = [40000] * n
+    vol[-2], vol[-1] = 300000, 350000
+    full = bars(DAY, p, vol)
+    now = DAY.replace(hour=9, minute=30) + timedelta(minutes=n - 1, seconds=30)  # 10:01:30
+    today = {"RUN": bars(DAY, p[:n - 2], vol[:n - 2]), "SPY": bars(DAY, list(np.linspace(500, 502, n)), 50000),
+             "QQQ": bars(DAY, list(np.linspace(400, 402, n)), 50000)}
+    ib = [[int(ts.timestamp()), o + 0.0007, h + 0.0007, lo + 0.0007, c + 0.0007, v / 100]  # IBKR: otro precio, lotes
+          for ts, (o, h, lo, c, v) in zip(full.index, full[["Open", "High", "Low", "Close", "Volume"]].values)]
+    assert abs(metrics.vol_scale(full, metrics.rows_frame(ib)) - 100) < 1e-6           # lotes de 100 → ×100
+    shares = [r[:5] + [r[5] * 100] for r in ib]
+    assert abs(metrics.vol_scale(full, metrics.rows_frame(shares)) - 1) < 1e-6          # en acciones → ×1
+    assert metrics.vol_scale(full.iloc[:4], metrics.rows_frame(ib)) is None             # sin con qué comparar
+    # 9:35: Yahoo aún no muestra 3 minutos de sesión; el pre-market (incompleto en Yahoo) solo da la escala
+    yb = bars(DAY, [10.0] * 4, 40000, pm=[10.0] * 20)
+
+    def lots(df, share=1.0):
+        return [[int(ts.timestamp()), o, h, lo, c, v / 100 * share] for ts, (o, h, lo, c, v)
+                in zip(df.index, df[["Open", "High", "Low", "Close", "Volume"]].values)] + [[int(df.index[-1].timestamp()) + 60, 10, 10, 10, 10, 5]]
+    assert metrics.vol_scale(yb, metrics.rows_frame(lots(yb))) == 100.0
+    assert metrics.vol_scale(yb, metrics.rows_frame(lots(yb, 1.3))) == 100.0           # Yahoo con algo menos: igual ×100
+    assert metrics.vol_scale(yb, metrics.rows_frame(lots(yb, 20))) is None              # no cuadra con ×1 ni ×100
+    old = _fake_sources(today, now)
+    old_n = runner.IBKR_BARS
+    runner.IBKR_BARS = 5
+    try:
+        r = runner.Radar(notify=False)
+        r.trades, r.arms, r.sent = {}, {}, set()
+        got, real_tg = [], r.tg
+        r.tg = lambda key, text, **kw: (got.append((key, text)), real_tg(key, text, **kw))
+        r.universe, r.universe_ts = ["RUN"], 1e18
+        r.cycle(now.astimezone(ET))
+        row = next(x for x in r.snapshot["rows"] if x["t"] == "RUN")
+        assert row["decision"] == "ESPERA" and r.bar_want == ["RUN"], (row["decision"], row["reason"], r.bar_want)
+        r.wake.clear()
+        out = r.on_bridge(bars={"RUN": ib}, now=now)
+        assert out["early"] == ["RUN"] and r.wake.is_set() and out["bars"] == {"RUN": ib[-1][0]}, out
+        assert out["bars_t0"] == int(DAY.replace(hour=4).timestamp()) and r.vol_k["RUN"] == 100, (out, r.vol_k)
+        txt = next(t for k, t in got if k == "early:RUN")
+        assert txt.startswith("🟢⚡ COMPRA RUN") and "velas de IBKR" in txt, txt     # privado: solo por Telegram
+        assert "RUN" not in r.trades and r.early["RUN"] == {"early_t": "10:01:30", "early_src": "ibkr"}, r.early
+        assert r.on_bridge(bars={"RUN": ib[-1:]}, now=now).get("early") is None        # una vez por día
+        pub = str(r.snapshot) + str(r.trades) + str(r.arms)
+        assert "10.3457" not in pub and "10.3307" not in pub                          # nada de IBKR en lo público
+        # Sin velas de Yahoo para calibrar el volumen no hay aviso (el RVOL saldría 100 veces más chico o más grande)
+        r2 = runner.Radar(notify=False)
+        r2.sent, r2.trades, r2.ctx_cache, r2.bar_want, r2.last_bars = set(), {}, r.ctx_cache, ["RUN"], {}
+        assert r2.on_bridge(bars={"RUN": ib}, now=now).get("early") is None
+        runner.IBKR_BARS = 0                                                             # apagado: no pide velas
+        assert r2.on_bridge(bars={"RUN": ib}, now=now)["bars"] == {}
+        runner.IBKR_BARS = 5
+        # Yahoo se pone al día: el ciclo da la COMPRA pública con sus datos y anota la hora del aviso temprano
+        today["RUN"] = full
+        q = {s: {"symbol": s, "regularMarketPrice": float(today[s]["Close"].iloc[-1]), "quoteType": "EQUITY",
+                 "regularMarketPreviousClose": float(today[s]["Close"].iloc[0]) * 0.96, "shortName": s} for s in today}
+        yahoo.batch_quotes = lambda syms: {s: q[s] for s in syms if s in q}
+        r.cycle((now + timedelta(seconds=20)).astimezone(ET))
+        tr = r.trades.get("RUN")
+        assert tr and tr["early_t"] == "10:01:30" and tr["early_src"] == "ibkr", tr
+        buy = next(t for k, t in got if k == "buy:RUN")
+        assert "IBKR la vio a las 10:01:30" in buy and "10.3457" not in buy, buy
+        assert "10.3457" not in str(r.trades) + str(r.snapshot) and "RUN" not in r.bar_want
+    finally:
+        runner.IBKR_BARS = old_n
         for (mod, name), fn in old.items():
             setattr(mod, name, fn)
 
@@ -1208,5 +1316,7 @@ if __name__ == "__main__":
     test_whale_early()
     test_background_needs_sec_before_buy()
     test_armed_survives_missing_data()
+    test_bridge_bars_state()
+    test_early_ibkr()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})
