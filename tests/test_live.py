@@ -804,6 +804,51 @@ def test_bridge_api():
     os.environ.pop("BRIDGE_TOKEN", None)
 
 
+def test_telegram_state():
+    """Telegram: sin token o chat no intenta; si Telegram rechaza (token o chat equivocados) queda el motivo para
+    /health; un error de red no deja el token ni en /health ni en el registro; al arrancar avisa que está en línea."""
+    import os
+
+    import requests
+    env = {k: os.environ.get(k) for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")}
+    old_post = requests.post
+
+    class Resp:
+        def __init__(self, code, body):
+            self.status_code, self._b = code, body
+
+        def json(self):
+            return self._b
+    try:
+        r = runner.Radar(notify=True)
+        os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+        assert r._send("x") is False and r.tg_state == {}
+        os.environ.update(TELEGRAM_BOT_TOKEN="123:SECRETO", TELEGRAM_CHAT_ID="42")
+        requests.post = lambda *a, **k: Resp(400, {"ok": False, "description": "Bad Request: chat not found"})
+        assert r._send("x") is False and r.tg_state["error"] == "Bad Request: chat not found", r.tg_state
+
+        def boom(*a, **k):
+            raise requests.ConnectionError("HTTPSConnectionPool url: /bot123:SECRETO/sendMessage")
+        requests.post = boom
+        assert r._send("x") is False and "SECRETO" not in str(r.tg_state), r.tg_state
+        sent = []
+        requests.post = lambda url, json=None, timeout=None: (sent.append(json["text"]), Resp(200, {"ok": True}))[1]
+        r.hello()
+        assert r.tg_state["ok"] and sent[0].startswith("✅ Semáforo en línea"), (sent, r.tg_state)
+        from fastapi.testclient import TestClient
+        from live import app as A
+        h = TestClient(A.app).get("/health").json()["telegram"]
+        assert "configured" in h and "SECRETO" not in str(h), h
+    finally:
+        requests.post = old_post
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -832,5 +877,6 @@ if __name__ == "__main__":
     test_bridge_break()
     test_bridge_universe()
     test_bridge_api()
+    test_telegram_state()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})

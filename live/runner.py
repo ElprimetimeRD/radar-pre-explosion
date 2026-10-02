@@ -322,6 +322,7 @@ class Radar:
         self.brk_lock = threading.Lock()   # el puente (petición web) y el vigía rápido revisan rupturas a la vez
         self.base_universe: list[str] | None = None  # universo del último refresco, sin los agregados de IBKR
         self.tg_lock = threading.Lock()
+        self.tg_state: dict = {}          # resultado del último envío a Telegram (para /health; sin el token)
         self._load()
 
     # ---------------- persistencia (sobrevive reinicios dentro del día) ----------------
@@ -398,15 +399,34 @@ class Radar:
         else:
             threading.Thread(target=self._send, args=(text,), name="telegram", daemon=True).start()
 
-    def _send(self, text: str):
+    def _send(self, text: str) -> bool:
+        """Manda a Telegram y anota si llegó. Antes un rechazo de Telegram (token o chat equivocado) no dejaba rastro, y
+        el error de red llevaba la URL con el token al registro: ahora solo se guarda el motivo."""
         tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
         if not (self.notify and tok and chat):
-            return
+            return False
+        ok, err = False, None
         try:
-            requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                          json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=15)
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=15)
+            ok = r.status_code == 200
+            if not ok:
+                try:
+                    err = str(r.json().get("description") or "")[:120] or f"HTTP {r.status_code}"
+                except ValueError:
+                    err = f"HTTP {r.status_code}"
         except requests.RequestException as e:
-            log.warning("Telegram: %s", e)
+            err = f"sin conexión con Telegram ({type(e).__name__})"
+        self.tg_state = {"ok": ok, "error": err, "ts": datetime.now(timezone.utc).isoformat()}
+        if not ok:
+            log.warning("Telegram no entregó el aviso: %s", err)
+        return ok
+
+    def hello(self):
+        """Al arrancar el servicio: confirma por Telegram que el semáforo está en línea (y deja ver los reinicios)."""
+        t = datetime.now(timezone.utc).astimezone(ET)
+        self._send(f"✅ Semáforo en línea ({t:%H:%M} ET). Te aviso aquí: 📋 lista de apertura desde las 9:15 y "
+                   f"🟡 ARMA · 🟢 COMPRA · ⚡ rupturas desde las {(OPEN_M + OR_MINUTES) // 60}:{(OPEN_M + OR_MINUTES) % 60:02d}.")
 
     def quotes(self, syms: list[str]) -> dict[str, dict]:
         """v7/quote con cortacircuito: si Yahoo niega el crumb (401), no insistir por 20 min."""
@@ -1045,6 +1065,10 @@ class Radar:
                                   f"{memory.LIMIT_MB:.0f}). Si llega al 100% Render lo reinicia y las señales se atrasan.")
 
     def run_forever(self):
+        try:
+            self.hello()
+        except Exception as e:  # noqa: BLE001
+            log.warning("aviso de arranque: %s", type(e).__name__)
         while True:
             t0 = time.time()
             try:

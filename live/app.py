@@ -144,6 +144,8 @@ def health():
     return clean({"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
             "armed": sorted(radar.armed), "uptime_min": round((time.time() - STARTED) / 60, 1),
             "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB}, "bridge": radar.bridge.status(),
+            "telegram": {"configured": bool(radar.notify and os.environ.get("TELEGRAM_BOT_TOKEN")
+                                            and os.environ.get("TELEGRAM_CHAT_ID")), **radar.tg_state},
             "now": datetime.now(timezone.utc).isoformat()})
 
 
