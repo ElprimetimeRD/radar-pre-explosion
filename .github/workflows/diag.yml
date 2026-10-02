@@ -1,0 +1,36 @@
+name: Diagnóstico de retraso (rama diag-velas)
+
+on:
+  push:
+    branches: [diag-velas]
+    paths: ["tools/diag_latency.py", ".github/workflows/diag.yml", "data/diag/run.txt"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diag
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt tabulate
+      - name: Diagnóstico
+        env:
+          URL: ${{ vars.SEMAFORO_URL || 'https://radar-semaforo.onrender.com' }}
+        run: python tools/diag_latency.py
+      - name: Commit
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add -f data/diag/latencia.json data/diag/latencia.md
+          git diff --cached --quiet && exit 0
+          git commit -m "diagnóstico de retraso $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin HEAD:diag-velas
