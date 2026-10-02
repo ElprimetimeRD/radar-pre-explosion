@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 data/live/
+bridge/puente.env
+bridge/puente.log*
