@@ -14,14 +14,15 @@
    "score": 91,
    "limit": false,
    "valid_m": null,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 1.45,
    "mae": -0.5,
    "last": 82.81999969482422,
    "level": 81.6119,
    "slip": 0.34,
-   "lag_min": 15
+   "lag_min": 15,
+   "close_pct": 1.14
   },
   {
    "t": "HPE-PC",
@@ -36,14 +37,15 @@
    "score": 81,
    "limit": false,
    "valid_m": null,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.79,
    "mae": -0.1,
    "last": 177.85000610351562,
    "level": 177.11,
    "slip": -0.01,
-   "lag_min": null
+   "lag_min": null,
+   "close_pct": 0.42
   },
   {
    "t": "TER",
@@ -124,14 +126,15 @@
    "score": 71,
    "limit": false,
    "valid_m": null,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.67,
    "mae": -0.75,
    "last": 38.619998931884766,
    "level": 38.7,
    "slip": -0.05,
-   "lag_min": null
+   "lag_min": null,
+   "close_pct": -0.16
   },
   {
    "t": "PENG",
@@ -146,14 +149,15 @@
    "score": 80,
    "limit": false,
    "valid_m": null,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.13,
    "mae": -0.8,
    "last": 60.91999816894531,
    "level": 61.05,
    "slip": 0.36,
-   "lag_min": 4
+   "lag_min": 4,
+   "close_pct": -0.57
   },
   {
    "t": "NKE",
@@ -168,14 +172,15 @@
    "score": 66,
    "limit": false,
    "valid_m": null,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.34,
    "mae": -0.22,
    "last": 33.54790115356445,
    "level": 33.5,
    "slip": -0.04,
-   "lag_min": 1
+   "lag_min": 1,
+   "close_pct": 0.19
   }
  ],
  "armadas": [
@@ -292,13 +297,14 @@
    "score": 76,
    "limit": false,
    "valid_m": 930,
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 0.2,
    "mae": -0.37,
    "last": 33.54790115356445,
    "fill": 33.5809,
-   "fill_m": 832
+   "fill_m": 832,
+   "close_pct": 0.04
   },
   {
    "t": "WNC",
