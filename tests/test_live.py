@@ -1308,7 +1308,7 @@ def test_early_async_and_race():
     # carrera: el ciclo crea la COMPRA mientras el temprano calcula (aquí, dentro de decide)
     r2 = runner.Radar(notify=False)
     r2.sent, r2.trades = set(), {}
-    r2.bar_want, r2.ctx_cache = ["RUN"], {"RUN": {"ctx": {}, "prev": 10.0}}
+    r2.bar_want, r2.ctx_cache = ["RUN"], {"RUN": {"ctx": {}, "prev": 10.0, "ok": True}}
     r2.bridge.bar_rows = lambda s: [[1_790_000_000, 10, 10, 10, 10, 100]]
     r2._vol_k = lambda s, rows: 1.0
     plan = {"entry": 10.0, "stop": 9.9, "t1": 10.2, "t2": 10.5, "risk": 1.0}
@@ -1321,6 +1321,11 @@ def test_early_async_and_race():
         runner.IBKR_BARS, runner.session_metrics, runner.decide = 5, lambda *a, **k: {}, cycle_wins
         runner.phase_of = lambda now: "open"
         assert r2._early(["RUN"], DAY.replace(hour=10)) == [] and "early:RUN" not in r2.sent and not r2.early
+        r2.trades = {}
+        r2.ctx_cache["RUN"]["ok"] = False                                      # sin noticias ni SEC: no hay temprano
+        runner.decide = lambda s, m, ctx: {"t": "RUN", "decision": "COMPRA", "plan": plan, "why": [], "score": 70,
+                                           "px": 10.0}
+        assert r2._early(["RUN"], DAY.replace(hour=10)) == [] and "early:RUN" not in r2.sent
     finally:
         runner.IBKR_BARS, runner.session_metrics, runner.decide, runner.phase_of = olds
     del r2._vol_k

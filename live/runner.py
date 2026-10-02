@@ -855,6 +855,7 @@ class Radar:
             return (r["decision"] != "NO" or near, r["score"])
         order = sorted(base, key=prio, reverse=True)
         now_ts = now.timestamp()
+        ctx_ok: dict[str, bool] = {}  # acciones con noticias y SEC (sin eso el aviso temprano tampoco puede dar COMPRA)
         for i, s in enumerate(order[:ENRICH_N]):
             m, ctx, first = base[s]
             # Titulares más seguido (NEWS_TTL_HOT) solo para las que están por disparar: cada pedido extra a Yahoo
@@ -872,16 +873,18 @@ class Radar:
                 # Sin noticias ni SEC todavía (acción nueva o servicio recién reiniciado) no se sabe si hay dilución:
                 # para una que daría COMPRA o ARMA se piden en el acto, como antes del hilo de contexto
                 try:
-                    self._enrich(s, m, ctx, now_ts, today, with_opt, hot, inline=True)
+                    complete = self._enrich(s, m, ctx, now_ts, today, with_opt, hot, inline=True)
                     r = decide(s, m, ctx)
                 except Exception as e:  # noqa: BLE001
                     log.warning("enriquecer %s: %s", s, e)
                     if r["decision"] == "COMPRA" or r.get("level"):
                         r = {**r, "decision": "ESPERA", "reason": "sin noticias ni SEC todavía: no sé si hay dilución",
                              "plan": None, "level": None, "trigger": "se reevalúa en el próximo ciclo"}
+            ctx_ok[s] = complete
             base[s] = (m, ctx, r)
         if IBKR_BARS > 0:  # lo que el aviso temprano necesita del ciclo para decidir con las velas de IBKR
-            self.ctx_cache = {s: {"ctx": dict(base[s][1]), "prev": prev_of(s)} for s in base}
+            self.ctx_cache = {s: {"ctx": dict(base[s][1]), "prev": prev_of(s), "ok": ctx_ok.get(s, False)}
+                              for s in base}
         self.reg_txt = reg_txt
         rows = [base[s][2] for s in base]
         for r in rows:
@@ -1102,7 +1105,8 @@ class Radar:
         out = []
         for s in syms:
             c = self.ctx_cache.get(s)
-            if not c or s not in want or s in self.trades or f"early:{s}" in self.sent:
+            # Sin noticias ni SEC de esa acción no se sabe si hay dilución: el aviso temprano espera al ciclo
+            if not c or not c.get("ok") or s not in want or s in self.trades or f"early:{s}" in self.sent:
                 continue
             rows = self.bridge.bar_rows(s)
             k = self._vol_k(s, rows) if rows else None
