@@ -13,9 +13,10 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import keepalive
+from . import keepalive, memory
 from .runner import Radar
 
+memory.limit_arenas(int(os.environ.get("MALLOC_ARENAS", "2")))  # antes de crear hilos
 PAGE = os.path.join(os.path.dirname(__file__), "page.html")
 radar = Radar(notify=os.environ.get("NO_NOTIFY") != "1")
 STARTED = time.time()
@@ -63,10 +64,13 @@ def replay(step: int = 10, fresh: int = 0):
 
 @app.get("/api/trades")
 def trades():
-    """Señales del día (las guarda GitHub Actions en data/live/ para que sobrevivan a los redeploys)."""
+    """Señales del día y compras stop de los avisos ARMA (las guarda GitHub Actions en data/live/ para que sobrevivan
+    a los redeploys)."""
     day = radar.day.isoformat() if radar.day else None
-    hist = [{"day": d, "trades": t} for d, t in sorted(radar.history.items())]
-    return JSONResponse(clean({"day": day, "trades": list(radar.trades.values()), "stats": radar.stats(), "history": hist}),
+    hist = [{"day": d, "trades": radar.history.get(d, []), "armadas": radar.arm_history.get(d, [])}
+            for d in sorted(set(radar.history) | set(radar.arm_history))]
+    return JSONResponse(clean({"day": day, "trades": list(radar.trades.values()), "stats": radar.stats(),
+                               "armadas": list(radar.arms.values()), "armStats": radar.arm_stats(), "history": hist}),
                         headers={"Cache-Control": "no-store"})
 
 
@@ -111,8 +115,10 @@ def positions_remove(t: str, x_token: str | None = Header(default=None)):
 @app.get("/health")
 def health():
     ts = radar.snapshot.get("ts")
+    rss = memory.rss_mb()
     return {"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
             "armed": sorted(radar.armed), "uptime_min": round((time.time() - STARTED) / 60, 1),
+            "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB},
             "now": datetime.now(timezone.utc).isoformat()}
 
 

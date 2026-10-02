@@ -164,6 +164,23 @@ def test_merge(tmp="/tmp/claude-0/merge_test"):
     subprocess.run([sys.executable, "tools/merge_trades.py", f"{tmp}/in.json", f"{tmp}/live"], check=True, capture_output=True)
     sm = json.load(open(f"{tmp}/live/summary.json"))
     assert sm["total"]["n"] == 3 and sm["total"]["filled"] == 3 and sm["days"] == 1, sm
+    # armadas (compras stop de los avisos ARMA): se guardan aparte y el resumen las cuenta por separado, junto con el
+    # retraso y el deslizamiento promedio de la COMPRA
+    with open(f"{tmp}/in.json", "w") as f:
+        json.dump({"day": "2026-09-30", "trades": [{"t": "D", "time": "10:00", "status": "t1", "hit1": True, "lag_min": 4, "slip": 0.3}],
+                   "armadas": [{"t": "D", "time": "09:50", "status": "abierta", "hit1": False, "fill_m": 600},
+                               {"t": "E", "time": "09:55", "status": "cancelada", "hit1": False}]}, f)
+    subprocess.run([sys.executable, "tools/merge_trades.py", f"{tmp}/in.json", f"{tmp}/live"], check=True, capture_output=True)
+    sm = json.load(open(f"{tmp}/live/summary.json"))
+    day = json.load(open(f"{tmp}/live/2026-09-30.json"))
+    assert len(day["trades"]) == 1 and len(day["armadas"]) == 2, day
+    assert sm["armadas"] == {"n": 2, "filled": 1, "t1": 0, "t2": 0, "stop": 0, "cancelled": 1}, sm
+    assert sm["total"]["n"] == 4 and sm["lag"] == 4.0 and sm["slip"] == 0.3 and sm["days"] == 2, sm
+    # un reinicio del servidor no retrocede una armada ya cancelada
+    with open(f"{tmp}/in.json", "w") as f:
+        json.dump({"day": "2026-09-30", "trades": [], "armadas": [{"t": "E", "time": "09:55", "status": "pendiente", "hit1": False}]}, f)
+    subprocess.run([sys.executable, "tools/merge_trades.py", f"{tmp}/in.json", f"{tmp}/live"], check=True, capture_output=True)
+    assert [x["status"] for x in json.load(open(f"{tmp}/live/2026-09-30.json"))["armadas"]] == ["abierta", "cancelada"]
 
 
 def test_regime():
@@ -233,13 +250,14 @@ def test_arm_and_fast(tmp="/tmp/claude-0/arm_test_state"):
     old_q = yahoo.batch_quotes
     try:
         r = runner.Radar(notify=False)
-        r.trades, r.sent = {}, set()
+        r.trades, r.arms, r.sent = {}, {}, set()
         rows = [row("AAA", 50.0, 49.8), row("FAR", 50.0, 48.0), row("WEAK", 50.0, 49.9, score=40),
                 row("RISKY", 50.0, 49.9, risk=3.0)] + [row(f"Z{i}", 20.0, 19.95) for i in range(10)]
         r._arm(rows, "verde", "open", 10 * 60)
         assert "AAA" in r.armed and not ({"FAR", "WEAK", "RISKY"} & set(r.armed)), r.armed
         arms = [k for k in r.sent if k.startswith("arm:")]
         assert len(arms) == runner.ARM_MAX and "arm:AAA" in r.sent, arms                 # tope diario de avisos
+        assert len(r.arms) == runner.ARM_MAX and r.arms["AAA"]["status"] == "pendiente"   # una orden virtual por aviso
         r._arm(rows, "rojo", "open", 10 * 60)
         assert r.armed == {}                                                             # mercado en rojo: nada armado
         r._arm([row("MID", 50.0, 49.8, score=57)], "amarillo", "open", 10 * 60)
@@ -306,7 +324,7 @@ def test_cycle():
         setattr(mod, name, fn)
     try:
         r = runner.Radar(notify=False)
-        r.trades, r.sent = {}, set()
+        r.trades, r.arms, r.sent = {}, {}, set()
         r.universe, r.universe_ts = ["RUN"], 1e18
         r.cycle(now.astimezone(ET))
         snap = r.snapshot
@@ -315,6 +333,11 @@ def test_cycle():
         assert row["decision"] == "COMPRA", (row["decision"], row["reason"], row["score"])
         assert snap["best"] == "RUN" and "RUN" in r.trades and "buy:RUN" in r.sent
         assert snap["armed"] == [] and "watching" in snap and "fast" in snap, snap.keys()
+        assert snap["armadas"] == [] and snap["armStats"]["n"] == 0, snap["armStats"]
+        # qué tan tarde llegó: minutos desde la ruptura del nivel y entrada sobre el nivel (retesteo: ~+0.2 %)
+        tr = r.trades["RUN"]
+        assert tr["level"] and 0 <= tr["slip"] <= 0.6 and tr["lag_min"] is not None and 0 <= tr["lag_min"] <= 30, tr
+        assert snap["stats"]["lag"] == tr["lag_min"] and snap["stats"]["slip"] == tr["slip"], snap["stats"]
         # siguiente minuto: sube a +2 %
         e = r.trades["RUN"]["entry"]
         assert r.trades["RUN"]["limit"] and r.trades["RUN"]["status"] == "pendiente", r.trades["RUN"]
@@ -352,6 +375,174 @@ def test_cycle():
         for (mod, name), fn in old.items():
             setattr(mod, name, fn)
     return snap
+
+
+def _fake_sources(today, now):
+    """Fuentes falsas (sin red) para correr un ciclo completo con las velas de `today`. Devuelve lo original."""
+    from scanner.sources import other, yahoo
+    hist5 = {s: five_days() for s in today}
+    daily = pd.DataFrame({"Open": 10.0, "High": 10.5, "Low": 10.0, "Close": 10.2, "Volume": 1e6},
+                         index=pd.date_range("2026-06-01", periods=60))
+
+    def history(syms, period="1y", interval="1d", prepost=False):
+        if interval == "1d":
+            return {s: daily for s in syms}
+        return {s: (hist5 if period == "5d" else today)[s] for s in syms if s in today}
+
+    quotes = {s: {"symbol": s, "regularMarketPrice": float(today[s]["Close"].iloc[-1]), "quoteType": "EQUITY",
+                  "regularMarketPreviousClose": float(today[s]["Close"].iloc[0]) * 0.96, "shortName": s} for s in today}
+    patches = {(yahoo, "history"): history,
+               (yahoo, "batch_quotes"): lambda syms: {s: quotes[s] for s in syms if s in quotes},
+               (yahoo, "news"): lambda s, count=10: [{"title": f"{s} update", "ts": now.timestamp() - 1800, "url": None}],
+               (yahoo, "option_chains"): lambda s, max_days=30: ([], False),
+               (other, "sec_ticker_map"): lambda: {},
+               (halts, "fetch"): lambda: None}
+    old = {k: getattr(*k) for k in patches}
+    for (mod, name), fn in patches.items():
+        setattr(mod, name, fn)
+    return old
+
+
+def test_follow_outside_universe():
+    """Una COMPRA abierta se sigue aunque su acción salga del universo (SITC, 1-oct: dejó de seguirse a los 6 min
+    de la señal y nunca llegó el aviso de stop ni de objetivo)."""
+    n = 40
+    now = DAY.replace(hour=9, minute=30) + timedelta(minutes=n - 1)
+    today = {"RUN": bars(DAY, [10.0] * n, 40000), "SPY": bars(DAY, list(np.linspace(500, 502, n)), 50000),
+             "QQQ": bars(DAY, list(np.linspace(400, 402, n)), 50000),
+             "OUT": bars(DAY, [20.0] * 20 + list(np.linspace(20.0, 19.6, n - 20)), 30000)}
+    old = _fake_sources(today, now)
+    try:
+        r = runner.Radar(notify=False)
+        r.trades, r.arms, r.sent = {}, {}, set()
+        r.universe, r.universe_ts = ["RUN"], 1e18
+        r.trades["OUT"] = {"t": "OUT", "day": DAY.date().isoformat(), "time": "09:45", "m": 585, "entry": 20.0,
+                           "stop": 19.8, "t1": 20.4, "t2": 21.0, "risk": 1.0, "score": 70, "limit": False,
+                           "valid_m": None, "status": "abierta", "hit1": False, "mfe": 0.0, "mae": 0.0, "last": 20.0}
+        r.cycle(now.astimezone(ET))
+        assert "OUT" not in [x["t"] for x in r.snapshot["rows"]]                       # no entra al semáforo...
+        assert r.trades["OUT"]["status"] == "stop" and "stop:OUT" in r.sent, r.trades["OUT"]  # ...pero se sigue
+    finally:
+        for (mod, name), fn in old.items():
+            setattr(mod, name, fn)
+
+
+def test_stop_orders():
+    """Compra stop de un aviso ARMA: se activa al subir a la entrada; si antes pierde el stop se cancela; si abre por
+    encima del límite no se llena; vence a la hora de corte."""
+    def arm():
+        return runner.new_arm("AAA", {"level": 10.0, "entry": 10.01, "stop": 9.9, "t1": 10.21, "t2": 10.51, "risk": 1.1,
+                                      "score": 70, "px": 9.95}, "2026-09-29", "10:00", 600, 720)
+
+    def b(rows, start=601):
+        df = pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"])
+        df["m"] = range(start, start + len(df))
+        return df
+    o = arm()
+    assert o["cap"] == 10.04 and o["status"] == "pendiente" and o["kind"] == "armada", o
+    assert runner.advance(o, b([(9.95, 9.98, 9.93, 9.97)])) == [] and o["status"] == "pendiente"
+    assert runner.advance(o, b([(9.97, 10.05, 9.96, 10.04), (10.04, 10.25, 10.03, 10.2)], 602)) == ["fill", "t1"]
+    assert o["fill"] == 10.01 and o["fill_m"] == 602 and o["hit1"] and o["mfe"] > 2, o
+    o = arm()
+    assert runner.advance(o, b([(9.95, 9.97, 9.88, 9.9)])) == ["invalid"] and o["status"] == "cancelada"
+    o = arm()
+    assert runner.advance(o, b([(10.2, 10.3, 10.15, 10.25)])) == ["gap"] and o["status"] == "no ejecutada"
+    o = arm()
+    assert runner.advance(o, b([(10.03, 10.06, 10.02, 10.05)])) == ["fill"] and o["fill"] == 10.03  # abrió sobre la entrada
+    o = arm()
+    assert runner.advance(o, b([(9.95, 9.98, 9.93, 9.97)], 721)) == ["expired"] and o["status"] == "no ejecutada"
+
+
+def test_track_arms():
+    """El ciclo sigue la compra stop como si estuviera puesta: avisa al activarse, avisa para cancelarla si el semáforo
+    la pasa a NO COMPRES o se acaba la hora de entradas, y una orden activada o cancelada no se vuelve a armar."""
+    r = runner.Radar(notify=False)
+    r.trades, r.arms, r.sent, r.day = {}, {}, set(), DAY.date()
+
+    def row(t, dec="ESPERA", reason="debajo del máximo de apertura"):
+        e = 50.0 * 1.001
+        return {"t": t, "decision": dec, "level": 50.0, "px": 49.8, "chg": 6.0, "score": 70, "reason": reason,
+                "plan": {"entry": e, "stop": e * 0.99, "t1": e * 1.02, "t2": e * 1.05, "risk": 1.0}}
+    r._arm([row("AAA"), row("BBB"), row("CCC")], "verde", "open", 10 * 60)
+    assert set(r.arms) == {"AAA", "BBB", "CCC"} and r.arms["AAA"]["day"] == DAY.date().isoformat(), r.arms
+    e = r.arms["AAA"]["entry"]
+    today = {"AAA": bars(DAY, [49.8, 49.9, e * 1.003, e * 1.004], 50000, start_m=601),   # rompe y se activa
+             "BBB": bars(DAY, [49.8, 49.75, 49.7], 50000, start_m=601),                  # pierde el VWAP sin romper
+             "CCC": bars(DAY, [49.8, 49.8], 50000, start_m=601)}                         # sigue esperando
+    rows = [row("AAA"), row("BBB", "NO", "debajo del VWAP: mandan los vendedores"), row("CCC")]
+    r._track_arms(rows, today, DAY.replace(hour=10, minute=5))
+    assert r.arms["AAA"]["status"] == "abierta" and "arm-fill:AAA" in r.sent, r.arms["AAA"]
+    assert r.arms["BBB"]["status"] == "cancelada" and "arm-x:BBB" in r.sent and "VWAP" in r.arms["BBB"]["cancel"]
+    assert r.arms["CCC"]["status"] == "pendiente" and "arm-x:CCC" not in r.sent
+    r._arm([row("AAA"), row("BBB"), row("CCC")], "verde", "open", 10 * 60 + 6)
+    assert set(r.armed) == {"CCC"}, r.armed                    # el vigía rápido solo mira la que sigue pendiente
+    vm = r.arms["CCC"]["valid_m"]
+    r._track_arms([row("CCC")], {}, DAY.replace(hour=vm // 60, minute=vm % 60))
+    assert r.arms["CCC"]["status"] == "no ejecutada" and "arm-x:CCC" in r.sent
+    st = r.arm_stats()
+    assert st == {"n": 3, "filled": 1, "t1": 0, "t2": 0, "stop": 0, "open": 1, "pending": 0, "cancelled": 2}, st
+    # cierre: la activada se cierra al último precio y entra al resumen del día junto a las COMPRA
+    r._eod(DAY.replace(hour=16, minute=5))
+    assert r.arms["AAA"]["status"] == "cierre" and r.arms["AAA"]["close_pct"] is not None
+    assert DAY.date().isoformat() in r.arm_history and "eod:" + DAY.date().isoformat() in r.sent
+
+
+def test_break_lag():
+    """Retraso de la señal: minutos desde la primera vela que superó el nivel."""
+    b = bars(DAY, [9.9] * 10 + [10.1, 10.15, 10.2], 30000, start_m=600)   # rompe 10.0 en el minuto 610 (10:10)
+    assert runner.break_lag(b, 10.0, DAY.replace(hour=10, minute=13)) == 3
+    assert runner.break_lag(b, 11.0, DAY.replace(hour=10, minute=13)) is None    # todavía no rompe
+    assert runner.break_lag(None, 10.0, DAY.replace(hour=10, minute=13)) is None
+
+
+def test_day_reset():
+    """Los avisos y las armadas son por día: al cambiar de día se vacían y lo de ayer pasa al historial.
+    Antes, sin COMPRA el día anterior, un ARMA de ayer bloqueaba el de hoy para la misma acción."""
+    r = runner.Radar(notify=False)
+    r.trades, r.history, r.arm_history = {}, {}, {}
+    r.sent, r.sent_day = {"arm:AAA", "break:AAA:50.00"}, "2026-09-28"
+    r.arms = {"AAA": {"t": "AAA", "day": "2026-09-28", "status": "no ejecutada"}}
+    r.cycle(DAY.replace(hour=20, minute=0).astimezone(ET))                        # 29-sep de noche: fase cerrada
+    assert r.sent == set() and r.sent_day == "2026-09-29" and r.arms == {}, (r.sent, r.arms)
+    assert r.arm_history.get("2026-09-28"), r.arm_history
+    r.sent.add("arm:BBB")
+    r.cycle(DAY.replace(hour=20, minute=5).astimezone(ET))                        # mismo día: no se vacía
+    assert "arm:BBB" in r.sent
+
+
+def test_memory_and_threads():
+    """Los hilos de descarga terminados se sueltan (el 1-oct el servicio se quedó sin memoria a las 10:18) y la
+    memoria se mide y avisa una vez por día si se acerca al límite."""
+    import multitasking
+    from scanner.sources import yahoo
+    from live import memory
+
+    @multitasking.task
+    def job():
+        return 1
+    before = len(multitasking.config["TASKS"])
+    for _ in range(30):
+        job()
+    for t in list(multitasking.config["TASKS"]):
+        t.join()
+    assert len(multitasking.config["TASKS"]) >= before + 30          # la librería guarda cada hilo terminado...
+    gone = yahoo.prune_tasks()
+    assert gone >= 30 and all(t.is_alive() for t in multitasking.config["TASKS"]), gone   # ...y ahora se sueltan
+    m = memory.trim()
+    assert m["rss_mb"] and m["rss_mb"] > 10 and 0 < m["pct"] < 100, m
+    assert memory.pct(256.0) == round(100 * 256 / memory.LIMIT_MB, 1)
+    r = runner.Radar(notify=False)
+    r.sent, r.snapshot = set(), {"status": "ok"}
+    r.after_cycle()
+    assert r.snapshot["mem"]["rss_mb"] and not any(k.startswith("mem:") for k in r.sent)   # lejos del límite
+    old = memory.ALERT_PCT
+    memory.ALERT_PCT = 0.0
+    try:
+        r.after_cycle()
+        r.after_cycle()
+        assert sum(1 for k in r.sent if k.startswith("mem:")) == 1                          # un solo aviso por día
+    finally:
+        memory.ALERT_PCT = old
 
 
 def test_positions(tmp="/tmp/claude-0/positions_test.json"):
@@ -471,9 +662,15 @@ if __name__ == "__main__":
     test_news_relevance()
     test_spread_sanity()
     test_arm_and_fast()
+    test_stop_orders()
+    test_track_arms()
+    test_break_lag()
+    test_day_reset()
+    test_memory_and_threads()
     test_pre_list()
     test_positions()
     test_positions_api()
     test_watch_positions()
+    test_follow_outside_universe()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})
