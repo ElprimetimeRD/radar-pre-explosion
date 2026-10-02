@@ -882,15 +882,15 @@ def test_partial_bars():
     r = runner.Radar(notify=False)
     r.trades, r.arms, r.sent, r.day = {}, {}, set(), DAY.date()
     sig = {"t": "RUN", "score": 70, "plan": {"entry": 10.0, "stop": 9.9, "t1": 10.2, "t2": 10.5, "risk": 1.0}}
-    r.trades["RUN"] = tr = runner.new_trade(sig, DAY.date().isoformat(), "10:02", 602, seen_m=600)
-    assert tr["m"] == 600 and tr["valid_m"] is None                       # sigue desde la última vela que vio la señal
-    t_et = DAY.replace(hour=10, minute=4)
-    b1 = bars(DAY, [10.0, 10.02, 10.03], 50000, start_m=601)              # 10:01–10:03; la de 10:03 a medio llenar
+    r.trades["RUN"] = tr = runner.new_trade(sig, DAY.date().isoformat(), "10:02", 602)
+    t_et = DAY.replace(hour=10, minute=7)
+    # 10:01–10:02 son de antes del aviso (la de 10:01 bajó del stop: no cuenta); 10:05 llega a medio llenar
+    b1 = bars(DAY, [9.8, 10.0, 10.01, 10.02, 10.03], 50000, start_m=601)
     r._track([], {"RUN": b1}, t_et, "verde")
-    assert tr["status"] == "abierta" and tr["m"] == 601, tr               # las 2 últimas se vuelven a mirar
+    assert tr["status"] == "abierta" and tr["m"] == 603 and "stop:RUN" not in r.sent, tr   # las 2 últimas, otra vez
     b2 = b1.copy()
     b2.iloc[-1, b2.columns.get_loc("Low")] = 9.85                         # completa: bajó al stop en la 2.ª mitad
-    r._track([], {"RUN": b2}, t_et.replace(minute=5), "verde")
+    r._track([], {"RUN": b2}, t_et.replace(minute=8), "verde")
     assert tr["status"] == "stop" and "stop:RUN" in r.sent, tr
     # límite llenada en el retesteo: las velas de antes (más arriba) no son de la posición
     lim = {"t": "LIM", "score": 70, "plan": {"entry": 10.0, "stop": 9.9, "t1": 10.2, "t2": 10.5, "risk": 1.0,
@@ -1012,14 +1012,14 @@ def test_background_context():
         r = runner.Radar(notify=False)
         r.bg = True
         c = {"name": "Acme Corp"}
-        assert r._enrich("ACME", {"px": 12.0}, c, now.timestamp(), DAY.date(), True, True) is True
+        assert r._enrich("ACME", {"px": 12.0}, c, now.timestamp(), DAY.date(), True, True) is False  # incompleta
         assert fetched == [] and "ACME" in r.enrich_q and not c.get("cat")       # el ciclo no esperó
         r.wake.clear()
         done = r.context_once(now)
         assert done["enriched"] == 1 and ("news", "ACME") in fetched and ("opt", "ACME") in fetched, (done, fetched)
         assert r.wake.is_set() and done["halts"]                                 # noticia fresca: despierta al ciclo
         c = {"name": "Acme Corp"}
-        assert r._enrich("ACME", {"px": 12.0}, c, now.timestamp(), DAY.date(), True, True) is False
+        assert r._enrich("ACME", {"px": 12.0}, c, now.timestamp(), DAY.date(), True, True) is True
         assert c["cat"]["type"] == "contract" and c["callVolOI"] is None
         n = len(fetched)
         assert r.opt_ctx("ACME", 12.0) is None and len(fetched) == n            # None en caché: no se vuelve a pedir
@@ -1119,6 +1119,54 @@ def test_whale_early():
     assert w["buy"] == 1, w
 
 
+def test_background_needs_sec_before_buy():
+    """Con el hilo de contexto, una acción sin noticias ni SEC todavía (nueva o tras un reinicio) que daría COMPRA las
+    pide en el acto antes de decidir: la dilución sigue vetando como antes (no sale COMPRA a ciegas)."""
+    n = 40
+    now = DAY.replace(hour=9, minute=30) + timedelta(minutes=n - 1)
+    vol = [40000] * n
+    vol[-3] = 400000
+    today = {"RUN": bars(DAY, runner_path(n), vol), "SPY": bars(DAY, list(np.linspace(500, 502, n)), 50000),
+             "QQQ": bars(DAY, list(np.linspace(400, 402, n)), 50000)}
+    old = _fake_sources(today, now)
+    from scanner.sources import yahoo
+    yahoo.news = lambda s, count=10: [{"title": f"{s} announces $20 million public offering", "ts": now.timestamp() - 1800}]
+    try:
+        r = runner.Radar(notify=False)
+        r.bg = True
+        r.trades, r.arms, r.sent = {}, {}, set()
+        r.universe, r.universe_ts = ["RUN"], 1e18
+        r.halts_ts = runner.time.time()
+        r.cycle(now.astimezone(ET))
+        row = next(x for x in r.snapshot["rows"] if x["t"] == "RUN")
+        assert row["decision"] == "NO" and "dilución" in row["reason"] and "RUN" not in r.trades, (row["decision"], row["reason"])
+    finally:
+        for (mod, name), fn in old.items():
+            setattr(mod, name, fn)
+
+
+def test_armed_survives_missing_data():
+    """Si Yahoo no da velas de una armada pendiente, el vigía rápido y el puente la siguen mirando (no se pierde el ⚡)."""
+    r = runner.Radar(notify=False)
+    r.trades, r.arms, r.sent, r.day = {}, {}, set(), DAY.date()
+    e = 50.0 * 1.001
+    row = {"t": "AAA", "decision": "ESPERA", "level": 50.0, "px": 49.8, "chg": 6.0, "score": 70, "reason": "x",
+           "plan": {"entry": e, "stop": e * 0.99, "t1": e * 1.02, "t2": e * 1.05, "risk": 1.0}}
+    r._arm([row], "verde", "open", 600)
+    assert "AAA" in r.armed and r.arms["AAA"]["status"] == "pendiente"
+    r._arm([{"t": "AAA", "decision": "NO", "reason": "sin datos de precio", "nodata": True, "score": 0}], "verde", "open", 602)
+    assert "AAA" in r.armed                                                   # sigue vigilada
+    r._arm([{"t": "AAA", "decision": "NO", "reason": "debajo del VWAP", "score": 0}], "verde", "open", 603)
+    assert "AAA" not in r.armed                                               # un NO del mercado sí la saca
+    # replay: un resultado sin datos se puede reintentar al minuto (no espera 10)
+    r.replay_state, r.replay_ts = {"status": "sin datos todavía"}, runner.time.time() - 61
+    import threading as th
+    gate = th.Event()
+    r.replay = lambda step=10: (gate.wait(2), {"status": "ok"})[1]
+    assert r.replay_async(10, False)["status"] == "corriendo"
+    gate.set()
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -1158,5 +1206,7 @@ if __name__ == "__main__":
     test_breaks_outside_lock_and_private_log()
     test_replay_and_api_limits()
     test_whale_early()
+    test_background_needs_sec_before_buy()
+    test_armed_survives_missing_data()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})

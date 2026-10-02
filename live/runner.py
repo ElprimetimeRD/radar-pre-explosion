@@ -247,25 +247,22 @@ def advance(tr: dict, bars) -> list[str]:
     return ev
 
 
-def new_trade(r: dict, day: str, t_str: str, m: int, seen_m: int | None = None) -> dict:
-    """m: minuto del aviso (de él cuenta la validez de la límite). seen_m: última vela que vio la señal; el seguimiento
-    empieza después de ella. Antes empezaba en m (el reloj) y, con Yahoo 1–2 min atrasado, las velas entre la última
-    recibida y el aviso nunca se revisaban."""
+def new_trade(r: dict, day: str, t_str: str, m: int) -> dict:
+    """m: minuto del aviso. El seguimiento empieza en la vela siguiente: las anteriores (y la del propio minuto, que
+    mezcla segundos de antes del aviso) son de antes de la orden y darían stops, llenados o cancelaciones falsos."""
     p = r["plan"]
     lim = bool(p.get("limit"))
-    cur = m if seen_m is None else min(m, int(seen_m))
-    return {"t": r["t"], "day": day, "time": t_str, "m": cur, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"],
+    return {"t": r["t"], "day": day, "time": t_str, "m": m, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"],
             "t2": p["t2"], "risk": p.get("risk"), "score": r["score"], "limit": lim,
             "valid_m": m + (p.get("valid_min") or 10) if lim else None,
             "status": "pendiente" if lim else "abierta", "hit1": False, "mfe": 0.0, "mae": 0.0, "last": p["entry"]}
 
 
-def new_arm(t: str, a: dict, day: str | None, t_str: str, m: int, valid_m: int, seen_m: int | None = None) -> dict:
+def new_arm(t: str, a: dict, day: str | None, t_str: str, m: int, valid_m: int) -> dict:
     """La compra stop que pide el aviso 🟡 ARMA, como orden virtual: así se mide si entrar en la ruptura (rápido)
-    rinde mejor que esperar la COMPRA confirmada. seen_m: última vela que vio el aviso (ver new_trade)."""
+    rinde mejor que esperar la COMPRA confirmada. Se sigue desde la vela posterior al aviso (ver new_trade)."""
     e = a["entry"]
-    cur = m if seen_m is None else min(m, int(seen_m))
-    return {"t": t, "day": day, "time": t_str, "m": cur, "kind": "armada", "order": "stop", "level": a["level"],
+    return {"t": t, "day": day, "time": t_str, "m": m, "kind": "armada", "order": "stop", "level": a["level"],
             "entry": e, "cap": round(e * 1.003, 4), "stop": a["stop"], "t1": a["t1"],
             "t2": a.get("t2") or round(e * (1 + T2 / 100), 4), "risk": a["risk"], "score": a["score"], "limit": False,
             "valid_m": valid_m, "status": "pendiente", "hit1": False, "mfe": 0.0, "mae": 0.0, "last": a.get("px") or e}
@@ -649,30 +646,36 @@ class Radar:
             c = self.cache.put(("opt", s), options_features(chains, px).get("callVolOI"))
         return c
 
-    def _enrich(self, s, m, ctx, now_ts, today, with_opt: bool, hot: bool) -> bool:
-        """Noticias, SEC y opciones de una acción, desde la caché. Sin el hilo de contexto (pruebas) las pide en el acto,
-        como antes; con él, lo que falte o esté viejo queda en cola y el ciclo sigue con lo último que haya. Devuelve
-        True si dejó algo en cola."""
+    def _enrich(self, s, m, ctx, now_ts, today, with_opt: bool, hot: bool, inline: bool = False) -> bool:
+        """Noticias, SEC y opciones de una acción, desde la caché. Sin el hilo de contexto (pruebas) o con inline=True
+        las pide en el acto, como antes; con él, lo que falte o esté viejo queda en cola y el ciclo sigue con lo último
+        que haya. Devuelve True si la acción tiene noticias y SEC (aunque sean de antes): sin eso no se sabe si hay
+        dilución y el ciclo no debe dar COMPRA ni ARMA (lo resuelve pidiéndolas en el acto)."""
         ttl = NEWS_TTL_HOT if hot else NEWS_TTL
-        if not self.bg:
+        if not self.bg or inline:
             cat = self.news_ctx(s, now_ts, ctx.get("name"), ttl)
             f = self.sec_ctx(s, today)
-            cvo = self.opt_ctx(s, m.get("px")) if with_opt else None
-            queued = False
+            cvo = self.opt_ctx(s, m.get("px")) if with_opt and not inline else (
+                self.cache.get(("opt", s), 3600) if with_opt else None)
+            complete = True
         else:
             cat = self.cache.get(("news", s), ttl, MISS)
             f = self.cache.get(("sec", s), 6 * 3600, MISS)
             cvo = self.cache.get(("opt", s), 900, MISS) if with_opt else None
-            queued = cat is MISS or f is MISS or cvo is MISS
-            if queued:
+            if cat is MISS or f is MISS or cvo is MISS:
                 with self.enrich_lock:
                     self.enrich_q[s] = {"name": ctx.get("name"), "px": m.get("px"), "today": today, "opt": with_opt,
                                         "ttl": ttl}
                 self.bg_ev.set()
-            if cat is MISS:  # mientras llega la nueva, la última que haya (hasta 6 h) sigue contando
-                cat = self.cache.get(("news", s), 6 * 3600, {})
+            # Mientras llega lo nuevo, lo último que haya sigue contando (titulares hasta 6 h; SEC hasta 24 h: antes
+            # de las 10:10 vencía la SEC leída en pre-market y la COMPRA salía sin el filtro de dilución)
+            if cat is MISS:
+                cat = self.cache.get(("news", s), 6 * 3600, MISS)
             if f is MISS:
-                f = {}
+                f = self.cache.get(("sec", s), 24 * 3600, MISS)
+            complete = cat is not MISS and f is not MISS
+            cat = {} if cat is MISS else cat
+            f = {} if f is MISS else f
             if cvo is MISS:
                 cvo = self.cache.get(("opt", s), 3600)
         if cat.get("type"):
@@ -682,7 +685,7 @@ class Radar:
         ctx["offer30"], ctx["shelf"] = f.get("offer30"), f.get("shelf36m")
         if with_opt:
             ctx["callVolOI"] = cvo
-        return queued
+        return complete
 
     # ---------------- hilo de contexto (segundo plano) ----------------
     def context_once(self, now: datetime | None = None) -> dict:
@@ -829,22 +832,36 @@ class Radar:
             # Titulares más seguido (NEWS_TTL_HOT) solo para las que están por disparar: cada pedido extra a Yahoo
             # suma al riesgo de que limite la IP y se pierdan las velas
             hot = s in self.armed or first["decision"] == "COMPRA" or (first["decision"] == "ESPERA" and first.get("level"))
+            with_opt = i < 10 and (m.get("px") or 0) >= 3
+            complete = True
             try:
-                self._enrich(s, m, ctx, now_ts, today, i < 10 and (m.get("px") or 0) >= 3, hot)
+                complete = self._enrich(s, m, ctx, now_ts, today, with_opt, hot)
             except Exception as e:  # noqa: BLE001
                 log.warning("enriquecer %s: %s", s, e)
-            base[s] = (m, ctx, decide(s, m, ctx))
+                complete = not self.bg  # en línea (sin hilo) se sigue como antes; con el hilo, se pide en el acto abajo
+            r = decide(s, m, ctx)
+            if not complete and (r["decision"] == "COMPRA" or (r["decision"] == "ESPERA" and r.get("level"))):
+                # Sin noticias ni SEC todavía (acción nueva o servicio recién reiniciado) no se sabe si hay dilución:
+                # para una que daría COMPRA o ARMA se piden en el acto, como antes del hilo de contexto
+                try:
+                    self._enrich(s, m, ctx, now_ts, today, with_opt, hot, inline=True)
+                    r = decide(s, m, ctx)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("enriquecer %s: %s", s, e)
+                    if r["decision"] == "COMPRA" or r.get("level"):
+                        r = {**r, "decision": "ESPERA", "reason": "sin noticias ni SEC todavía: no sé si hay dilución",
+                             "plan": None, "level": None, "trigger": "se reevalúa en el próximo ciclo"}
+            base[s] = (m, ctx, r)
         rows = [base[s][2] for s in base]
         for r in rows:
             r["src"] = self.sources.get(r["t"], [])
-        lastm = {s: base[s][0].get("last_bar_m") for s in base}  # última vela de cada acción: ahí empieza el seguimiento
         rank = {"COMPRA": 0, "ESPERA": 1, "NO": 2}
         rows.sort(key=lambda r: (rank[r["decision"]], -((r["chg"] or 0) if phase == "pre" else r["score"])))
-        self._track(rows, bars, t_et, reg_txt, lastm)
+        self._track(rows, bars, t_et, reg_txt)
         # "Mejor opción" solo existe si hay COMPRA: un ESPERA con plan arriba se leía como orden de compra (ACN, 1-oct)
         best = next((r for r in rows if r["decision"] == "COMPRA"), None)
         self._track_arms(rows, bars, t_et)
-        self._arm(rows, reg, phase, t_et.hour * 60 + t_et.minute, lastm)
+        self._arm(rows, reg, phase, t_et.hour * 60 + t_et.minute)
         if phase == "pre":
             self._pre_list(rows, t_et)
         esp = [r for r in rows if r["decision"] == "ESPERA"]
@@ -862,7 +879,7 @@ class Radar:
         self._save()
 
     # ---------------- rupturas armadas y lista de apertura ----------------
-    def _arm(self, rows, reg, phase, now_m, lastm: dict | None = None):
+    def _arm(self, rows, reg, phase, now_m):
         """Rupturas listas para dejar la orden puesta: ESPERA con gatillo de ruptura, fuerza ≥ ARM_MIN (+5 con mercado
         amarillo, igual que la COMPRA), riesgo ≤ RISK_MAX y el precio a ≤ ARM_NEAR % del gatillo. Avisa una vez por
         ticker y día con la orden completa (compra stop) y desde ese momento la sigue como orden virtual (_track_arms).
@@ -879,6 +896,12 @@ class Radar:
                     continue
                 armed[r["t"]] = {"level": lvl, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"], "t2": p.get("t2"),
                                  "risk": p["risk"], "score": r["score"], "px": px, "chg": r.get("chg"), "reason": r["reason"]}
+            # Si a una armada pendiente le faltan datos este ciclo (Yahoo no dio velas), el vigía y el puente la siguen
+            # mirando: la orden sigue puesta y la ruptura se puede dar igual
+            nodata = {r["t"] for r in rows if r.get("nodata")}
+            for t, a in self.armed.items():
+                if t not in armed and t in nodata and (self.arms.get(t) or {}).get("status") == "pendiente":
+                    armed[t] = a
         self.armed = armed
         with self.tg_lock:  # el vigía rápido puede estar agregando avisos en otro hilo
             n = sum(1 for k in self.sent if k.startswith("arm:"))
@@ -892,8 +915,7 @@ class Radar:
                 f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
                 f"{a['reason']}. Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla."))
             if t not in self.arms:
-                self.arms[t] = new_arm(t, a, day, f"{now_m // 60:02d}:{now_m % 60:02d}", now_m, cutoff,
-                                       (lastm or {}).get(t))
+                self.arms[t] = new_arm(t, a, day, f"{now_m // 60:02d}:{now_m % 60:02d}", now_m, cutoff)
             n += 1
 
     def _track_arms(self, rows, bars, t_et):
@@ -1060,13 +1082,13 @@ class Radar:
             self.tg(key, text)
 
     # ---------------- seguimiento de señales y alertas ----------------
-    def _track(self, rows, bars, t_et, reg_txt, lastm: dict | None = None):
+    def _track(self, rows, bars, t_et, reg_txt):
         now_m = t_et.hour * 60 + t_et.minute
         day = t_et.date().isoformat()
         for r in rows:
             if r["decision"] != "COMPRA" or r["t"] in self.trades:
                 continue
-            tr = self.trades[r["t"]] = new_trade(r, day, t_et.strftime("%H:%M"), now_m, (lastm or {}).get(r["t"]))
+            tr = self.trades[r["t"]] = new_trade(r, day, t_et.strftime("%H:%M"), now_m)
             lvl, late = r.get("level"), ""
             if lvl:
                 # Qué tan tarde llega la señal: minutos desde la ruptura y cuánto sobre el nivel queda la entrada
@@ -1174,7 +1196,7 @@ class Radar:
         now_et = _dt.now(timezone.utc).astimezone(ET)
         now_m = now_et.hour * 60 + now_et.minute if now_et.date() == day else 16 * 60
         et = {s: to_et(df) for s, df in bars.items()}
-        news = {k[1]: v for k, v in self.cache.d.items() if k[0] == "news"}
+        news = {k[1]: v for k, v in list(self.cache.d.items()) if k[0] == "news"}  # el hilo de contexto la escribe
 
         def cut(s, m):
             d = et.get(s)
@@ -1228,8 +1250,9 @@ class Radar:
         st = self.replay_state
         if st.get("status") == "corriendo" or (st.get("status") == "ok" and not fresh):
             return st
-        if self.replay_ts and time.time() - self.replay_ts < REPLAY_MIN_S:
-            return {**st, "nota": f"recalculable cada {REPLAY_MIN_S // 60} min"}
+        wait = REPLAY_MIN_S if st.get("status") == "ok" else 60  # sin datos o con error: se puede reintentar al minuto
+        if self.replay_ts and time.time() - self.replay_ts < wait:
+            return {**st, "nota": f"recalculable cada {wait // 60} min"}
         self.replay_state = {"status": "corriendo", "desde": datetime.now(timezone.utc).isoformat()}
 
         def go():
