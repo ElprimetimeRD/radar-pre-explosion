@@ -1,5 +1,7 @@
 """Pruebas del puente IBKR (bridge/puente_ibkr.py) con un IBKR falso: sin red, sin TWS y sin órdenes.
 Uso: NO_LOOP=1 NO_NOTIFY=1 PYTHONPATH=. python tests/test_bridge.py"""
+import os as _os
+_os.environ.setdefault("RIESGO", "normal")  # pruebas con los umbrales de siempre; el perfil alto tiene su prueba
 import asyncio
 import http.server
 import json
