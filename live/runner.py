@@ -308,6 +308,22 @@ def perfil() -> dict:
             "perseguir_max": D.CHASE_MAX, "ext_max": D.EXT_MAX, "riesgo_max": D.RISK_MAX}
 
 
+ORDEN_USD = float(os.environ.get("ORDEN_USD", "500"))
+
+
+def orden_ibkr(t, entry, stop, t2, usd=None):
+    """Bloque listo para copiar en IBKR: compra stop-límite con stop de protección que sube solo (TRAIL) y objetivo +5%.
+    En Hapi no hay trailing ni bracket: ahí se pone la compra y el stop fijo a mano."""
+    usd = usd or ORDEN_USD
+    lim = round(entry * 1.003, 2)
+    qty = int(usd // lim) if lim > 0 else 0
+    if qty < 1:
+        return ""
+    trail = round(entry - stop, 2)
+    return (f"\nIBKR · {qty} acc (~${qty * lim:,.0f}): BUY STP LMT {entry:.2f}/{lim:.2f} → hijas OCA: "
+            f"SELL TRAIL {trail:.2f} (el stop sube con el precio) + SELL LMT {t2:.2f} (+5%)")
+
+
 class TTLCache:
     def __init__(self):
         self.d: dict = {}
@@ -924,7 +940,8 @@ class Radar:
                 f"🟡 ARMA {t} · {a['px']:.2f} ({(a['chg'] or 0):+.1f}%) · fuerza {a['score']}\n"
                 f"Gatillo: rompe {a['level']:.2f}. Orden: compra stop {a['entry']:.2f} (límite {a['entry'] * 1.003:.2f}) · "
                 f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
-                f"{a['reason']}. Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla."))
+                f"{a['reason']}.{orden_ibkr(t, a['entry'], a['stop'], (a.get('t2') or a['entry'] * 1.05))}\n"
+                f"Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla."))
             if t not in self.arms:
                 self.arms[t] = new_arm(t, a, day, f"{now_m // 60:02d}:{now_m % 60:02d}", now_m, cutoff)
             n += 1
@@ -1117,6 +1134,7 @@ class Radar:
             self.tg(f"buy:{r['t']}", (
                 f"🟢 COMPRA {r['t']} {how}\nFuerza {r['score']}/100 · {why}\n"
                 f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}{late}\n"
+                f"{orden_ibkr(r['t'], tr['entry'], tr['stop'], tr['t2']).lstrip(chr(10))}\n"
                 f"Para operarla dime: «ejecuta {r['t']} $monto, vender a +3%»"))
         for s, tr in self.trades.items():
             if tr["status"] not in ("pendiente", "abierta", "t1"):
