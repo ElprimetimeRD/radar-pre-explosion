@@ -71,12 +71,32 @@ def _split(df: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFrame]:
     return out
 
 
+def prune_tasks() -> int:
+    """yf.download descarga con `multitasking` (un hilo por ticker) y esa librería guarda CADA hilo terminado en una
+    lista global para siempre (≈2 KB cada uno). En el semáforo son decenas de miles por día: el 1-oct el servicio
+    llegó a la sesión al ~95 % de sus 512 MB y Render lo reinició por falta de memoria a las 10:18. Quita de la lista
+    los hilos ya terminados (los vivos se quedan) y devuelve cuántos quitó."""
+    try:
+        import multitasking
+        tasks = multitasking.config["TASKS"]
+    except (ImportError, AttributeError, KeyError, TypeError):
+        return 0
+    dead = [t for t in list(tasks) if t is None or not t.is_alive()]
+    for t in dead:
+        try:
+            tasks.remove(t)
+        except ValueError:  # otro hilo ya lo quitó
+            pass
+    return len(dead)
+
+
 def history(symbols: list[str], period="1y", interval="1d", prepost=False) -> dict[str, pd.DataFrame]:
     out = {}
     for i in range(0, len(symbols), 80):
         chunk = symbols[i:i + 80]
         df = retry(lambda: yf.download(chunk, period=period, interval=interval, group_by="ticker", auto_adjust=True,
                                        threads=True, progress=False, prepost=prepost), what=f"download {interval}")
+        prune_tasks()
         out.update(_split(df, chunk))
         time.sleep(1)
     return out
