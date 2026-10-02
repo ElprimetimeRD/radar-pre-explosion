@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 
 from . import keepalive, memory
-from .runner import Radar
+from .runner import Radar, perfil
 
 memory.limit_arenas(int(os.environ.get("MALLOC_ARENAS", "2")))  # antes de crear hilos
 PAGE = os.path.join(os.path.dirname(__file__), "page.html")
@@ -152,6 +152,7 @@ def health():
     rss = memory.rss_mb()
     return clean({"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
             "armed": sorted(radar.armed), "uptime_min": round((time.time() - STARTED) / 60, 1),
+            "perfil": perfil(),
             "cycle_s": radar.cycle_s, "context": {"on": radar.bg, "queue": len(radar.enrich_q),
                                                   "halts_age_s": round(time.time() - radar.halts_ts) if radar.halts_ts else None},
             "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB}, "bridge": radar.bridge.status(),

@@ -1,6 +1,9 @@
 """Pruebas sin red del semáforo en vivo: python -m tests.test_live"""
 from __future__ import annotations
 
+import os as _os
+_os.environ.setdefault("RIESGO", "normal")  # pruebas con los umbrales de siempre; el perfil alto tiene su prueba
+
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -1167,6 +1170,27 @@ def test_armed_survives_missing_data():
     gate.set()
 
 
+def test_risk_profile():
+    """Perfil de riesgo: sin RIESGO (o RIESGO=alto) avisa antes (umbrales más bajos); RIESGO=normal vuelve a los de
+    siempre; una variable de Render con su nombre manda sobre el perfil. /health muestra el perfil activo."""
+    import subprocess
+    import sys
+
+    def consts(**env):
+        e = {k: v for k, v in _os.environ.items() if k not in ("RIESGO", "ARM_NEAR", "RVOL15_IN_PLAY")}
+        e.update(env, NO_LOOP="1", NO_NOTIFY="1")
+        code = "import json; from live import runner as R; print(json.dumps(R.perfil()))"
+        out = subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True, check=True).stdout
+        import json
+        return json.loads(out.strip().splitlines()[-1])
+    alto = consts()
+    assert alto["riesgo"] == "alto" and alto["arm_near"] == 2.5 and alto["arm_min"] == 50 and alto["rvol"] == 1.5, alto
+    assert alto["rvol15"] == 3.0 and alto["fuerza_compra"] == 55 and alto["riesgo_max"] == 3.0 and alto["fast_s"] == 10
+    normal = consts(RIESGO="normal")
+    assert normal["arm_near"] == 1.0 and normal["rvol"] == 2.0 and normal["rvol15"] == 0 and normal["fuerza_compra"] == 60
+    assert consts(ARM_NEAR="1.5")["arm_near"] == 1.5                           # la variable de Render manda
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -1208,5 +1232,6 @@ if __name__ == "__main__":
     test_whale_early()
     test_background_needs_sec_before_buy()
     test_armed_survives_missing_data()
+    test_risk_profile()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})
