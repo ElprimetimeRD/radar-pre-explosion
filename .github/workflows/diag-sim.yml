@@ -1,0 +1,53 @@
+name: Simulación del historial (rama diag-velas)
+
+on:
+  push:
+    branches: [diag-velas]
+    paths: ["tools/sim_hist.py", ".github/workflows/diag-sim.yml", "data/diag/sim_run.txt"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diag-sim
+  cancel-in-progress: true
+
+jobs:
+  sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        day: ["2026-09-10", "2026-09-11", "2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25", "2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: NO_LOOP=1 python -m tools.sim_hist ${{ matrix.day }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sim-${{ matrix.day }}
+          path: out/sim-${{ matrix.day }}.json
+  join:
+    needs: sim
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sim-*
+          path: data/diag/hist
+          merge-multiple: true
+      - name: Commit
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add -f data/diag/hist
+          git diff --cached --quiet && exit 0
+          git commit -m "simulación del historial $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -X theirs origin diag-velas && git push origin HEAD:diag-velas && exit 0; sleep 5; done
+          exit 1

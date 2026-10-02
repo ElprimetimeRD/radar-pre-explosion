@@ -145,7 +145,7 @@ def move(t):
 
 
 if __name__ == "__main__":
-    ticks = [t for t in FR if INFO[t]["role"] != "regimen"]
+    ticks = [t for t in FR if INFO[t]["role"] != "regimen"][: int(os.environ.get("SIM_LIMIT", "999"))]
     res = {"day": DAY.isoformat(), "info": {t: {"role": INFO[t]["role"], **move(t)} for t in ticks}, "scen": {}}
     with Pool(os.cpu_count() or 2) as pool:
         for name in SCEN:
