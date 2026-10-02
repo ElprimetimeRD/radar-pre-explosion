@@ -22,6 +22,7 @@ from . import halts as halts_src
 from . import memory
 from .bridge import Bridge
 from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, RISK_MAX, T2, decide, regime
+from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
 from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
 from .positions import Positions
 
@@ -34,6 +35,12 @@ ARM_NEAR = float(os.environ.get("ARM_NEAR", "1.0"))   # % máximo debajo del gat
 ARM_MAX = int(os.environ.get("ARM_MAX", "8"))         # avisos de "arma" por día (no saturar Telegram)
 IBKR_TOP = int(os.environ.get("IBKR_TOP", "12"))     # tickers de los escáneres de IBKR (puente) que entran al universo
 ENRICH_N = 20
+CTX_RETRY_S = 300     # s antes de volver a pedir la curva de volumen o el cierre previo de una acción que falló
+PARTIAL_BARS = 2      # las últimas velas de Yahoo pueden estar a medio llenar: se vuelven a revisar en el ciclo siguiente
+HALTS_S = 20          # s entre lecturas de los halts de NASDAQ (en segundo plano)
+NEWS_TTL, NEWS_TTL_HOT = 600, 180  # s de caché de titulares; las armadas y las que están cerca del gatillo, más seguido
+REPLAY_MIN_S = 600    # s mínimos entre dos replays recalculados (compite con el ciclo por CPU y memoria)
+Q_BACKOFF = (60, 120, 300, 1200)  # s sin pedir cotizaciones v7 tras 1, 2, 3 y 4+ fallos seguidos (antes 20 min al primero)
 STATE_DIR = os.path.join(DATA, "live")
 HIST_DAYS = 5
 DEFAULT_WATCH = ["MU", "SNDK", "MRVL", "ARM", "BE", "AXTI", "NVDA", "AMD", "SNXX", "MUU"]
@@ -180,8 +187,12 @@ def advance(tr: dict, bars) -> list[str]:
     fill, expired, stop, t1, t2, be (y en compras stop: invalid, gap). Estados: pendiente → abierta → t1 → t2 |
     t1-cerrada | stop | no ejecutada | cancelada.
     order='stop' (ruptura armada): se activa cuando el precio SUBE hasta la entrada; si antes pierde el stop, la jugada
-    se cancela; si abre por encima del límite (cap) y no vuelve a él, no se llena (no se persigue)."""
+    se cancela; si abre por encima del límite (cap) y no vuelve a él, no se llena (no se persigue).
+    Las últimas velas pueden llegar de nuevo, ya completas, en el ciclo siguiente: las anteriores a la entrada no
+    cuentan para la posición y la vuelta a la entrada solo cuenta en velas posteriores a la del +2 %."""
     ev = []
+    if tr.get("hit1") and tr.get("t1_m") is None:
+        tr["t1_m"] = tr.get("m", -1)  # señal guardada antes de existir t1_m: todo hasta su cursor ya se revisó
     for _, b in bars.iterrows():
         hi, lo, m = float(b["High"]), float(b["Low"]), int(b["m"])
         if tr["status"] == "pendiente":
@@ -208,21 +219,28 @@ def advance(tr: dict, bars) -> list[str]:
             ev.append("fill")
         if tr["status"] not in ("abierta", "t1"):
             break
-        tr["mfe"] = max(tr["mfe"], round(100 * (hi / tr["entry"] - 1), 2))
+        if tr.get("fill_m") is not None and m < tr["fill_m"]:
+            continue  # vela repasada de antes de llenarse la orden: no es de la posición
+        # En la vela en que se llena una límite (retesteo desde arriba) su máximo suele ser de ANTES de llenarse: no
+        # cuenta para el +2 % ni para el máximo (antes podía avisar "✅ tocó +2 %" en el mismo minuto de la entrada)
+        lim_fill = bool(tr.get("limit")) and m == tr.get("fill_m")
+        if not lim_fill:
+            tr["mfe"] = max(tr["mfe"], round(100 * (hi / tr["entry"] - 1), 2))
         tr["mae"] = min(tr["mae"], round(100 * (lo / tr["entry"] - 1), 2))
         if not tr["hit1"] and lo <= tr["stop"]:
             tr["status"] = "stop"
             ev.append("stop")
             break
-        just_hit = False
+        if lim_fill:
+            continue
         if not tr["hit1"] and hi >= tr["t1"]:
-            tr["hit1"], tr["status"], just_hit = True, "t1", True
+            tr["hit1"], tr["status"], tr["t1_m"] = True, "t1", m
             ev.append("t1")
         if tr["hit1"] and hi >= tr["t2"]:
             tr["status"] = "t2"
             ev.append("t2")
             break
-        if tr["hit1"] and lo <= tr["entry"] and not just_hit:
+        if tr["hit1"] and lo <= tr["entry"] and m > tr.get("t1_m", -1):
             tr["status"] = "t1-cerrada"
             ev.append("be")
             break
@@ -230,6 +248,8 @@ def advance(tr: dict, bars) -> list[str]:
 
 
 def new_trade(r: dict, day: str, t_str: str, m: int) -> dict:
+    """m: minuto del aviso. El seguimiento empieza en la vela siguiente: las anteriores (y la del propio minuto, que
+    mezcla segundos de antes del aviso) son de antes de la orden y darían stops, llenados o cancelaciones falsos."""
     p = r["plan"]
     lim = bool(p.get("limit"))
     return {"t": r["t"], "day": day, "time": t_str, "m": m, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"],
@@ -240,7 +260,7 @@ def new_trade(r: dict, day: str, t_str: str, m: int) -> dict:
 
 def new_arm(t: str, a: dict, day: str | None, t_str: str, m: int, valid_m: int) -> dict:
     """La compra stop que pide el aviso 🟡 ARMA, como orden virtual: así se mide si entrar en la ruptura (rápido)
-    rinde mejor que esperar la COMPRA confirmada."""
+    rinde mejor que esperar la COMPRA confirmada. Se sigue desde la vela posterior al aviso (ver new_trade)."""
     e = a["entry"]
     return {"t": t, "day": day, "time": t_str, "m": m, "kind": "armada", "order": "stop", "level": a["level"],
             "entry": e, "cap": round(e * 1.003, 4), "stop": a["stop"], "t1": a["t1"],
@@ -274,13 +294,16 @@ FILLED = ("abierta", "t1", "t2", "stop", "t1-cerrada", "cierre")
 LOG_BASE = os.environ.get("LOG_BASE", "https://raw.githubusercontent.com/ElprimetimeRD/radar-pre-explosion/main/data/live")
 
 
+MISS = object()  # TTLCache.get sin dato vigente (un None guardado también es un dato: "esa acción no tiene opciones")
+
+
 class TTLCache:
     def __init__(self):
         self.d: dict = {}
 
-    def get(self, key, ttl):
+    def get(self, key, ttl, default=None):
         v = self.d.get(key)
-        return v[1] if v and time.time() - v[0] < ttl else None
+        return v[1] if v and time.time() - v[0] < ttl else default
 
     def put(self, key, val):
         self.d[key] = (time.time(), val)
@@ -323,6 +346,19 @@ class Radar:
         self.base_universe: list[str] | None = None  # universo del último refresco, sin los agregados de IBKR
         self.tg_lock = threading.Lock()
         self.tg_state: dict = {}          # resultado del último envío a Telegram (para /health; sin el token)
+        self.ctx_try: dict[str, float] = {}  # última vez que se pidió el contexto (5 días + diario) de cada acción
+        self.q_fail = 0                   # fallos seguidos de las cotizaciones v7 (el descanso crece con ellos)
+        # Segundo plano (hilo "contexto"): halts, refresco del universo y noticias/SEC/opciones, fuera del ciclo de 1 min
+        self.bg = False                   # True cuando el hilo corre; si no (pruebas), el ciclo lo hace todo en línea
+        self.bg_ev = threading.Event()
+        self.halted: dict = {}
+        self.halts_ts = 0.0
+        self.enrich_q: dict[str, dict] = {}
+        self.enrich_lock = threading.Lock()
+        self.uni_lock = threading.Lock()
+        self.wake_ts = 0.0
+        self.cycle_s: float | None = None  # duración del último ciclo (s): el retraso de la señal es esto + el de Yahoo
+        self.replay_ts = 0.0              # cuándo terminó el último replay
         self._load()
 
     # ---------------- persistencia (sobrevive reinicios dentro del día) ----------------
@@ -386,14 +422,24 @@ class Radar:
                     del dst[old]
 
     # ---------------- Telegram ----------------
-    def tg(self, key: str, text: str, wait: bool = True):
+    def tg(self, key: str, text: str, wait: bool = True, private: bool = False):
         """Avisa una sola vez por clave. wait=False manda en otro hilo: la petición del puente IBKR no espera a
         Telegram (si tarda, el puente se quedaría sin enviar precios de las demás armadas)."""
-        with self.tg_lock:  # el ciclo y el vigía rápido avisan desde hilos distintos
+        if self._claim(key):
+            self._emit(key, text, wait, private)
+
+    def _claim(self, key: str) -> bool:
+        """Reserva la clave del aviso (True si nadie lo mandó todavía). El ciclo, el vigía rápido y el puente avisan
+        desde hilos distintos."""
+        with self.tg_lock:
             if key in self.sent:
-                return
+                return False
             self.sent.add(key)
-        log.info("ALERTA %s", text.replace("\n", " | "))
+            return True
+
+    def _emit(self, key: str, text: str, wait: bool = True, private: bool = False):
+        """private: el texto lleva un precio de IBKR (uso personal): al registro de Render va solo la clave."""
+        log.info("ALERTA %s", key if private else text.replace("\n", " | "))
         if wait:
             self._send(text)
         else:
@@ -429,14 +475,18 @@ class Radar:
                    f"🟡 ARMA · 🟢 COMPRA · ⚡ rupturas desde las {(OPEN_M + OR_MINUTES) // 60}:{(OPEN_M + OR_MINUTES) % 60:02d}.")
 
     def quotes(self, syms: list[str]) -> dict[str, dict]:
-        """v7/quote con cortacircuito: si Yahoo niega el crumb (401), no insistir por 20 min."""
+        """v7/quote con cortacircuito: si Yahoo la niega (crumb 401, límite), descansa 1, 2, 5 y luego 20 min según los
+        fallos seguidos. Antes un solo lote fallido apagaba 20 min el precio en vivo y el vigía rápido sin IBKR."""
         if not syms or time.time() < self.q_off_until:
             return {}
         first = yahoo.batch_quotes(syms[:40])
         if not first:
-            self.q_off_until = time.time() + 1200
-            log.warning("v7/quote no disponible; sigo con precios de velas por 20 min")
+            self.q_fail += 1
+            wait = Q_BACKOFF[min(self.q_fail, len(Q_BACKOFF)) - 1]
+            self.q_off_until = time.time() + wait
+            log.warning("v7/quote no disponible (%d fallo/s seguidos); sigo con precios de velas por %d s", self.q_fail, wait)
             return {}
+        self.q_fail = 0
         if len(syms) > 40:
             first.update(yahoo.batch_quotes(syms[40:]))
         return first
@@ -462,6 +512,15 @@ class Radar:
 
     # ---------------- universo ----------------
     def refresh_universe(self, now: datetime, phase: str, halted: dict):
+        """Un refresco a la vez: lo hace el hilo de contexto y, si se atrasa, el ciclo."""
+        if not self.uni_lock.acquire(blocking=False):
+            return
+        try:
+            self._refresh_universe(now, phase, halted)
+        finally:
+            self.uni_lock.release()
+
+    def _refresh_universe(self, now: datetime, phase: str, halted: dict):
         watch = load_watchlist()
         cand: dict[str, set] = {}
 
@@ -535,30 +594,43 @@ class Radar:
         log.info("universo: %d candidatos, %d cotizados → %d en seguimiento", len(cand), len(quotes), len(uni))
 
     def ensure_context(self, syms: list[str], today):
-        need = [s for s in syms if s not in self.baseline]
+        """Curva de volumen de 5 días, ATR y cierre previo de cada acción. Si Yahoo falla con alguna, se vuelve a pedir
+        cada CTX_RETRY_S: antes quedaba sin curva todo el día (RVOL vacío → NO) justo con las que entran a las 9:2x."""
+        now = time.time()
+        need = [s for s in syms if s not in self.baseline
+                or ((self.baseline.get(s) is None or self.prev.get(s) is None)
+                    and now - self.ctx_try.get(s, 0) >= CTX_RETRY_S)]
         if not need:
             return
+        for s in need:
+            self.ctx_try[s] = now
         h5 = yahoo.history(need, period="5d", interval="1m", prepost=False)
         hd = yahoo.history(need, period="3mo", interval="1d")
         for s in need:
-            self.baseline[s] = baseline_curve(h5.get(s), today)
+            base = baseline_curve(h5.get(s), today)
+            if base is not None or s not in self.baseline:
+                self.baseline[s] = base
             d = hd.get(s)
             if d is not None and not d.empty:
                 d = d.dropna(subset=["Close"])
                 d = d[[ix.date() < today for ix in d.index]]
-            self.atr[s] = atr_pct(d)
-            self.prev[s] = float(d["Close"].iloc[-1]) if d is not None and not d.empty else None
+            if d is not None and not d.empty:
+                self.atr[s] = atr_pct(d)
+                self.prev[s] = float(d["Close"].iloc[-1])
+            else:
+                self.atr.setdefault(s, None)
+                self.prev.setdefault(s, None)
 
     # ---------------- enriquecimiento con caché ----------------
-    def news_ctx(self, s, now_ts, name=None):
-        c = self.cache.get(("news", s), 600)
-        if c is None:
+    def news_ctx(self, s, now_ts, name=None, ttl=NEWS_TTL):
+        c = self.cache.get(("news", s), ttl, MISS)
+        if c is MISS:
             c = self.cache.put(("news", s), classify(yahoo.news(s, count=10) or rss_news(s, name), now_ts, s, name))
         return c
 
     def sec_ctx(self, s, today):
-        c = self.cache.get(("sec", s), 6 * 3600)
-        if c is None:
+        c = self.cache.get(("sec", s), 6 * 3600, MISS)
+        if c is MISS:
             if not self.sec_map:
                 self.sec_map = other.sec_ticker_map()
             cik = self.sec_map.get(s)
@@ -566,11 +638,99 @@ class Radar:
         return c
 
     def opt_ctx(self, s, px):
-        c = self.cache.get(("opt", s), 900)
-        if c is None:
+        """callVolOI de las opciones a ≤ 30 días. Un None (sin opciones) también se guarda 15 min: antes se volvía a
+        pedir la cadena de opciones en cada ciclo."""
+        c = self.cache.get(("opt", s), 900, MISS)
+        if c is MISS:
             chains, _ = yahoo.option_chains(s, max_days=30)
             c = self.cache.put(("opt", s), options_features(chains, px).get("callVolOI"))
         return c
+
+    def _enrich(self, s, m, ctx, now_ts, today, with_opt: bool, hot: bool, inline: bool = False) -> bool:
+        """Noticias, SEC y opciones de una acción, desde la caché. Sin el hilo de contexto (pruebas) o con inline=True
+        las pide en el acto, como antes; con él, lo que falte o esté viejo queda en cola y el ciclo sigue con lo último
+        que haya. Devuelve True si la acción tiene noticias y SEC (aunque sean de antes): sin eso no se sabe si hay
+        dilución y el ciclo no debe dar COMPRA ni ARMA (lo resuelve pidiéndolas en el acto)."""
+        ttl = NEWS_TTL_HOT if hot else NEWS_TTL
+        if not self.bg or inline:
+            cat = self.news_ctx(s, now_ts, ctx.get("name"), ttl)
+            f = self.sec_ctx(s, today)
+            cvo = self.opt_ctx(s, m.get("px")) if with_opt and not inline else (
+                self.cache.get(("opt", s), 3600) if with_opt else None)
+            complete = True
+        else:
+            cat = self.cache.get(("news", s), ttl, MISS)
+            f = self.cache.get(("sec", s), 6 * 3600, MISS)
+            cvo = self.cache.get(("opt", s), 900, MISS) if with_opt else None
+            if cat is MISS or f is MISS or cvo is MISS:
+                with self.enrich_lock:
+                    self.enrich_q[s] = {"name": ctx.get("name"), "px": m.get("px"), "today": today, "opt": with_opt,
+                                        "ttl": ttl}
+                self.bg_ev.set()
+            # Mientras llega lo nuevo, lo último que haya sigue contando (titulares hasta 6 h; SEC hasta 24 h: antes
+            # de las 10:10 vencía la SEC leída en pre-market y la COMPRA salía sin el filtro de dilución)
+            if cat is MISS:
+                cat = self.cache.get(("news", s), 6 * 3600, MISS)
+            if f is MISS:
+                f = self.cache.get(("sec", s), 24 * 3600, MISS)
+            complete = cat is not MISS and f is not MISS
+            cat = {} if cat is MISS else cat
+            f = {} if f is MISS else f
+            if cvo is MISS:
+                cvo = self.cache.get(("opt", s), 3600)
+        if cat.get("type"):
+            ctx["cat"] = {k: cat.get(k) for k in ("type", "age", "title", "url", "hours")}
+        ctx["offer"] = cat.get("offer")
+        ctx["news_ok"] = cat.get("n", 0) > 0
+        ctx["offer30"], ctx["shelf"] = f.get("offer30"), f.get("shelf36m")
+        if with_opt:
+            ctx["callVolOI"] = cvo
+        return complete
+
+    # ---------------- hilo de contexto (segundo plano) ----------------
+    def context_once(self, now: datetime | None = None) -> dict:
+        """Lo lento que no tiene que frenar al ciclo de 1 min: halts de NASDAQ, refresco del universo y las noticias,
+        SEC y opciones que el ciclo dejó en cola. Si llega una noticia fresca, despierta al ciclo."""
+        now = now or datetime.now(timezone.utc)
+        phase = phase_of(now)
+        done = {"halts": False, "universe": False, "enriched": 0}
+        if phase == "closed":
+            return done
+        if time.time() - self.halts_ts >= HALTS_S:
+            self.halted, self.halts_ts = halts_src.parse(halts_src.fetch(), now), time.time()
+            done["halts"] = True
+        if self.universe and time.time() - self.universe_ts > (UNIVERSE_TTL if phase == "open" else 600):
+            self.refresh_universe(now, phase, self.halted)
+            done["universe"] = True
+        with self.enrich_lock:
+            jobs, self.enrich_q = self.enrich_q, {}
+        hot = False
+        for s, j in jobs.items():
+            try:
+                before = self.cache.get(("news", s), 6 * 3600, {})
+                cat = self.news_ctx(s, now.timestamp(), j["name"], j["ttl"])
+                self.sec_ctx(s, j["today"])
+                if j["opt"] and (j["px"] or 0) >= 3:
+                    self.opt_ctx(s, j["px"])
+                done["enriched"] += 1
+                if cat.get("type") and cat.get("age") in ("fresh", "d1") and cat.get("title") != before.get("title"):
+                    hot = True
+            except Exception as e:  # noqa: BLE001
+                log.warning("enriquecer %s: %s", s, e)
+        if hot and phase == "open" and time.time() - self.wake_ts >= 20:
+            self.wake_ts = time.time()
+            self.wake.set()
+        return done
+
+    def context_forever(self):
+        self.bg = True
+        while True:
+            try:
+                self.context_once()
+            except Exception as e:  # noqa: BLE001
+                log.warning("hilo de contexto: %s", e)
+            self.bg_ev.wait(5)
+            self.bg_ev.clear()
 
     # ---------------- ciclo ----------------
     def cycle(self, now: datetime | None = None):
@@ -580,6 +740,7 @@ class Radar:
         phase = phase_of(now)
         if self.day != today:
             self.day, self.baseline, self.atr, self.prev = today, {}, {}, {}
+            self.ctx_try = {}
             self.breaks = {}
             self.cache = TTLCache()  # noticias, SEC y opciones de ayer ya no sirven: sin esto la caché crece cada día
             iso = today.isoformat()
@@ -605,9 +766,18 @@ class Radar:
             self._watch_positions(now, phase)
         except Exception as e:  # noqa: BLE001
             log.warning("monitor de posiciones: %s", e)
-        halted = halts_src.parse(halts_src.fetch(), now)
-        if not self.universe or time.time() - self.universe_ts > (UNIVERSE_TTL if phase == "open" else 600):
+        # Halts y refresco del universo: con el hilo de contexto corriendo, los hace él (el ciclo usa lo último que
+        # trajo); sin él, o si se atrasó, aquí mismo como antes
+        if self.bg and time.time() - self.halts_ts <= 3 * HALTS_S:
+            halted = self.halted
+        else:
+            halted = self.halted = halts_src.parse(halts_src.fetch(), now)
+            self.halts_ts = time.time()
+        due = time.time() - self.universe_ts > (UNIVERSE_TTL if phase == "open" else 600)
+        if not self.universe or (due and not self.bg) or (self.bg and time.time() - self.universe_ts > 4 * UNIVERSE_TTL):
             self.refresh_universe(now, phase, halted)
+        elif due:
+            self.bg_ev.set()
         if phase == "open":
             # Lo que los escáneres de IBKR ven AHORA entra ya, sin esperar el próximo refresco del universo. Reemplaza
             # a los agregados del ciclo anterior (no se acumulan: cada uno pide 5 días de velas y la memoria es justa).
@@ -649,24 +819,39 @@ class Radar:
             if h and h["code"] == "T1":
                 ctx["cat"] = {"type": "halt_news", "age": "fresh", "title": f"halt T1 {h['time']}"}
             base[s] = (m, ctx, decide(s, m, ctx))
-        # Enriquecer a los más prometedores (noticias, SEC, opciones) y decidir de nuevo
-        order = sorted(base, key=lambda s: (base[s][2]["decision"] != "NO", base[s][2]["score"]), reverse=True)
+        # Enriquecer a los más prometedores (noticias, SEC, opciones) y decidir de nuevo. También a las que una noticia
+        # fresca pondría en juego (RVOL 1.5–2: el umbral baja a 1.5 con noticia), aunque hoy salgan NO.
+        def prio(s):
+            r = base[s][2]
+            near = r["decision"] == "NO" and 1.5 <= (r.get("rvol") or 0) < D_RVOL_IN_PLAY
+            return (r["decision"] != "NO" or near, r["score"])
+        order = sorted(base, key=prio, reverse=True)
         now_ts = now.timestamp()
         for i, s in enumerate(order[:ENRICH_N]):
-            m, ctx, _ = base[s]
+            m, ctx, first = base[s]
+            # Titulares más seguido (NEWS_TTL_HOT) solo para las que están por disparar: cada pedido extra a Yahoo
+            # suma al riesgo de que limite la IP y se pierdan las velas
+            hot = s in self.armed or first["decision"] == "COMPRA" or (first["decision"] == "ESPERA" and first.get("level"))
+            with_opt = i < 10 and (m.get("px") or 0) >= 3
+            complete = True
             try:
-                cat = self.news_ctx(s, now_ts, ctx.get("name"))
-                if cat.get("type"):
-                    ctx["cat"] = {k: cat.get(k) for k in ("type", "age", "title", "url", "hours")}
-                ctx["offer"] = cat.get("offer")
-                ctx["news_ok"] = cat.get("n", 0) > 0
-                f = self.sec_ctx(s, today)
-                ctx["offer30"], ctx["shelf"] = f.get("offer30"), f.get("shelf36m")
-                if i < 10 and (m.get("px") or 0) >= 3:
-                    ctx["callVolOI"] = self.opt_ctx(s, m.get("px"))
+                complete = self._enrich(s, m, ctx, now_ts, today, with_opt, hot)
             except Exception as e:  # noqa: BLE001
                 log.warning("enriquecer %s: %s", s, e)
-            base[s] = (m, ctx, decide(s, m, ctx))
+                complete = not self.bg  # en línea (sin hilo) se sigue como antes; con el hilo, se pide en el acto abajo
+            r = decide(s, m, ctx)
+            if not complete and (r["decision"] == "COMPRA" or (r["decision"] == "ESPERA" and r.get("level"))):
+                # Sin noticias ni SEC todavía (acción nueva o servicio recién reiniciado) no se sabe si hay dilución:
+                # para una que daría COMPRA o ARMA se piden en el acto, como antes del hilo de contexto
+                try:
+                    self._enrich(s, m, ctx, now_ts, today, with_opt, hot, inline=True)
+                    r = decide(s, m, ctx)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("enriquecer %s: %s", s, e)
+                    if r["decision"] == "COMPRA" or r.get("level"):
+                        r = {**r, "decision": "ESPERA", "reason": "sin noticias ni SEC todavía: no sé si hay dilución",
+                             "plan": None, "level": None, "trigger": "se reevalúa en el próximo ciclo"}
+            base[s] = (m, ctx, r)
         rows = [base[s][2] for s in base]
         for r in rows:
             r["src"] = self.sources.get(r["t"], [])
@@ -689,6 +874,7 @@ class Radar:
             "trades": list(self.trades.values()), "stats": self.stats(), "universe": len(self.universe),
             "armadas": list(self.arms.values()), "armStats": self.arm_stats(),
             "halts": {s: h for s, h in halted.items()}, "errors": self.errors[-5:], "bridge": self.bridge.status(),
+            "cycle_s": self.cycle_s,
         }
         self._save()
 
@@ -710,6 +896,12 @@ class Radar:
                     continue
                 armed[r["t"]] = {"level": lvl, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"], "t2": p.get("t2"),
                                  "risk": p["risk"], "score": r["score"], "px": px, "chg": r.get("chg"), "reason": r["reason"]}
+            # Si a una armada pendiente le faltan datos este ciclo (Yahoo no dio velas), el vigía y el puente la siguen
+            # mirando: la orden sigue puesta y la ruptura se puede dar igual
+            nodata = {r["t"] for r in rows if r.get("nodata")}
+            for t, a in self.armed.items():
+                if t not in armed and t in nodata and (self.arms.get(t) or {}).get("status") == "pendiente":
+                    armed[t] = a
         self.armed = armed
         with self.tg_lock:  # el vigía rápido puede estar agregando avisos en otro hilo
             n = sum(1 for k in self.sent if k.startswith("arm:"))
@@ -750,18 +942,30 @@ class Radar:
                            "expired": f"⌛ {s}: la compra stop {o['entry']:.2f} no se activó a tiempo. Cancélala."}.get(ev)
                     if msg:
                         self.tg(f"arm-fill:{s}" if ev == "fill" else f"arm-x:{s}", msg)
-                if not after.empty:
-                    o["last"] = float(after["Close"].iloc[-1])
-                    o["m"] = int(after["m"].iloc[-1])
+                self._move_cursor(o, after)
             if o["status"] != "pendiente":
                 continue
             r = by_t.get(s)
-            if r is not None and r["decision"] == "NO":
+            # Solo cancela un NO del mercado: no uno por falta de datos (Yahoo no entregó velas o la curva de volumen), ni
+            # si el precio ya está sobre la entrada (la orden pudo activarse y las velas aún no lo muestran)
+            if (r is not None and r["decision"] == "NO" and not r.get("nodata") and not d.empty
+                    and not (r.get("px") and r["px"] >= o["entry"])):
                 o["status"], o["cancel"] = "cancelada", r["reason"]
                 self.tg(f"arm-x:{s}", f"❌ {s}: cancela la compra stop {o['entry']:.2f}. {r['reason']}.")
             elif now_m >= (o.get("valid_m") or 10**9):
                 o["status"] = "no ejecutada"
                 self.tg(f"arm-x:{s}", f"⌛ {s}: la compra stop {o['entry']:.2f} no se activó a tiempo. Cancélala.")
+
+    @staticmethod
+    def _move_cursor(o: dict, after):
+        """Después de revisar velas nuevas: último precio y cursor. El cursor queda antes de las últimas PARTIAL_BARS
+        velas (pueden estar a medio llenar) para revisarlas otra vez completas; antes se daban por vistas y un stop o un
+        +2 % tocado en la segunda mitad de ese minuto no se avisaba."""
+        if after is None or after.empty:
+            return
+        o["last"] = float(after["Close"].iloc[-1])
+        if len(after) > PARTIAL_BARS:
+            o["m"] = max(int(o["m"]), int(after["m"].iloc[-1 - PARTIAL_BARS]))
 
     def _pre_list(self, rows, t_et):
         """Desde las 9:15 ET: los gaps del pre-market con su referencia, para llegar preparado a la apertura."""
@@ -785,15 +989,16 @@ class Radar:
         son de uso personal y las armadas se publican en /api/trades y en GitHub) para medir cuánto adelanta."""
         armed = dict(self.armed)
         fired: list[str] = []
+        out: list[tuple[str, str]] = []
+        ib = src == "ibkr"
         with self.brk_lock:
             for s, p in prices.items():
                 a = armed.get(s)
                 if not a or not p or p < a["level"] * 1.001:
                     continue
                 key = f"break:{s}:{a['level']:.2f}"
-                if key in self.sent:
+                if not self._claim(key):
                     continue
-                ib = src == "ibkr"
                 if p <= a["entry"] * 1.004:
                     msg = (f"⚡ {s} rompe {a['level']:.2f} ahora ({p:.2f}{', IBKR' if ib else ''}). Entrada ≤ "
                            f"{a['entry'] * 1.003:.2f} · stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
@@ -801,11 +1006,14 @@ class Radar:
                 else:
                     msg = (f"⚡ {s} rompió {a['level']:.2f} y ya va en {p:.2f}{' (IBKR)' if ib else ''}: no persigas. "
                            f"Si dejaste la orden armada, ya entraste; si no, espera el retesteo que marque el semáforo.")
-                self.tg(key, msg, wait=not ib)
+                out.append((key, msg))
                 self.breaks.setdefault(s, {"break_t": now.astimezone(ET).strftime("%H:%M:%S"), "break_src": src})
                 fired.append(s)
         if fired:
             self.wake.set()
+        # El envío va fuera del candado: antes un aviso de Yahoo (hasta 15 s esperando a Telegram) frenaba al puente
+        for key, msg in out:
+            self._emit(key, msg, wait=not ib, private=ib)
         return fired
 
     def fast_once(self, now: datetime | None = None) -> list[str]:
@@ -915,10 +1123,10 @@ class Radar:
                        "be": None}.get(ev)
                 if msg:
                     self.tg(f"{ev}:{s}", msg)
-            if not after.empty:
-                tr["last"] = float(after["Close"].iloc[-1])
-                tr["m"] = int(after["m"].iloc[-1])
-            if tr["status"] == "pendiente" and now_m > (tr.get("valid_m") or 0):
+            self._move_cursor(tr, after)
+            # Respaldo por reloj si no llegan velas; con margen por el retraso de Yahoo: la vela que la llenaba a tiempo
+            # puede llegar 1–2 min después de vencer (el vencimiento exacto lo marca advance con la hora de cada vela)
+            if tr["status"] == "pendiente" and now_m > (tr.get("valid_m") or 0) + PARTIAL_BARS + 1:
                 tr["status"] = "no ejecutada"
         if now_m >= 15 * 60 + 50:
             open_ = [s for s, tr in self.trades.items() if tr["status"] in ("abierta", "t1")]
@@ -988,7 +1196,7 @@ class Radar:
         now_et = _dt.now(timezone.utc).astimezone(ET)
         now_m = now_et.hour * 60 + now_et.minute if now_et.date() == day else 16 * 60
         et = {s: to_et(df) for s, df in bars.items()}
-        news = {k[1]: v for k, v in self.cache.d.items() if k[0] == "news"}
+        news = {k[1]: v for k, v in list(self.cache.d.items()) if k[0] == "news"}  # el hilo de contexto la escribe
 
         def cut(s, m):
             d = et.get(s)
@@ -1037,9 +1245,14 @@ class Radar:
                 "paso_min": step, "universo": len(self.universe), "resumen": summ, "trades": trades}
 
     def replay_async(self, step: int = 10, fresh: bool = False) -> dict:
+        """Corre el replay en otro hilo. Uno a la vez y, recalculado, como mucho cada REPLAY_MIN_S: compite con el ciclo
+        por CPU y memoria, y /api/replay?fresh=1 es público (antes se podía relanzar en bucle)."""
         st = self.replay_state
         if st.get("status") == "corriendo" or (st.get("status") == "ok" and not fresh):
             return st
+        wait = REPLAY_MIN_S if st.get("status") == "ok" else 60  # sin datos o con error: se puede reintentar al minuto
+        if self.replay_ts and time.time() - self.replay_ts < wait:
+            return {**st, "nota": f"recalculable cada {wait // 60} min"}
         self.replay_state = {"status": "corriendo", "desde": datetime.now(timezone.utc).isoformat()}
 
         def go():
@@ -1047,7 +1260,9 @@ class Radar:
                 self.replay_state = self.replay(step)
             except Exception as e:  # noqa: BLE001
                 self.replay_state = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-        threading.Thread(target=go, daemon=True).start()
+            finally:
+                self.replay_ts = time.time()
+        threading.Thread(target=go, name="replay", daemon=True).start()
         return self.replay_state
 
     # ---------------- bucle ----------------
@@ -1079,6 +1294,10 @@ class Radar:
                 log.error("ciclo falló: %s\n%s", msg, traceback.format_exc())
                 self.errors.append(msg)
                 self.snapshot = {**self.snapshot, "status": "error", "errors": self.errors[-5:]}
+            self.cycle_s = round(time.time() - t0, 1)
+            self.snapshot["cycle_s"] = self.cycle_s
+            if self.cycle_s > CYCLE_S:
+                log.warning("el ciclo tardó %.0f s (más que CYCLE_S=%d)", self.cycle_s, CYCLE_S)
             try:
                 self.after_cycle()
             except Exception as e:  # noqa: BLE001

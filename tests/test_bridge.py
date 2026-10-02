@@ -330,8 +330,8 @@ async def _end_to_end():
         r.sent, r.breaks, r.armed = set(), {}, {"AAA": dict(a)}
         r.arms = {"AAA": runner.new_arm("AAA", a, "2026-09-29", "10:00", 600, 720)}
         sent = []
-        real = r.tg
-        r.tg = lambda key, text, **kw: (sent.append(text), real(key, text, **kw))
+        real = r._emit
+        r._emit = lambda key, text, wait=True, private=False: (sent.append(text), real(key, text, wait, private))
 
         def post(url, token, payload):
             res = cl.post("/api/bridge", json=payload, headers={"X-Token": token})

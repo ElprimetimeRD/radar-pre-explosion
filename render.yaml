@@ -3,7 +3,7 @@ services:
     name: radar-semaforo
     runtime: python
     plan: starter
-    region: virginia
+    region: oregon
     buildCommand: pip install -r requirements-live.txt
     startCommand: uvicorn live.app:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
@@ -22,6 +22,8 @@ services:
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: POSITIONS_TOKEN
+        sync: false
+      - key: BRIDGE_TOKEN
         sync: false
       - key: DROP_ALERTS
         value: "2,3"

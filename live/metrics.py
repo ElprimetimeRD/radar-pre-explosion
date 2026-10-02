@@ -5,6 +5,7 @@ Todas las horas en Nueva York (ET). La sesión regular va de 9:30 (minuto 570) a
 from __future__ import annotations
 
 import os
+from array import array
 from datetime import datetime
 
 import numpy as np
@@ -23,8 +24,12 @@ OR_MINUTES = int(os.environ.get("OR_MINUTES", "5"))  # rango de apertura: 9:30�
 
 
 def to_et(df: pd.DataFrame) -> pd.DataFrame:
+    """Velas con índice en hora de Nueva York y columnas m (minuto del día) y day. Si ya vienen así (el replay corta
+    velas ya convertidas en cada paso), las devuelve sin copiarlas: nadie modifica el resultado."""
     if df is None or df.empty:
         return pd.DataFrame()
+    if "m" in df.columns and "day" in df.columns and getattr(df.index, "tz", None) is not None:
+        return df
     d = df.dropna(subset=["Close"]).copy()
     idx = d.index
     if getattr(idx, "tz", None) is None:
@@ -36,8 +41,9 @@ def to_et(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def baseline_curve(df5d: pd.DataFrame, today) -> list[float] | None:
-    """Volumen acumulado promedio por minuto de sesión (0..389) de los días previos a `today`."""
+def baseline_curve(df5d: pd.DataFrame, today) -> array | None:
+    """Volumen acumulado promedio por minuto de sesión (0..389) de los días previos a `today`. Como array de floats
+    (≈3 KB por acción en vez de ≈12 KB de una lista): el servicio guarda una por cada acción que vio en el día."""
     d = to_et(df5d)
     if d.empty:
         return None
@@ -49,7 +55,7 @@ def baseline_curve(df5d: pd.DataFrame, today) -> list[float] | None:
             curves.append(s.values)
     if not curves:
         return None
-    return [float(x) for x in np.mean(curves, axis=0)]
+    return array("d", np.mean(curves, axis=0).tolist())
 
 
 def atr_pct(daily: pd.DataFrame, n=14) -> float | None:
@@ -65,10 +71,11 @@ def atr_pct(daily: pd.DataFrame, n=14) -> float | None:
 def whale_bars(reg: pd.DataFrame, now_m: int) -> dict:
     """Velas de 1 min con volumen anómalo en los últimos WHALE_WINDOW minutos, clasificadas por lado."""
     out = {"buy": 0, "sell": 0, "absorb": 0, "usd": 0.0, "last": None}
-    if len(reg) < 12:
+    if len(reg) < 7:
         return out
     v = reg["Volume"]
-    med = v.shift(1).rolling(30, min_periods=10).median()
+    # Mediana de hasta 30 minutos previos; con 5 basta, así la ballena de 9:35–9:40 (la ruptura del rango) ya cuenta
+    med = v.shift(1).rolling(30, min_periods=5).median()
     usd = v * reg["Close"]
     hit = (v >= WHALE_K * med) & (usd >= WHALE_MIN_USD) & (med > 0)
     rec = reg[hit & (reg["m"] >= now_m - WHALE_WINDOW)]
@@ -96,10 +103,13 @@ def session_metrics(bars: pd.DataFrame, prev_close: float | None, baseline: list
     now = now.astimezone(ET)
     now_m = now.hour * 60 + now.minute
     out: dict = {"now_m": now_m}
-    if d.empty:
-        return out
-    today = d[d["day"] == now.date()]
-    if today.empty:
+    if d.empty or (today := d[d["day"] == now.date()]).empty:
+        # Sin velas (Yahoo limitó la descarga o la acción aún no opera): el precio en vivo de la cotización sigue
+        # sirviendo. Antes quedaba sin precio y la decisión salía NO "sin datos de precio".
+        if live_px:
+            out["px"] = float(live_px)
+            if prev_close:
+                out["chg"] = round(100 * (float(live_px) / prev_close - 1), 2)
         return out
     pm = today[today["m"] < OPEN_M]
     reg = today[(today["m"] >= OPEN_M) & (today["m"] < CLOSE_M)]
@@ -123,9 +133,14 @@ def session_metrics(bars: pd.DataFrame, prev_close: float | None, baseline: list
     vol = reg["Volume"]
     out["vwap"] = float((tp * vol).sum() / vol.sum()) if vol.sum() > 0 else float(tp.mean())
     out["ext"] = round(100 * (px / out["vwap"] - 1), 2)
-    orb = reg[reg["m"] < OPEN_M + OR_MINUTES]
+    # Rango de apertura: los primeros OR_MINUTES minutos desde la primera vela de la sesión (si abrió tarde por un
+    # halt, desde que empezó a operar: antes quedaba vacío y el nivel salía NaN). Se da por cerrado cuando ya hay una
+    # vela posterior, no por la hora del reloj: con 1–2 min de retraso de Yahoo, a las 9:35 el rango tenía 4 velas.
+    or_end = int(reg["m"].iloc[0]) + OR_MINUTES
+    orb = reg[reg["m"] < or_end]
     out["orh"], out["orl"] = float(orb["High"].max()), float(orb["Low"].min())
-    out["or_done"] = now_m >= OPEN_M + OR_MINUTES
+    out["or_end"] = or_end
+    out["or_done"] = now_m >= or_end and int(reg["m"].iloc[-1]) >= or_end
     out["hod"], out["lod"] = float(reg["High"].max()), float(reg["Low"].min())
     out["dist_hod"] = round(100 * (out["hod"] / px - 1), 2)
     # Nivel que se está rompiendo: el mayor entre el máximo de apertura y el máximo previo a los últimos 15 min
@@ -136,9 +151,18 @@ def session_metrics(bars: pd.DataFrame, prev_close: float | None, baseline: list
     last = reg.tail(15)
     if len(last) >= 5:
         out["rng1m"] = round(float(((last["High"] - last["Low"]) / last["Close"]).median() * 100), 3)
-    elapsed = int(min(max(reg["m"].iloc[-1] - OPEN_M, 0), SESSION_LEN - 1))
+    # RVOL con las velas cerradas: la última se está formando y su volumen parcial lo bajaba
+    done = reg.iloc[:-1] if len(reg) >= 2 else reg
+    elapsed = int(min(max(done["m"].iloc[-1] - OPEN_M, 0), SESSION_LEN - 1))
     if baseline and baseline[elapsed] > 0:
-        out["rvol"] = round(float(vol.sum()) / baseline[elapsed], 2)
+        out["rvol"] = round(float(done["Volume"].sum()) / baseline[elapsed], 2)
+    # RVOL de los últimos 15 min contra lo normal a esa hora: ve el volumen NUEVO de una ruptura de media mañana,
+    # que el RVOL acumulado desde la apertura diluye
+    if baseline and elapsed >= 15:
+        b15 = baseline[elapsed] - baseline[elapsed - 15]
+        v15 = float(done[done["m"] > done["m"].iloc[-1] - 15]["Volume"].sum())
+        if b15 > 0:
+            out["rvol15"] = round(v15 / b15, 2)
     # Aceleración: volumen de los últimos 5 min vs. mediana de bloques de 5 min de hoy
     if len(reg) >= 15:
         blocks = vol.groupby((reg["m"] - OPEN_M) // 5).sum()
