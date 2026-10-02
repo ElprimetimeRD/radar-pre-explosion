@@ -222,7 +222,7 @@ def main():
             continue
         days = sorted(set(d["day"]))[-5:]
         x = d[d["day"].isin(days)][["Open", "High", "Low", "Close", "Volume"]].copy()
-        x["ts"] = (x.index.tz_convert("UTC").astype("int64") // 10**9).astype(int)
+        x["ts"] = [int(i.timestamp()) for i in x.index]  # independiente de la resolución del índice
         x["t"] = s
         keep.append(x.reset_index(drop=True))
     if keep:
