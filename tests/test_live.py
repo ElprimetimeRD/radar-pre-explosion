@@ -1191,6 +1191,27 @@ def test_risk_profile():
     assert consts(ARM_NEAR="1.5")["arm_near"] == 1.5                           # la variable de Render manda
 
 
+def test_orden_ibkr():
+    """Línea de orden para IBKR: ARMA = Stop Limit puesto antes de la ruptura; COMPRA y ⚡ = Limit. Trailing a la
+    distancia del stop del plan, objetivo +5 % y riesgo en dólares; nada si el presupuesto no alcanza."""
+    arma = runner.orden_ibkr(10.0, 9.7, 10.5, 10.03, gatillo=10.0, usd=500)
+    assert arma == "\n📲 IBKR 49 acc · Stop Limit 10.00 / 10.03 + Trailing 0.30 (3.0%) + objetivo 10.50 · riesgo ~$15", arma
+    compra = runner.orden_ibkr(10.412, 10.3391, 10.9326, 10.412, usd=500)
+    assert compra == "\n📲 IBKR 48 acc · Limit 10.41 + Trailing 0.07 (0.7%) + objetivo 10.93 · riesgo ~$3", compra
+    assert "objetivo 21.00" in runner.orden_ibkr(20.0, 19.5, None, 20.06, usd=500)     # sin t2: +5 %
+    assert runner.orden_ibkr(600.0, 590.0, 630.0, 601.8, usd=500) == ""              # no alcanza para 1 acción
+    assert runner.orden_ibkr(10.0, 10.0, 10.5, 10.03, usd=500) == ""                 # stop inválido
+    # el aviso ⚡ de ruptura trae la orden límite para quien no dejó puesta la del ARMA
+    now = DAY.replace(hour=10, minute=0)
+    r = runner.Radar(notify=False)
+    r.sent, msgs = set(), []
+    r._send = lambda text: (msgs.append(text), True)[1]
+    r.armed = {"AAA": {"level": 50.0, "entry": 50.05, "stop": 49.55, "t1": 51.05, "t2": 52.55, "risk": 1.0,
+                       "score": 70, "px": 49.9}}
+    assert r._check_breaks({"AAA": 50.06}, "yahoo", now) == ["AAA"]
+    assert msgs and "📲 IBKR 9 acc · Limit 50.20 + Trailing 0.50 (1.0%) + objetivo 52.55" in msgs[0], msgs
+
+
 if __name__ == "__main__":
     m = test_compra()
     test_vetos(m)
@@ -1233,5 +1254,6 @@ if __name__ == "__main__":
     test_background_needs_sec_before_buy()
     test_armed_survives_missing_data()
     test_risk_profile()
+    test_orden_ibkr()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})

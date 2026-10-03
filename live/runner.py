@@ -311,17 +311,23 @@ def perfil() -> dict:
 ORDEN_USD = float(os.environ.get("ORDEN_USD", "500"))
 
 
-def orden_ibkr(t, entry, stop, t2, usd=None):
-    """Bloque listo para copiar en IBKR: compra stop-límite con stop de protección que sube solo (TRAIL) y objetivo +5%.
-    En Hapi no hay trailing ni bracket: ahí se pone la compra y el stop fijo a mano."""
+def orden_ibkr(entry: float, stop: float, t2: float | None, limite: float, gatillo: float | None = None,
+               usd: float | None = None) -> str:
+    """Línea lista para teclear en IBKR, en el orden de la boleta: cantidad, compra, stop que sube solo (Trailing) y
+    objetivo +5 %. gatillo → Stop Limit (orden puesta antes de la ruptura: IBKR compra sola al romper, sin esperar a que
+    reacciones); sin gatillo → Limit (la ruptura ya pasó). La distancia del Trailing es la del stop del plan, así que la
+    pérdida máxima es cantidad × distancia (más deslizamiento). Vacía si el presupuesto no alcanza para 1 acción.
+    En Hapi no hay Trailing ni órdenes adjuntas: ahí va la compra y el stop fijo de la línea anterior."""
     usd = usd or ORDEN_USD
-    lim = round(entry * 1.003, 2)
-    qty = int(usd // lim) if lim > 0 else 0
-    if qty < 1:
+    limite = round(limite, 2)
+    qty = int(usd // limite) if limite > 0 else 0
+    if qty < 1 or not stop or stop >= entry:
         return ""
-    trail = round(entry - stop, 2)
-    return (f"\nIBKR · {qty} acc (~${qty * lim:,.0f}): BUY STP LMT {entry:.2f}/{lim:.2f} → hijas OCA: "
-            f"SELL TRAIL {trail:.2f} (el stop sube con el precio) + SELL LMT {t2:.2f} (+5%)")
+    trail = max(0.01, round(entry - stop, 2))
+    obj = round(t2 or entry * (1 + T2 / 100), 2)
+    compra = f"Stop Limit {gatillo:.2f} / {limite:.2f}" if gatillo else f"Limit {limite:.2f}"
+    return (f"\n📲 IBKR {qty} acc · {compra} + Trailing {trail:.2f} ({100 * trail / entry:.1f}%) + objetivo {obj:.2f}"
+            f" · riesgo ~${qty * trail:,.0f}")
 
 
 class TTLCache:
@@ -939,9 +945,9 @@ class Radar:
             self.tg(f"arm:{t}", (
                 f"🟡 ARMA {t} · {a['px']:.2f} ({(a['chg'] or 0):+.1f}%) · fuerza {a['score']}\n"
                 f"Gatillo: rompe {a['level']:.2f}. Orden: compra stop {a['entry']:.2f} (límite {a['entry'] * 1.003:.2f}) · "
-                f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
-                f"{a['reason']}.{orden_ibkr(t, a['entry'], a['stop'], (a.get('t2') or a['entry'] * 1.05))}\n"
-                f"Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla."))
+                f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}"
+                f"{orden_ibkr(a['entry'], a['stop'], a.get('t2'), a['entry'] * 1.003, gatillo=a['entry'])}\n"
+                f"{a['reason']}. Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla."))
             if t not in self.arms:
                 self.arms[t] = new_arm(t, a, day, f"{now_m // 60:02d}:{now_m % 60:02d}", now_m, cutoff)
             n += 1
@@ -1029,8 +1035,9 @@ class Radar:
                     continue
                 if p <= a["entry"] * 1.004:
                     msg = (f"⚡ {s} rompe {a['level']:.2f} ahora ({p:.2f}{', IBKR' if ib else ''}). Entrada ≤ "
-                           f"{a['entry'] * 1.003:.2f} · stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}\n"
-                           f"Confirma volumen en tu gráfico; el semáforo lo reevalúa ya.")
+                           f"{a['entry'] * 1.003:.2f} · stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}"
+                           f"{orden_ibkr(a['entry'], a['stop'], a.get('t2'), a['entry'] * 1.003)}\n"
+                           f"Si dejaste la orden del ARMA, ya está puesta. Confirma volumen; el semáforo lo reevalúa ya.")
                 else:
                     msg = (f"⚡ {s} rompió {a['level']:.2f} y ya va en {p:.2f}{' (IBKR)' if ib else ''}: no persigas. "
                            f"Si dejaste la orden armada, ya entraste; si no, espera el retesteo que marque el semáforo.")
@@ -1131,10 +1138,11 @@ class Radar:
                 how = f"orden LÍMITE {tr['entry']:.2f} válida hasta {vm // 60}:{vm % 60:02d} ET (no persigas {r['px']:.2f})"
             else:
                 how = f"a {tr['entry']:.2f}, no pagues más de {tr['entry'] * 1.003:.2f}"
+            lim_px = tr["entry"] if tr["limit"] else tr["entry"] * 1.003
             self.tg(f"buy:{r['t']}", (
-                f"🟢 COMPRA {r['t']} {how}\nFuerza {r['score']}/100 · {why}\n"
+                f"🟢 COMPRA {r['t']} {how}{orden_ibkr(tr['entry'], tr['stop'], tr['t2'], lim_px)}\n"
+                f"Fuerza {r['score']}/100 · {why}\n"
                 f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}{late}\n"
-                f"{orden_ibkr(r['t'], tr['entry'], tr['stop'], tr['t2']).lstrip(chr(10))}\n"
                 f"Para operarla dime: «ejecuta {r['t']} $monto, vender a +3%»"))
         for s, tr in self.trades.items():
             if tr["status"] not in ("pendiente", "abierta", "t1"):
