@@ -689,8 +689,8 @@ def test_bridge_break():
         r = runner.Radar(notify=False)
         r.trades, r.arms, r.sent = {}, {}, set()
         got, real_emit = [], r._emit
-        r._emit = lambda key, text, wait=True, private=False: (got.append((key, text, private)),
-                                                               real_emit(key, text, wait, private))
+        r._emit = lambda key, text, wait=True, private=False, markup=None: (got.append((key, text, private)),
+                                                                            real_emit(key, text, wait, private, markup))
         a = {"level": 50.0, "entry": 50.05, "stop": 49.55, "t1": 51.05, "t2": 52.55, "risk": 1.0, "score": 70,
              "px": 49.9, "chg": 6.0, "reason": "debajo del máximo de apertura"}
         r.armed = {"AAA": dict(a), "BBB": dict(a)}

@@ -25,7 +25,9 @@ from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMI
 from .decide import ALTO, RIESGO, RVOL_NEWS
 from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
 from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
+from .paper import Paper, boton, et_ts
 from .positions import Positions
+from .tgbot import TgIn
 
 UNIVERSE_N = int(os.environ.get("UNIVERSE_N", "50"))
 CYCLE_S = int(os.environ.get("CYCLE_S", "60"))
@@ -360,6 +362,8 @@ class Radar:
         self.trades: dict[str, dict] = {}
         self.arms: dict[str, dict] = {}   # compras stop de los avisos ARMA, seguidas como órdenes virtuales
         self.positions = Positions()  # posiciones reales que Priamo registra al ejecutar (avisos de caída y objetivo)
+        self.paper = Paper()          # órdenes en la cuenta paper de IBKR (botón ✅ Ejecutar / modo automático)
+        self.tgin = TgIn(self.paper)  # toques del botón y comandos que llegan por Telegram
         self.sent: set[str] = set()
         self.sent_day: str | None = None  # día al que pertenecen los avisos enviados (se vacían al cambiar de día)
         self.history: dict[str, list] = {}  # días anteriores (hasta HIST_DAYS) para que GitHub los guarde aunque se salte corridas
@@ -470,13 +474,53 @@ class Radar:
             self.sent.add(key)
             return True
 
-    def _emit(self, key: str, text: str, wait: bool = True, private: bool = False):
-        """private: el texto lleva un precio de IBKR (uso personal): al registro de Render va solo la clave."""
+    def _emit(self, key: str, text: str, wait: bool = True, private: bool = False, markup: dict | None = None):
+        """private: el texto lleva un precio de IBKR (uso personal): al registro de Render va solo la clave.
+        markup: botones de Telegram (el «✅ Ejecutar en paper» de los avisos)."""
         log.info("ALERTA %s", key if private else text.replace("\n", " | "))
+        fn, args = (self._send_markup, (text, markup)) if markup else (self._send, (text,))
         if wait:
-            self._send(text)
+            fn(*args)
         else:
-            threading.Thread(target=self._send, args=(text,), name="telegram", daemon=True).start()
+            threading.Thread(target=fn, args=args, name="telegram", daemon=True).start()
+
+    def _send_markup(self, text: str, markup: dict) -> bool:
+        """Como _send, con botones. Si Telegram rechaza los botones, manda el aviso igual, sin ellos."""
+        tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+        if not (self.notify and tok and chat):
+            return False
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              json={"chat_id": chat, "text": text, "disable_web_page_preview": True,
+                                    "reply_markup": markup}, timeout=15)
+            if r.status_code == 200:
+                self.tg_state = {"ok": True, "error": None, "ts": datetime.now(timezone.utc).isoformat()}
+                return True
+        except requests.RequestException:
+            pass
+        return self._send(text)
+
+    def _offer_txt(self, text: str, o: dict | None) -> tuple[str, dict | None]:
+        """Agrega al aviso lo que pasó con su orden paper (modo automático) o su botón (modo botón)."""
+        if not o:
+            return text, None
+        if o.get("nota"):
+            text += "\n" + o["nota"]
+        return text, boton(o)
+
+    def telegram_forever(self):
+        """Hilo: escucha Telegram (botón ✅ Ejecutar y comandos de paper). TELEGRAM_ENTRADA=0 lo apaga (si otro
+        programa leyera mensajes con el mismo bot, Telegram solo deja leer a uno: /health mostraría el error 409)."""
+        if self.notify and self.tgin.configured() and os.environ.get("TELEGRAM_ENTRADA", "1") != "0":
+            self.tgin.forever()
+
+    def on_paper(self, estado: dict, eventos: list) -> dict:
+        """El ejecutor paper de la PC (POST /api/paper/sync): aplica lo que pasó, avisa por Telegram (sin hacerlo
+        esperar) y le devuelve lo que tiene que hacer."""
+        res = self.paper.sync(estado, eventos)
+        for key, text in self.paper.tomar_msgs():
+            self.tg(key, text, wait=False, private=True)  # llevan precios de IBKR: al registro va solo la clave
+        return res
 
     def _send(self, text: str) -> bool:
         """Manda a Telegram y anota si llegó. Antes un rechazo de Telegram (token o chat equivocado) no dejaba rastro, y
@@ -940,14 +984,17 @@ class Radar:
             n = sum(1 for k in self.sent if k.startswith("arm:"))
         day = self.day.isoformat() if self.day else None
         for t, a in sorted(armed.items(), key=lambda kv: -kv[1]["score"]):
-            if n >= ARM_MAX or f"arm:{t}" in self.sent:
+            if n >= ARM_MAX or f"arm:{t}" in self.sent or not self._claim(f"arm:{t}"):
                 continue
-            self.tg(f"arm:{t}", (
-                f"🟡 ARMA {t} · {a['px']:.2f} ({(a['chg'] or 0):+.1f}%) · fuerza {a['score']}\n"
-                f"Gatillo: rompe {a['level']:.2f}. Orden: compra stop {a['entry']:.2f} (límite {a['entry'] * 1.003:.2f}) · "
-                f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}"
-                f"{orden_ibkr(a['entry'], a['stop'], a.get('t2'), a['entry'] * 1.003, gatillo=a['entry'])}\n"
-                f"{a['reason']}. Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla."))
+            text = (f"🟡 ARMA {t} · {a['px']:.2f} ({(a['chg'] or 0):+.1f}%) · fuerza {a['score']}\n"
+                    f"Gatillo: rompe {a['level']:.2f}. Orden: compra stop {a['entry']:.2f} (límite {a['entry'] * 1.003:.2f}) · "
+                    f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}"
+                    f"{orden_ibkr(a['entry'], a['stop'], a.get('t2'), a['entry'] * 1.003, gatillo=a['entry'])}\n"
+                    f"{a['reason']}. Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla.")
+            o = self.paper.ofrecer("arma", t, a["entry"], a["stop"], a.get("t2"), a["entry"] * 1.003,
+                                   gatillo=a["entry"], hasta=et_ts(time.time(), cutoff))
+            text, markup = self._offer_txt(text, o)
+            self._emit(f"arm:{t}", text, markup=markup)
             if t not in self.arms:
                 self.arms[t] = new_arm(t, a, day, f"{now_m // 60:02d}:{now_m % 60:02d}", now_m, cutoff)
             n += 1
@@ -976,6 +1023,9 @@ class Radar:
                            "expired": f"⌛ {s}: la compra stop {o['entry']:.2f} no se activó a tiempo. Cancélala."}.get(ev)
                     if msg:
                         self.tg(f"arm-fill:{s}" if ev == "fill" else f"arm-x:{s}", msg)
+                    if ev in ("invalid", "gap", "expired"):
+                        self.paper.cancelar_ticker(s, {"invalid": "perdió el stop sin romper", "gap": "saltó sobre el límite",
+                                                       "expired": "no se activó a tiempo"}[ev])
                 self._move_cursor(o, after)
             if o["status"] != "pendiente":
                 continue
@@ -986,9 +1036,11 @@ class Radar:
                     and not (r.get("px") and r["px"] >= o["entry"])):
                 o["status"], o["cancel"] = "cancelada", r["reason"]
                 self.tg(f"arm-x:{s}", f"❌ {s}: cancela la compra stop {o['entry']:.2f}. {r['reason']}.")
+                self.paper.cancelar_ticker(s, r["reason"])
             elif now_m >= (o.get("valid_m") or 10**9):
                 o["status"] = "no ejecutada"
                 self.tg(f"arm-x:{s}", f"⌛ {s}: la compra stop {o['entry']:.2f} no se activó a tiempo. Cancélala.")
+                self.paper.cancelar_ticker(s, "no se activó a tiempo")
 
     @staticmethod
     def _move_cursor(o: dict, after):
@@ -1033,22 +1085,26 @@ class Radar:
                 key = f"break:{s}:{a['level']:.2f}"
                 if not self._claim(key):
                     continue
+                markup = None
                 if p <= a["entry"] * 1.004:
                     msg = (f"⚡ {s} rompe {a['level']:.2f} ahora ({p:.2f}{', IBKR' if ib else ''}). Entrada ≤ "
                            f"{a['entry'] * 1.003:.2f} · stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}"
                            f"{orden_ibkr(a['entry'], a['stop'], a.get('t2'), a['entry'] * 1.003)}\n"
                            f"Si dejaste la orden del ARMA, ya está puesta. Confirma volumen; el semáforo lo reevalúa ya.")
+                    if self.paper.modo == "boton" and not self.paper.viva(s):  # en automático ya la puso el ARMA
+                        o = self.paper.ofrecer("ruptura", s, a["entry"], a["stop"], a.get("t2"), a["entry"] * 1.003)
+                        msg, markup = self._offer_txt(msg, o)
                 else:
                     msg = (f"⚡ {s} rompió {a['level']:.2f} y ya va en {p:.2f}{' (IBKR)' if ib else ''}: no persigas. "
                            f"Si dejaste la orden armada, ya entraste; si no, espera el retesteo que marque el semáforo.")
-                out.append((key, msg))
+                out.append((key, msg, markup))
                 self.breaks.setdefault(s, {"break_t": now.astimezone(ET).strftime("%H:%M:%S"), "break_src": src})
                 fired.append(s)
         if fired:
             self.wake.set()
         # El envío va fuera del candado: antes un aviso de Yahoo (hasta 15 s esperando a Telegram) frenaba al puente
-        for key, msg in out:
-            self._emit(key, msg, wait=not ib, private=ib)
+        for key, msg, markup in out:
+            self._emit(key, msg, wait=not ib, private=ib, markup=markup)
         return fired
 
     def fast_once(self, now: datetime | None = None) -> list[str]:
@@ -1139,11 +1195,17 @@ class Radar:
             else:
                 how = f"a {tr['entry']:.2f}, no pagues más de {tr['entry'] * 1.003:.2f}"
             lim_px = tr["entry"] if tr["limit"] else tr["entry"] * 1.003
-            self.tg(f"buy:{r['t']}", (
-                f"🟢 COMPRA {r['t']} {how}{orden_ibkr(tr['entry'], tr['stop'], tr['t2'], lim_px)}\n"
-                f"Fuerza {r['score']}/100 · {why}\n"
-                f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}{late}\n"
-                f"Para operarla dime: «ejecuta {r['t']} $monto, vender a +3%»"))
+            if not self._claim(f"buy:{r['t']}"):
+                continue
+            text = (f"🟢 COMPRA {r['t']} {how}{orden_ibkr(tr['entry'], tr['stop'], tr['t2'], lim_px)}\n"
+                    f"Fuerza {r['score']}/100 · {why}\n"
+                    f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}{late}")
+            hasta = et_ts(time.time(), tr["valid_m"]) if tr["limit"] and tr.get("valid_m") else None
+            o = self.paper.ofrecer("compra", r["t"], tr["entry"], tr["stop"], tr["t2"], lim_px, hasta=hasta)
+            if not o:
+                text += f"\nPara operarla dime: «ejecuta {r['t']} $monto, vender a +3%»"
+            text, markup = self._offer_txt(text, o)
+            self._emit(f"buy:{r['t']}", text, markup=markup)
         for s, tr in self.trades.items():
             if tr["status"] not in ("pendiente", "abierta", "t1"):
                 continue
@@ -1160,6 +1222,8 @@ class Radar:
                        "be": None}.get(ev)
                 if msg:
                     self.tg(f"{ev}:{s}", msg)
+                if ev == "expired":
+                    self.paper.cancelar_ticker(s, "la límite venció sin llenarse")
             self._move_cursor(tr, after)
             # Respaldo por reloj si no llegan velas; con margen por el retraso de Yahoo: la vela que la llenaba a tiempo
             # puede llegar 1–2 min después de vencer (el vencimiento exacto lo marca advance con la hora de cada vela)

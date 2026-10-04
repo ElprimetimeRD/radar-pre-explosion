@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=radar.fast_forever, name="vigia-rapido", daemon=True).start()
         threading.Thread(target=radar.context_forever, name="contexto", daemon=True).start()
         threading.Thread(target=keepalive.loop, name="keepalive", daemon=True).start()
+        threading.Thread(target=radar.telegram_forever, name="telegram-in", daemon=True).start()
     yield
 
 
@@ -126,12 +127,9 @@ class BridgeIn(BaseModel):
     info: dict | None = None                   # estado del programa (conexión con IBKR, último error)
 
 
-@app.post("/api/bridge")
-async def bridge_feed(request: Request, x_token: str | None = Header(default=None)):
-    """Puente IBKR (bridge/puente_ibkr.py en la PC de Priamo): recibe escáneres y precios al instante, avisa rupturas
-    y responde qué acciones vigilar. Exige BRIDGE_TOKEN; el cuerpo se lee solo después de validar la clave."""
-    _auth(x_token, "BRIDGE_TOKEN")
-    try:  # por la cabecera, antes de leer el cuerpo
+async def _body(request: Request) -> bytes:
+    """Cuerpo con tope de tamaño: primero por la cabecera, antes de leerlo."""
+    try:
         if int(request.headers.get("content-length") or 0) > BRIDGE_MAX:
             raise HTTPException(413, "cuerpo demasiado grande")
     except ValueError:
@@ -139,11 +137,40 @@ async def bridge_feed(request: Request, x_token: str | None = Header(default=Non
     raw = await request.body()
     if len(raw) > BRIDGE_MAX:
         raise HTTPException(413, "cuerpo demasiado grande")
+    return raw
+
+
+@app.post("/api/bridge")
+async def bridge_feed(request: Request, x_token: str | None = Header(default=None)):
+    """Puente IBKR (bridge/puente_ibkr.py en la PC de Priamo): recibe escáneres y precios al instante, avisa rupturas
+    y responde qué acciones vigilar. Exige BRIDGE_TOKEN; el cuerpo se lee solo después de validar la clave."""
+    _auth(x_token, "BRIDGE_TOKEN")
+    raw = await _body(request)
     try:
         b = BridgeIn.model_validate_json(raw or b"{}")
     except ValidationError as e:
         raise HTTPException(422, str(e)[:300])
     return clean(await run_in_threadpool(radar.on_bridge, b.scan, b.quotes, b.info))
+
+
+class PaperIn(BaseModel):
+    v: int = 1
+    estado: dict | None = None      # conexión, cuenta paper, dinero comprometido, P/L del día, posiciones
+    eventos: list[dict] | None = None  # lo que pasó desde la última vez: puesta, llena, salida, rechazada…
+
+
+@app.post("/api/paper/sync")
+async def paper_sync(request: Request, x_token: str | None = Header(default=None)):
+    """Ejecutor paper (bridge/ejecutor_paper.py en la PC de Priamo, solo IB Gateway paper): manda su estado y lo que
+    pasó; recibe las órdenes que Priamo tocó con ✅ Ejecutar (o todas, en modo automático), las cancelaciones, el
+    /cerrar y los límites. Exige BRIDGE_TOKEN."""
+    _auth(x_token, "BRIDGE_TOKEN")
+    raw = await _body(request)
+    try:
+        b = PaperIn.model_validate_json(raw or b"{}")
+    except ValidationError as e:
+        raise HTTPException(422, str(e)[:300])
+    return clean(await run_in_threadpool(radar.on_paper, b.estado or {}, b.eventos or []))
 
 
 @app.get("/health")
@@ -157,7 +184,9 @@ def health():
                                                   "halts_age_s": round(time.time() - radar.halts_ts) if radar.halts_ts else None},
             "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB}, "bridge": radar.bridge.status(),
             "telegram": {"configured": bool(radar.notify and os.environ.get("TELEGRAM_BOT_TOKEN")
-                                            and os.environ.get("TELEGRAM_CHAT_ID")), **radar.tg_state},
+                                            and os.environ.get("TELEGRAM_CHAT_ID")), **radar.tg_state,
+                         "entrada": radar.tgin.state},
+            "paper": radar.paper.status(),
             "now": datetime.now(timezone.utc).isoformat()})
 
 
