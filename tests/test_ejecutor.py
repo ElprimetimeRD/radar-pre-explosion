@@ -487,6 +487,15 @@ def test_rechazos():
     m = {e["id"]: e for e in evs(posted)}
     assert "fondos insuficientes" in m["00000001"]["motivo"] and "<br>" not in m["00000001"]["motivo"]
     assert "stop" in m["00000003"]["motivo"]
+    # IB Gateway en solo lectura (IBC lo vuelve a marcar al entrar): la orden se da por rechazada y se dice por qué
+    exr, ibr, cr, pr, rr = nuevo()
+    rr["r"] = {"ordenes": [orden()]}
+    exr.paso()
+    ibr.error(exr.ord["a1b2c3d4"]["oids"]["e"], 321,
+              "Error validating request.-'bW' : cause - The API interface is currently in Read-Only mode.")
+    vuelta(exr, cr, rr)
+    vuelta(exr, cr, rr)
+    assert exr.ord["a1b2c3d4"]["estado"] == "rechazada" and "Read-Only API" in evs(pr, "rechazada")[0]["motivo"]
     # hija rechazada después de comprar → vende la posición (sin esperar dentro del manejador)
     ex, ib, clock, posted, resp = nuevo()
     resp["r"] = {"ordenes": [orden()]}

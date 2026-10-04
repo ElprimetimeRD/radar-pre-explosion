@@ -653,7 +653,11 @@ class Ejecutor:
             o = self.ord.get(oid)
             if not o:
                 continue
-            if not (code in (201, 203) or "reject" in txt.lower()):
+            solo_lectura = "read-only" in txt.lower() or "read only" in txt.lower()
+            if solo_lectura and rol == "e":
+                txt = ("IB Gateway paper está en solo lectura: desmarca «Read-Only API» en Configure → Settings → API → "
+                       "Settings (o vuelve a abrir ARRANCAR_PAPER.bat)")
+            if not (code in (201, 203) or "reject" in txt.lower() or solo_lectura):
                 if (oid, code) not in self.errores_vistos:
                     self.errores_vistos.add((oid, code))
                     log.warning("IBKR %s sobre %s (%s): %s", code, o["t"], rol, txt)
