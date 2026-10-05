@@ -763,6 +763,69 @@ def test_una_sola_copia():
         assert c5 is None and otro5 is False, (saludo, c5, otro5)
 
 
+def test_windows_bloquea_archivos():
+    """En Windows, el diario abierto en Excel no deja añadirle filas y el estado puede fallar un instante al reemplazarse. Ninguna fila se
+    pierde (esperan y entran todas, en orden, sin repetir la cabecera, cuando se libera) y el estado se guarda al reintentar."""
+    import csv
+    import json
+    import logging
+    ex, ib, clock, posted, resp = nuevo()
+    ex.diario = tempfile.mktemp(suffix=".csv")
+    avisos = []
+
+    class Cap(logging.Handler):
+        def emit(self, rec):
+            avisos.append(rec.getMessage())
+    cap = Cap(level=logging.WARNING)
+    E.log.addHandler(cap)
+    real_open = open
+
+    def excel(path, *a, **kw):                                           # el CSV está abierto en Excel: Windows no deja añadir
+        if str(path) == ex.diario:
+            raise PermissionError(13, "Permission denied", path)
+        return real_open(path, *a, **kw)
+    try:
+        E.open = excel
+        ex.diario_fila("cancelada", orden("11111111", "AAA"), {"motivo": "venció sin activarse"})
+        ex.diario_fila("cancelada", orden("22222222", "BBB"), {"motivo": "venció sin activarse"})
+        ex.diario_vaciar()                                               # sigue bloqueado: no pierde nada ni repite el aviso
+        assert len(ex.diario_pend) == 2 and not os.path.exists(ex.diario)
+        assert len([a for a in avisos if "diario" in a]) == 1, avisos      # un solo aviso, no uno por vuelta
+        ex.salir()                                                       # si se cierra el programa así, las filas quedan en el registro
+        assert len([a for a in avisos if "sin escribir" in a]) == 2 and any("AAA" in a for a in avisos), avisos
+        del E.open                                                       # Excel se cerró: en la siguiente vuelta entran las dos
+        vuelta(ex, clock, resp)
+        assert ex.diario_pend == [] and ex.diario_aviso is False
+        ex.diario_fila("cancelada", orden("33333333", "CCC"), {"motivo": "venció sin activarse"})   # y las siguientes, directas
+        with real_open(ex.diario, encoding="utf-8", newline="") as f:
+            filas = list(csv.DictReader(f))
+        assert [r["simbolo"] for r in filas] == ["AAA", "BBB", "CCC"], filas   # en orden, y una sola cabecera
+        # el estado: un bloqueo momentáneo del reemplazo se supera reintentando
+        real_replace, sleep, n = E.os.replace, E.time.sleep, {"n": 0}
+
+        def replace_flojo(a, b):
+            n["n"] += 1
+            if n["n"] <= 2:
+                raise PermissionError(5, "Access is denied")             # WinError 5
+            return real_replace(a, b)
+        E.os.replace, E.time.sleep = replace_flojo, lambda s: None
+        try:
+            ex.pausa = True
+            ex.guardar()
+            assert n["n"] == 3
+            with real_open(ex.path, encoding="utf-8") as f:
+                assert json.load(f)["pausa"] is True                     # quedó guardado, pese a los dos bloqueos
+            n["n"] = -100                                                # bloqueado todo el rato: se rinde sin lanzar nada
+            avisos.clear()
+            ex.guardar()
+            assert n["n"] == -96 and any("No pude guardar" in a for a in avisos), (n, avisos)
+        finally:
+            E.os.replace, E.time.sleep = real_replace, sleep
+    finally:
+        E.log.removeHandler(cap)
+        E.__dict__.pop("open", None)
+
+
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -794,5 +857,6 @@ if __name__ == "__main__":
     test_el_corte_de_conexion_no_mata_el_bucle()
     test_el_error_real_de_ib_async()
     test_una_sola_copia()
+    test_windows_bloquea_archivos()
     test_hora_et()
     print("OK · ejecutor paper")

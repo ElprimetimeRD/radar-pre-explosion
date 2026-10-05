@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import csv
 import datetime as dt
+import io
 import json
 import logging
 import logging.handlers
@@ -54,7 +55,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.4"
+VERSION = "1.5"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -203,6 +204,8 @@ class Ejecutor:
         self.errores_vistos: set[tuple[str, int]] = set()
         self._vivas: set[int] | None = None    # orderIds que IBKR dice abiertos (se pide solo si hace falta)
         self._hooked = False
+        self.diario_pend: list[list] = []      # filas del diario que aún no entraron al CSV (p. ej. lo tienes abierto en Excel)
+        self.diario_aviso = False
         self.cargar()
 
     # ---------------- estado del día (sobrevive reinicios del programa) ----------------
@@ -226,15 +229,23 @@ class Ejecutor:
                     self.por_oid[int(n)] = MUERTA
 
     def guardar(self):
+        """Guarda el estado (archivo temporal y reemplazo). En Windows el reemplazo falla un instante («Acceso denegado») si otro
+        programa tiene el archivo abierto (antivirus, indexador, alguien leyéndolo): se reintenta unas décimas de segundo."""
         tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"dia": self.dia, "ord": self.ord, "cerrar_visto": self.cerrar_visto, "pausa": self.pausa,
-                           "modo": self.modo, "cerrado_hoy": self.cerrado_hoy, "parado": self.parado}, f,
-                          ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            log.warning("No pude guardar %s: %s", self.path, e)
+        for intento in range(4):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"dia": self.dia, "ord": self.ord, "cerrar_visto": self.cerrar_visto, "pausa": self.pausa,
+                               "modo": self.modo, "cerrado_hoy": self.cerrado_hoy, "parado": self.parado}, f,
+                              ensure_ascii=False)
+                os.replace(tmp, self.path)
+                return
+            except OSError as e:
+                if isinstance(e, PermissionError) and intento < 3:
+                    time.sleep(0.1)
+                    continue
+                log.warning("No pude guardar %s: %s", self.path, e)
+                return
 
     def nuevo_dia(self, dia: str):
         if self.dia and self.dia != dia and any(abs(self.abierta(o)) > EPS or o["estado"] in ("puesta", "cancelando")
@@ -431,14 +442,36 @@ class Ejecutor:
                     kw.get("px") or "", "" if pnl is None else pnl, round(com, 2) if com else "",
                     round(riesgo, 2) if riesgo else "", round(pnl / riesgo, 2) if (pnl is not None and riesgo) else "",
                     kw.get("por") or "", o.get("setup") or o.get("tipo") or "", kw.get("motivo") or ""]
-            nuevo = not os.path.exists(self.diario)
-            with open(self.diario, "a", encoding="utf-8", newline="") as f:
-                w = csv.writer(f)
-                if nuevo:
-                    w.writerow(DIARIO_COLS)
-                w.writerow(fila)
         except Exception as e:  # noqa: BLE001
-            log.warning("No pude escribir el diario %s: %s", self.diario, e)
+            log.warning("No pude armar la fila del diario %s: %s", self.diario, e)
+            return
+        self.diario_pend.append(fila)
+        self.diario_vaciar()
+
+    def diario_vaciar(self):
+        """Escribe en el CSV las filas que esperan. En Windows, mientras el CSV está abierto en Excel el archivo queda bloqueado y no
+        se le puede añadir nada: las filas esperan en memoria, se reintentan en cada vuelta y entran todas, en orden, en cuanto se
+        cierra Excel. Nunca debe estorbar a las órdenes: un fallo solo se anota (una vez)."""
+        if not self.diario_pend:
+            return
+        try:
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            if not os.path.exists(self.diario):
+                w.writerow(DIARIO_COLS)
+            w.writerows(self.diario_pend)
+            with open(self.diario, "a", encoding="utf-8", newline="") as f:
+                f.write(buf.getvalue())
+        except Exception as e:  # noqa: BLE001
+            if not self.diario_aviso:
+                self.diario_aviso = True
+                log.warning("No pude escribir el diario %s (¿lo tienes abierto en Excel? ciérralo): %s. %d fila(s) esperan y se "
+                            "reintentan solas.", self.diario, e, len(self.diario_pend))
+            return
+        if self.diario_aviso:
+            log.info("Diario %s al día otra vez (%d fila(s) que esperaban).", self.diario, len(self.diario_pend))
+        self.diario_pend.clear()
+        self.diario_aviso = False
 
     @staticmethod
     def detalle(o: dict) -> str:
@@ -803,6 +836,8 @@ class Ejecutor:
         dia = t.date().isoformat()
         if dia != self.dia:
             self.nuevo_dia(dia)
+        if self.diario_pend:
+            self.diario_vaciar()   # filas que no pudieron entrar al CSV (abierto en Excel): se reintentan en cada vuelta
         despierto = t.weekday() < 5 and 8 * 60 + 30 <= m < 16 * 60 + 30
         if despierto != self._despierto:   # Windows no se duerme mientras el mercado está abierto (y la PC está prendida)
             self._despierto = despierto
@@ -909,7 +944,10 @@ class Ejecutor:
 
     def salir(self):
         """Al cerrar el programa: cancela las compras que aún no se llenaron (nadie las vigilaría). Lo comprado queda
-        en IBKR con su stop y su objetivo hasta las 16:00."""
+        en IBKR con su stop y su objetivo hasta las 16:00. Si el diario sigue bloqueado, sus filas pendientes quedan en el registro."""
+        self.diario_vaciar()
+        for fila in self.diario_pend:
+            log.warning("Fila del diario sin escribir (el CSV seguía bloqueado): %s", ",".join(str(x) for x in fila))
         if not self.ib.isConnected():
             return
         for o in list(self.ord.values()):

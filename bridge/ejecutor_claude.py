@@ -36,7 +36,7 @@ import estrategia_claude as S  # noqa: E402
 from datos_yahoo import Feed  # noqa: E402
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.2"
+VERSION = "1.3"
 LOG_FILE = os.path.join(HERE, "ejecutor_claude.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_claude.json")
 LISTA_FILE = os.path.join(HERE, "lista_claude.txt")

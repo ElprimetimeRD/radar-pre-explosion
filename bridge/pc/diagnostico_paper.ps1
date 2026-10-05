@@ -32,7 +32,8 @@ foreach ($p in $todos) {
   }
 }
 if ($n -eq 0) { Add-Linea "   (ninguno)" }
-Add-Linea "   Lo normal: 1 IB Gateway, 1 ejecutor PAPER (programa + ventana) y 1 ejecutor CLAUDE (programa + ventana). Si hay mas, hay duplicados."
+Add-Linea "   Lo normal: 1 IB Gateway y, de cada ejecutor, 1 ventana de reinicio y 1 o 2 lineas de programa (el lanzador py y Python salen por separado: es una sola copia)."
+Add-Linea "   Duplicado = 2 ventanas de reinicio del mismo ejecutor, o 3 o mas lineas de programa del mismo."
 Add-Linea ""
 
 # 2) Puertos de IB Gateway
@@ -94,7 +95,10 @@ function Valor([string]$sub, [string]$set) {
   return ("enchufada={0} bateria={1}" -f (& $f $ac), (& $f $dc))
 }
 Add-Linea ("   Suspender tras (segundos, 0 = nunca): " + (Valor 'SUB_SLEEP' 'STANDBYIDLE'))
-Add-Linea ("   Al cerrar la tapa (0 nada, 1 suspender, 2 hibernar, 3 apagar): " + (Valor 'SUB_BUTTONS' 'LIDACTION'))
+$tapa = Valor 'SUB_BUTTONS' 'LIDACTION'
+if ($tapa -match '\?') { $tapa = Valor '4f971e89-eebd-4455-a8de-9e59040e7347' '5ca83367-6e45-459f-a27b-476b1d01c936' }
+if ($tapa -match '\?') { $tapa = $tapa + '  (no se pudo leer: miralo en Panel de control > Opciones de energia > Elegir el comportamiento del cierre de la tapa)' }
+Add-Linea ("   Al cerrar la tapa (0 nada, 1 suspender, 2 hibernar, 3 apagar): " + $tapa)
 Add-Linea "   (Mientras un ejecutor esta abierto en horario de mercado, el programa pide a Windows que no se duerma; cerrar la tapa si puede suspenderla.)"
 Add-Linea ""
 
