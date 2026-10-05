@@ -43,6 +43,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 
 try:
@@ -920,26 +921,76 @@ class Ejecutor:
                         "15:55 ET para que las cierre, o ciérralas tú.", ", ".join(abiertas))
 
 
-def tomar_cerrojo(puerto: int):
-    """Una sola copia de cada ejecutor: reserva un puerto local (solo 127.0.0.1) mientras el programa viva; el sistema lo
-    libera solo si el programa se cierra o se cae. Devuelve (socket, hay_otro):
-      (socket, False)  el puerto es nuestro (hay que conservar el socket hasta salir);
-      (None, True)     no se pudo reservar Y alguien contesta en ese puerto: ya hay otra copia abierta;
-      (None, False)    no se pudo reservar pero nadie contesta (puerto bloqueado por el sistema): se sigue sin este
-                       seguro, porque un seguro roto no debe dejar al ejecutor sin arrancar."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+SALUDO = b"radar-ejecutor-"   # lo primero que contesta la copia abierta a quien se conecte a su puerto del cerrojo
+
+
+class Cerrojo:
+    """Puerto local (solo 127.0.0.1) reservado mientras el programa viva. Contesta con un saludo a quien se conecte, para que otra
+    copia sepa que ahí hay un ejecutor y no un programa cualquiera. Se libera con close(), o solo si el programa se cierra o se cae."""
+
+    def __init__(self, sock, nombre: str):
+        self.sock, self.vivo = sock, True
+        self.saludo = SALUDO + nombre.encode("ascii", "ignore") + b"\n"
+        sock.settimeout(1.0)
+        self.hilo = threading.Thread(target=self._atender, name="cerrojo", daemon=True)
+        self.hilo.start()
+
+    def _atender(self):
+        while self.vivo:
+            try:
+                c, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                c.sendall(self.saludo)
+                c.settimeout(2.0)
+                c.recv(16)               # espera a que el otro cuelgue primero: así el TIME_WAIT queda de su lado y no en nuestro puerto
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    def close(self):
+        self.vivo = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)       # despierta el accept() en Linux (en Windows da error y no hace falta)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.hilo.join(1.5)                            # al volver, el puerto ya está libre
+
+
+def tomar_cerrojo(puerto: int, nombre: str = "ejecutor"):
+    """Una sola copia de cada ejecutor: reserva un puerto local mientras el programa viva. Devuelve (cerrojo, hay_otro):
+      (Cerrojo, False)  el puerto es nuestro (hay que conservar el cerrojo hasta salir);
+      (None, True)      no se pudo reservar y quien contesta en ese puerto es otra copia de un ejecutor: ya hay otro abierto;
+      (None, False)     no se pudo reservar y no es otra copia (puerto bloqueado por el sistema o usado por otro programa):
+                        se sigue sin este seguro, porque un seguro roto no debe dejar al ejecutor sin arrancar."""
     try:
-        if not hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # en Linux/Mac hace falta para reabrir justo tras cerrar; en Windows NO (dejaría compartir el puerto)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except Exception:  # noqa: BLE001
+        return None, False
+    try:
+        if not hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # Linux/Mac: hace falta para reabrir justo tras cerrar; en Windows NO (dejaría compartir el puerto)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", puerto))
-        s.listen(1)
-        return s, False
-    except OSError:
-        s.close()
-    try:                                                   # ¿contesta alguien en ese puerto?
-        with socket.create_connection(("127.0.0.1", puerto), timeout=2):
-            return None, True
-    except OSError:
+        s.listen(5)
+        return Cerrojo(s, nombre), False
+    except Exception:  # noqa: BLE001
+        try:
+            s.close()
+        except Exception:  # noqa: BLE001
+            pass
+    try:                                                   # no se pudo reservar: ¿quién contesta ahí?
+        with socket.create_connection(("127.0.0.1", puerto), timeout=2) as c:
+            c.settimeout(2)
+            return None, c.recv(64).startswith(SALUDO)
+    except Exception:  # noqa: BLE001
         return None, False
 
 
@@ -1004,7 +1055,7 @@ def main(argv=None):
     if IB is None:
         print("Falta la librería de IBKR. Instálala con:  py -m pip install -r requirements.txt")
         return 2
-    cerrojo, hay_otro = tomar_cerrojo(LOCK_PORT)
+    cerrojo, hay_otro = tomar_cerrojo(LOCK_PORT, "paper")
     if hay_otro:
         return ya_hay_otro(LOCK_PORT, "ejecutor paper")
     if cerrojo is None:

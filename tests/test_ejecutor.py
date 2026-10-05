@@ -5,6 +5,8 @@ import copy
 import os
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace as NS
 from zoneinfo import ZoneInfo
@@ -704,20 +706,22 @@ def _puerto_libre():
 
 
 def test_una_sola_copia():
-    """El cerrojo (puerto local): la primera copia lo toma, la segunda ve que ya hay otra, y al cerrar la primera se libera.
-    Si el puerto no se puede reservar y NADIE contesta (p. ej. bloqueado por el sistema), se sigue sin el seguro: un seguro
-    roto no debe dejar al ejecutor sin arrancar."""
+    """El cerrojo (puerto local): la primera copia lo toma y saluda a quien se conecte, la segunda ve que ya hay otra, y al cerrar
+    la primera se libera. Si el puerto no se puede reservar y quien contesta NO es otro ejecutor (nadie, o un programa cualquiera),
+    se sigue sin el seguro: un seguro roto no debe dejar al ejecutor sin arrancar."""
     import socket
     p = _puerto_libre()
-    s1, otro1 = E.tomar_cerrojo(p)
-    assert s1 is not None and otro1 is False
-    s2, otro2 = E.tomar_cerrojo(p)
-    assert s2 is None and otro2 is True                                   # ya hay otra copia
+    c1, otro1 = E.tomar_cerrojo(p, "paper")
+    assert isinstance(c1, E.Cerrojo) and otro1 is False
+    c2, otro2 = E.tomar_cerrojo(p, "paper")
+    assert c2 is None and otro2 is True                                   # ya hay otra copia
     assert E.ya_hay_otro(p, "ejecutor de prueba") == 3                    # y su código de salida es 3
-    s1.close()
-    s3, otro3 = E.tomar_cerrojo(p)                                        # liberado: se puede volver a tomar (reinicio)
-    assert s3 is not None and otro3 is False
-    s3.close()
+    t0 = time.time()
+    c1.close()
+    assert time.time() - t0 < 1.4                                         # cerrar no se queda esperando
+    c3, otro3 = E.tomar_cerrojo(p, "paper")                               # liberado: se puede volver a tomar (reinicio)
+    assert c3 is not None and otro3 is False
+    c3.close()
     # puerto que el sistema no deja reservar, sin nadie escuchando: no es "otra copia"
     p4 = _puerto_libre()
     real = E.socket.socket
@@ -727,19 +731,36 @@ def test_una_sola_copia():
             raise PermissionError(13, "acceso denegado")
     E.socket.socket = Bloqueado
     try:
-        s4, otro4 = E.tomar_cerrojo(p4)
+        c4, otro4 = E.tomar_cerrojo(p4)
     finally:
         E.socket.socket = real
-    assert s4 is None and otro4 is False
-    # puerto ocupado por un programa cualquiera que sí contesta: se trata como "ya hay otra copia" (se cierra, no se pelea)
-    ajeno = socket.socket()
-    ajeno.bind(("127.0.0.1", 0))
-    ajeno.listen(1)
-    try:
-        s5, otro5 = E.tomar_cerrojo(ajeno.getsockname()[1])
-    finally:
-        ajeno.close()
-    assert s5 is None and otro5 is True
+    assert c4 is None and otro4 is False
+    # puerto ocupado por un programa cualquiera (calla o contesta otra cosa): no es un ejecutor, se sigue sin el seguro
+    for saludo in (None, b"HTTP/1.1 400 Bad Request\r\n"):
+        ajeno = socket.socket()
+        ajeno.bind(("127.0.0.1", 0))
+        ajeno.listen(5)
+        parar = []
+
+        def servir(srv=ajeno, msg=saludo):
+            srv.settimeout(0.3)
+            while not parar:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    continue
+                if msg:
+                    c.sendall(msg)
+                c.close()
+        th = threading.Thread(target=servir, daemon=True)
+        th.start()
+        try:
+            c5, otro5 = E.tomar_cerrojo(ajeno.getsockname()[1])
+        finally:
+            parar.append(1)
+            th.join(2)
+            ajeno.close()
+        assert c5 is None and otro5 is False, (saludo, c5, otro5)
 
 
 def test_hora_et():

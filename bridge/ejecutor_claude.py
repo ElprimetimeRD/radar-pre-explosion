@@ -240,7 +240,7 @@ def main(argv=None):
     if E.IB is None:
         print("Falta la librería de IBKR. Instálala con:  py -m pip install -r requirements.txt")
         return 2
-    cerrojo, hay_otro = E.tomar_cerrojo(LOCK_PORT)
+    cerrojo, hay_otro = E.tomar_cerrojo(LOCK_PORT, "claude")
     if hay_otro:
         return E.ya_hay_otro(LOCK_PORT, "ejecutor de Claude")
     if cerrojo is None:
