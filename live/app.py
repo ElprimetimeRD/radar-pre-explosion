@@ -173,6 +173,20 @@ async def paper_sync(request: Request, x_token: str | None = Header(default=None
     return clean(await run_in_threadpool(radar.on_paper, b.estado or {}, b.eventos or []))
 
 
+@app.post("/api/claude/sync")
+async def claude_sync(request: Request, x_token: str | None = Header(default=None)):
+    """Ejecutor paralelo de Claude (bridge/ejecutor_claude.py en la PC de Priamo, misma cuenta paper): manda su estado y
+    lo que pasó; recibe la pausa, el /cerrar y los límites que comparte con el ejecutor de Priamo. No recibe órdenes: decide
+    solo. Exige BRIDGE_TOKEN."""
+    _auth(x_token, "BRIDGE_TOKEN")
+    raw = await _body(request)
+    try:
+        b = PaperIn.model_validate_json(raw or b"{}")
+    except ValidationError as e:
+        raise HTTPException(422, str(e)[:300])
+    return clean(await run_in_threadpool(radar.on_claude, b.estado or {}, b.eventos or []))
+
+
 @app.get("/health")
 def health():
     ts = radar.snapshot.get("ts")
@@ -186,7 +200,7 @@ def health():
             "telegram": {"configured": bool(radar.notify and os.environ.get("TELEGRAM_BOT_TOKEN")
                                             and os.environ.get("TELEGRAM_CHAT_ID")), **radar.tg_state,
                          "entrada": radar.tgin.state},
-            "paper": radar.paper.status(),
+            "paper": radar.paper.status(), "claude": radar.claude.status(),
             "now": datetime.now(timezone.utc).isoformat()})
 
 

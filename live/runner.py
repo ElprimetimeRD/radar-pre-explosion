@@ -21,6 +21,7 @@ from scanner.util import DATA, ET, fnum, log, read_json, write_json
 from . import halts as halts_src
 from . import memory
 from .bridge import Bridge
+from .claude_paper import FERIADOS, ClaudePaper
 from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMIT_MIN, RISK_MAX, T2, decide, regime
 from .decide import ALTO, RIESGO, RVOL_NEWS
 from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
@@ -363,7 +364,9 @@ class Radar:
         self.arms: dict[str, dict] = {}   # compras stop de los avisos ARMA, seguidas como órdenes virtuales
         self.positions = Positions()  # posiciones reales que Priamo registra al ejecutar (avisos de caída y objetivo)
         self.paper = Paper()          # órdenes en la cuenta paper de IBKR (botón ✅ Ejecutar / modo automático)
-        self.tgin = TgIn(self.paper)  # toques del botón y comandos que llegan por Telegram
+        self.claude = ClaudePaper(self.paper)  # el ejecutor paralelo de Claude: misma cuenta paper, otra estrategia
+        self.tgin = TgIn(self.paper, claude=self.claude)  # toques del botón y comandos que llegan por Telegram
+        self.t_arranque = time.time()
         self.sent: set[str] = set()
         self.sent_day: str | None = None  # día al que pertenecen los avisos enviados (se vacían al cambiar de día)
         self.history: dict[str, list] = {}  # días anteriores (hasta HIST_DAYS) para que GitHub los guarde aunque se salte corridas
@@ -521,6 +524,26 @@ class Radar:
         for key, text in self.paper.tomar_msgs():
             self.tg(key, text, wait=False, private=True)  # llevan precios de IBKR: al registro va solo la clave
         return res
+
+    def on_claude(self, estado: dict, eventos: list) -> dict:
+        """El ejecutor de Claude (POST /api/claude/sync): aplica lo que pasó, avisa por Telegram como «🤖 Claude» y le
+        devuelve la pausa, el /cerrar y los límites que comparte con el ejecutor de Priamo."""
+        res = self.claude.sync(estado, eventos, dia=datetime.fromtimestamp(time.time(), ET).date().isoformat())
+        for key, text in self.claude.tomar_msgs():
+            self.tg(key, text, wait=False, private=True)
+        return res
+
+    def vigilar_ejecutores(self):
+        """Después de cada ciclo: avisa si un ejecutor se cae en horario de mercado y, a las 16:10 ET, manda el marcador
+        del día (Priamo contra Claude)."""
+        now = time.time()
+        t = datetime.fromtimestamp(now, ET)
+        hoy, minuto = t.date().isoformat(), t.hour * 60 + t.minute
+        laborable = t.weekday() < 5 and hoy not in FERIADOS
+        for key, text in self.claude.vigilar(now, hoy, minuto, laborable, now - self.t_arranque):
+            self.tg(key, text, wait=False, private=True)
+        if laborable and 16 * 60 + 10 <= minuto < 18 * 60 and self.claude.actividad():
+            self.tg(f"marcador:{hoy}", self.claude.marcador(now), wait=False, private=True)
 
     def _send(self, text: str) -> bool:
         """Manda a Telegram y anota si llegó. Antes un rechazo de Telegram (token o chat equivocado) no dejaba rastro, y
@@ -1403,6 +1426,10 @@ class Radar:
                 self.after_cycle()
             except Exception as e:  # noqa: BLE001
                 log.warning("memoria: %s", e)
+            try:
+                self.vigilar_ejecutores()
+            except Exception as e:  # noqa: BLE001
+                log.warning("vigilancia de ejecutores: %s", e)
             phase = self.snapshot.get("phase") or phase_of(datetime.now(timezone.utc))
             wait = CYCLE_S if phase in ("open", "late") else 180 if phase == "pre" else 300
             # Espera su turno, salvo que el vigía rápido vea romper una acción armada: entonces corre ya.

@@ -1,5 +1,5 @@
 """Telegram de entrada: los toques del botón «✅ Ejecutar en paper» y los comandos (/estado, /pausa, /reanuda,
-/cerrar, /auto, /boton). Lee con long polling (getUpdates): Telegram responde en cuanto llega algo, sin webhook ni
+/cerrar, /auto, /boton, y /claude y /marcador del ejecutor paralelo de Claude). Lee con long polling (getUpdates): Telegram responde en cuanto llega algo, sin webhook ni
 dirección pública. Solo atiende al chat de TELEGRAM_CHAT_ID; el token nunca va al registro."""
 from __future__ import annotations
 
@@ -15,8 +15,9 @@ VIEJO_S = 120   # comandos más viejos que esto (p. ej. escritos mientras el ser
 
 class TgIn:
     def __init__(self, paper, token: str | None = None, chat_id: str | None = None, http=None, clock=time.time,
-                 user_id: str | None = None):
+                 user_id: str | None = None, claude=None):
         self.paper = paper
+        self.claude = claude    # live/claude_paper.py: /claude y /marcador (None = no existen)
         self.token = token or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
         self.chat = str(chat_id or os.environ.get("TELEGRAM_CHAT_ID") or "")
         # Quién puede mandar: TELEGRAM_USER_ID si está; si no, en un chat privado el propio chat (es tu usuario). En un
@@ -142,5 +143,10 @@ class TgIn:
         cmd = text.split()[0].split("@")[0]
         if cmd.lower() == "/start":
             cmd = "/ayuda"
-        txt, markup = self.paper.comando(cmd)
+        if self.claude and cmd.lower() == "/claude":
+            txt, markup = self.claude.estado_txt(), None
+        elif self.claude and cmd.lower() == "/marcador":
+            txt, markup = self.claude.marcador(), None
+        else:
+            txt, markup = self.paper.comando(cmd)
         self.send(txt, markup)

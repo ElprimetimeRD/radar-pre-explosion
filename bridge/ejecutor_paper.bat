@@ -1,8 +1,4 @@
 @echo off
-rem Ejecutor de ordenes en la cuenta PAPER de IBKR (dinero simulado). Solo IB Gateway paper (puerto 4002, cuentas DU).
-rem Abrelo despues de ARRANCAR_PAPER.bat y dejalo abierto. Ctrl+C para detenerlo.
-cd /d "%~dp0"
-set PY=python
-where py >nul 2>nul && set PY=py -3
-%PY% ejecutor_paper.py
-pause
+rem Atajo: abre SOLO tu ejecutor de ordenes en paper (con reinicio automatico si se cae). Lo normal es usar
+rem ARRANCAR_PAPER.bat, que abre IB Gateway paper y los dos ejecutores (el tuyo y el de Claude).
+call "%~dp0ejecutor.bat" paper
