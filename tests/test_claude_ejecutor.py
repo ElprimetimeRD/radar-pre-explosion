@@ -175,7 +175,13 @@ def test_sin_contacto_pausa_y_horario():
     ex3, ib3, c3, p3, r3, f3 = nuevo()
     f3.activo = False                                                         # Yahoo sin datos
     ex3.paso()
-    assert ib3.placed == []
+    assert ib3.placed == [] and ex3.ult_sin_datos == c3.t                      # y lo deja en el registro...
+    c3.t += 60
+    ex3.paso()
+    assert ex3.ult_sin_datos == c3.t - 60                                     # ...una vez cada 5 minutos
+    c3.t += 300
+    ex3.paso()
+    assert ex3.ult_sin_datos == c3.t and ib3.placed == []
     for h, m_ in ((9, 40), (15, 20)):                                         # fuera de 9:50–15:15
         ex4, ib4, c4, p4, r4, f4 = nuevo(now=at(h, m_))
         ex4.paso()

@@ -549,6 +549,151 @@ def test_red_y_reinicio():
     assert ex6.pausa is True and ex6.modo == "auto"
 
 
+class IBCaido(FakeIB):
+    """IB Gateway reiniciándose: rechaza las conexiones las primeras `fallar` veces."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.fallar = 0
+
+    def connect(self, host, port, clientId, timeout):
+        if self.fallar > 0:
+            self.fallar -= 1
+            raise ConnectionRefusedError("IB Gateway no contesta")
+        super().connect(host, port, clientId, timeout)
+
+
+def test_reconexion_tras_reinicio_del_gateway():
+    """El Gateway se reinicia solo cada noche (23:30). El ejecutor debe reconectar solo y seguir con lo suyo."""
+    ib = IBCaido()
+    clock, resp = Clock(T0), {"r": {"ordenes": [orden()]}}
+    ex = E.Ejecutor({"SEMAFORO_URL": "https://sem.test/", "BRIDGE_TOKEN": "clave"}, ib, post=lambda *a, **k: resp["r"],
+                    reloj=clock, estado_path=tempfile.mktemp(suffix=".json"))
+    ex.paso()
+    oids = dict(ex.ord["a1b2c3d4"]["oids"])
+    ib.fill(oids["e"], 49, 10.02)
+    clock.t += 1
+    ex.paso()
+    assert ex.ord["a1b2c3d4"]["estado"] == "llena" and ex.paper
+    colocadas = len(ib.placed)
+    # Corte: el Gateway se va y tarda 8 intentos en volver. Con el mercado abierto se insiste cada 10 s.
+    ib.conn, ib.fallar = False, 8
+    resp["r"] = {}
+    esperas = []
+    for _ in range(8):
+        clock.t += 10
+        esperas.append(ex.paso())
+        assert not ex.paper and ex.fallos_ib == len(esperas)
+    assert esperas == [10] * 8, esperas
+    clock.t += 10
+    ex.paso()                                                           # vuelve: reconoce lo suyo y sigue
+    assert ex.paper and ib.isConnected() and ex.fallos_ib == 0
+    assert ex.ord["a1b2c3d4"]["estado"] == "llena" and ex.por_oid[oids["t"]] == ("a1b2c3d4", "t")
+    assert len(ib.placed) == colocadas, "reconectar no debe poner órdenes nuevas"
+    ib.fill(oids["o"], 49, 10.5)                                        # y sigue gestionando la posición
+    vuelta(ex, clock, resp)
+    assert ex.ord["a1b2c3d4"]["estado"] == "cerrada"
+    # De noche (domingo 22:00 ET, mercado cerrado): 10 s los primeros 6 intentos y luego 30 s, sin llenar el registro.
+    ib2 = IBCaido()
+    ib2.fallar = 9
+    dom = datetime(2026, 10, 4, 22, 0, tzinfo=NY).timestamp()
+    ex2 = E.Ejecutor({"SEMAFORO_URL": "https://sem.test/", "BRIDGE_TOKEN": "clave"}, ib2, post=lambda *a, **k: {},
+                     reloj=Clock(dom), estado_path=tempfile.mktemp(suffix=".json"))
+    esp = [ex2.paso() for _ in range(9)]
+    assert esp == [10] * 6 + [30] * 3, esp
+    assert ex2.paso() == 10 and ex2.paper                                # al fin conecta (domingo: ritmo de reposo)
+    assert ex2.fallos_ib == 0
+
+
+def _bucle_con(pasos, sleeps):
+    """Corre E.bucle con un ejecutor y un ib falsos que van lanzando lo indicado; termina con Ctrl+C simulado."""
+    llamadas = {"paso": 0, "sleep": 0, "esperas": []}
+
+    class Ej:
+        def paso(self):
+            i = llamadas["paso"]
+            llamadas["paso"] += 1
+            r = pasos[i] if i < len(pasos) else 0
+            if isinstance(r, BaseException):
+                raise r
+            return r
+
+    class Ib:
+        def sleep(self, s):
+            i = llamadas["sleep"]
+            llamadas["sleep"] += 1
+            llamadas["esperas"].append(s)
+            r = sleeps[i] if i < len(sleeps) else KeyboardInterrupt()
+            if isinstance(r, BaseException):
+                raise r
+    old = E.time.sleep
+    E.time.sleep = lambda s: None                                       # sin esperas de verdad
+    try:
+        try:
+            E.bucle(Ej(), Ib(), "ejecutor de prueba")
+        except KeyboardInterrupt:
+            llamadas["ctrl_c"] = True
+    finally:
+        E.time.sleep = old
+    return llamadas
+
+
+def test_el_corte_de_conexion_no_mata_el_bucle():
+    """Lo que pasó de verdad a las 23:30: el Gateway se reinicia, la librería lanza ConnectionError desde ib.sleep() y el
+    ejecutor se cerraba sin avisar. Ahora el bucle sigue y solo Ctrl+C lo detiene."""
+    import asyncio
+    # 1) el error sale de la espera (el caso real)
+    ll = _bucle_con([5, 5, 5], [ConnectionError("Socket disconnect"), None, RuntimeError("raro"), KeyboardInterrupt()])
+    assert ll["ctrl_c"] and ll["paso"] == 4 and ll["sleep"] == 4, ll
+    # 2) la cancelación de asyncio también (otra forma en que la librería corta una espera)
+    ll = _bucle_con([5, 5], [asyncio.CancelledError(), KeyboardInterrupt()])
+    assert ll["ctrl_c"] and ll["paso"] == 2, ll
+    # 3) el corte llega a mitad de un paso (p. ej. mientras pide las órdenes abiertas): reintenta pronto, sin traceback
+    ll = _bucle_con([ConnectionError("Socket disconnect"), 5, asyncio.CancelledError(), 5], [None, None, None, KeyboardInterrupt()])
+    assert ll["ctrl_c"] and ll["esperas"][:3] == [3, 5, 3], ll
+    # 4) un error cualquiera en un paso: reintenta en 5 s
+    ll = _bucle_con([ValueError("x"), 7], [None, KeyboardInterrupt()])
+    assert ll["esperas"][0] == 5 and ll["esperas"][1] == 7, ll
+    # 5) Ctrl+C sale (no se traga): también si llega durante un paso
+    ll = _bucle_con([KeyboardInterrupt()], [])
+    assert ll["ctrl_c"] and ll["sleep"] == 0, ll
+    # 6) cerrar() desconecta aunque falle algo al despedirse
+    ib = FakeIB()
+    ib.conn = True
+    ex = E.Ejecutor({"SEMAFORO_URL": "https://sem.test/", "BRIDGE_TOKEN": "clave"}, ib, post=lambda *a, **k: {},
+                    reloj=Clock(T0), estado_path=tempfile.mktemp(suffix=".json"))
+    ex.salir = lambda: (_ for _ in ()).throw(ConnectionError("Socket disconnect"))
+    E.cerrar(ex, ib)
+    assert not ib.isConnected()
+
+
+def test_el_error_real_de_ib_async():
+    """Con la librería de verdad: un corte de conexión sale como ConnectionError de ib.sleep(); esperar() lo absorbe y la
+    librería sigue sirviendo para la siguiente espera. (Sin ib_async instalado no se prueba.)"""
+    if E.IB is None:
+        return
+    from ib_async import util
+    ib = E.IB()
+    loop = util.getLoop()
+
+    def corte():
+        util.globalErrorEvent.emit(ConnectionError("Socket disconnect"))
+    loop.call_later(0.1, corte)
+    try:
+        ib.sleep(1)
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("la librería ya no lanza ConnectionError desde sleep(): revisa esperar()/bucle()")
+    old = E.time.sleep
+    E.time.sleep = lambda s: None
+    try:
+        loop.call_later(0.1, corte)
+        E.esperar(ib, 1)                                                # no lanza
+        assert ib.sleep(0.05) in (True, None)                           # y la siguiente espera funciona
+    finally:
+        E.time.sleep = old
+
+
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -576,5 +721,8 @@ if __name__ == "__main__":
     test_cierre_1555_y_cerrar()
     test_rechazos()
     test_red_y_reinicio()
+    test_reconexion_tras_reinicio_del_gateway()
+    test_el_corte_de_conexion_no_mata_el_bucle()
+    test_el_error_real_de_ib_async()
     test_hora_et()
     print("OK · ejecutor paper")

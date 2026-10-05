@@ -32,6 +32,7 @@ límites y mismas protecciones) para correr en paralelo en la misma cuenta paper
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import datetime as dt
 import json
@@ -51,7 +52,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.2"
+VERSION = "1.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -195,6 +196,7 @@ class Ejecutor:
         self.ack_t: dict[str, float] = {}
         self.err_red: str | None = None
         self.err_ib: str | None = None
+        self.fallos_ib = 0                     # intentos seguidos de conectar con IB Gateway que fallaron
         self.errores_vistos: set[tuple[str, int]] = set()
         self._vivas: set[int] | None = None    # orderIds que IBKR dice abiertos (se pide solo si hace falta)
         self._hooked = False
@@ -805,8 +807,15 @@ class Ejecutor:
         if not self.ib.isConnected():
             self.paper = False
             if not self.conectar():
+                self.fallos_ib += 1
                 self.sync(now)  # el semáforo ve «desconectado» (o el candado) y no ofrece botón
-                return 10
+                en_horas = t.weekday() < 5 and 9 * 60 + 20 <= m < 16 * 60 + 5
+                # IB Gateway tarda 1-2 min en volver tras su reinicio de cada noche: con el mercado abierto se insiste
+                # cada 10 s; fuera de horario, tras unos intentos, se espera más para no llenar el registro.
+                return 10 if en_horas or self.fallos_ib <= 6 else 30
+            if self.fallos_ib:
+                log.info("Reconectado con IB Gateway tras %d intento(s) fallido(s).", self.fallos_ib)
+            self.fallos_ib = 0
         self._vivas = None
         self.atender_errores()
         self.revisar(now)
@@ -909,6 +918,47 @@ class Ejecutor:
                         "15:55 ET para que las cierre, o ciérralas tú.", ", ".join(abiertas))
 
 
+def esperar(ib, segundos: float):
+    """Espera procesando lo que llega de IBKR. Si el Gateway se cae (o se reinicia, como cada noche a las 23:30), la
+    librería convierte el corte en un ConnectionError que sale justo de esta espera: no debe matar al programa, el
+    siguiente paso() ve que no hay conexión y reconecta."""
+    try:
+        ib.sleep(segundos)
+    except (Exception, asyncio.CancelledError) as e:   # noqa: BLE001 (Ctrl+C no entra aquí: es BaseException)
+        log.warning("Espera interrumpida (%s: %s); sigo.", type(e).__name__, e)
+        time.sleep(1)
+
+
+def bucle(ex, ib, nombre: str = "ejecutor"):
+    """El ciclo de siempre: un paso, esperar, otro paso. Solo sale con Ctrl+C. Ningún error de un paso, ni un corte de
+    la conexión con IBKR, lo detiene."""
+    while True:
+        try:
+            espera = ex.paso()
+        except (ConnectionError, asyncio.CancelledError) as e:   # corte con IBKR a mitad de un paso: se reconecta solo
+            log.warning("Se cortó la conexión con IBKR en mitad de un paso (%s); reintento en 3 s.", type(e).__name__)
+            espera = 3
+        except Exception:  # noqa: BLE001 (nunca dejarlo caer en plena sesión)
+            log.exception("Error inesperado en el %s; sigo en 5 s.", nombre)
+            espera = 5
+        esperar(ib, espera)   # mientras espera, procesa lo que llega de IBKR (aquí sí se puede esperar)
+
+
+def cerrar(ex, ib):
+    """Al salir con Ctrl+C: cancela las compras sin llenar, avisa al semáforo y desconecta. Un fallo aquí no impide
+    desconectar."""
+    try:
+        ex.salir()
+        if ib.isConnected():
+            esperar(ib, 1)   # que salgan las cancelaciones antes de desconectar
+            ex.sync(ex.reloj())
+    except (Exception, asyncio.CancelledError):  # noqa: BLE001
+        log.exception("Error al cerrar el ejecutor.")
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Ejecutor de órdenes en la cuenta PAPER de IBKR (dinero simulado)")
     ap.parse_args(argv)
@@ -926,24 +976,11 @@ def main(argv=None):
     ib = IB()
     ex = Ejecutor(cfg, ib)
     try:
-        while True:
-            try:
-                espera = ex.paso()
-            except Exception:  # noqa: BLE001 (nunca dejarlo caer en plena sesión)
-                log.exception("Error inesperado en el ejecutor; sigo en 5 s.")
-                espera = 5
-            ib.sleep(espera)  # mientras espera, procesa lo que llega de IBKR (aquí sí se puede esperar)
+        bucle(ex, ib, "ejecutor")
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            ex.salir()
-            if ib.isConnected():
-                ib.sleep(1)   # que salgan las cancelaciones antes de desconectar
-                ex.sync(ex.reloj())
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
+        cerrar(ex, ib)
     log.info("Ejecutor detenido.")
     return 0
 

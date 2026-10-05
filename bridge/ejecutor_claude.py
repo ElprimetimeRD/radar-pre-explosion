@@ -36,7 +36,7 @@ import estrategia_claude as S  # noqa: E402
 from datos_yahoo import Feed  # noqa: E402
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.0"
+VERSION = "1.1"
 LOG_FILE = os.path.join(HERE, "ejecutor_claude.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_claude.json")
 LISTA_FILE = os.path.join(HERE, "lista_claude.txt")
@@ -80,6 +80,7 @@ class EjecutorClaude(E.Ejecutor):
         self.ult_eval = 0.0
         self.cand: list[dict] = []
         self.ult_resumen = 0.0
+        self.ult_sin_datos = 0.0
         self.vetadas: dict[str, float] = {}          # acciones que IBKR rechazó: no se reintentan por un rato
         self.omitidas: dict[tuple[str, str], float] = {}   # (acción, motivo) -> última vez que se anotó en el registro
 
@@ -145,7 +146,12 @@ class EjecutorClaude(E.Ejecutor):
             return
         ini, fin, _ = self.horario()
         m = t.hour * 60 + t.minute
-        if not ini <= m < fin or not self.feed.ok(now) or self.feed.ult_barrido == self.ult_eval:
+        if not ini <= m < fin:
+            return
+        if not self.feed.ok(now):
+            self.sin_datos_log(now)
+            return
+        if self.feed.ult_barrido == self.ult_eval:
             return
         self.ult_eval = self.feed.ult_barrido        # una evaluación por cada lectura nueva de Yahoo (cada minuto)
         buenos, spy = self.datos_hoy(now)
@@ -177,6 +183,15 @@ class EjecutorClaude(E.Ejecutor):
                 pend += 1
             elif o and o["estado"] == "rechazada":
                 self.vetadas[j["t"]] = now + 1800
+
+    def sin_datos_log(self, now: float):
+        """Yahoo no responde o respondió a medias: lo deja en el registro cada 5 min (si no, el día entero pasa en silencio)."""
+        if now - self.ult_sin_datos < 300:
+            return
+        self.ult_sin_datos = now
+        est = self.feed.estado(now)
+        log.warning("Sin datos de Yahoo suficientes (%s de %s acciones, última lectura hace %s s): no pongo órdenes nuevas. %s",
+                    est["feed_n"], est["feed_de"], est["feed_edad_s"], est["feed_error"] or "")
 
     def omitir(self, t: str, motivo: str, now: float):
         k = (t, motivo)
@@ -228,24 +243,11 @@ def main(argv=None):
     ib = E.IB()
     ex = EjecutorClaude(cfg, ib, feed)
     try:
-        while True:
-            try:
-                espera = ex.paso()
-            except Exception:  # noqa: BLE001 (nunca dejarlo caer en plena sesión)
-                log.exception("Error inesperado en el ejecutor de Claude; sigo en 5 s.")
-                espera = 5
-            ib.sleep(espera)
+        E.bucle(ex, ib, "ejecutor de Claude")   # un corte de IB Gateway (reinicio de las 23:30) no lo detiene: reconecta
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            ex.salir()
-            if ib.isConnected():
-                ib.sleep(1)
-                ex.sync(ex.reloj())
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
+        E.cerrar(ex, ib)
     log.info("Ejecutor de Claude detenido.")
     return 0
 
