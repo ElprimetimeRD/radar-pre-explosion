@@ -336,6 +336,17 @@ def test_cierre_1555_y_reinicio():
     assert C.cargar_lista(p) == ["NVDA", "AMD"] and "NVDA" in C.cargar_lista("no_existe.txt")
 
 
+def test_datos_viejos_segun_el_ritmo_del_lector():
+    """Si Yahoo limita y el lector va más despacio, la última vela es más vieja a propósito: se tolera en la misma medida."""
+    ex, ib, clock, posted, resp, feed = nuevo()
+    clock.t = T1 + 210                                    # la última vela completa terminó hace 4.5 min
+    assert "NVDA" not in ex.datos_hoy(clock.t)[0]         # ritmo normal: pasados 4 min ya no es fiable
+    feed.intervalo = 120                                  # el lector lee cada 2 min: 1 min más de margen
+    assert "NVDA" in ex.datos_hoy(clock.t)[0]
+    clock.t = T1 + 400
+    assert "NVDA" not in ex.datos_hoy(clock.t)[0]         # ni con margen: más de 5 min
+
+
 if __name__ == "__main__":
     test_orden_con_stop_fijo()
     test_no_toca_lo_ajeno()
@@ -345,4 +356,5 @@ if __name__ == "__main__":
     test_se_cancela_si_la_jugada_se_rompe()
     test_topes_y_vetos()
     test_cierre_1555_y_reinicio()
+    test_datos_viejos_segun_el_ritmo_del_lector()
     print("OK · ejecutor de Claude")

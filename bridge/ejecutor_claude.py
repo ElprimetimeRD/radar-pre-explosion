@@ -128,9 +128,11 @@ class EjecutorClaude(E.Ejecutor):
         hoy = E.et(now).date().isoformat()
         datos, spy = self.feed.snapshot(hoy)
         buenos = {}
+        # si Yahoo limitó las peticiones y el lector va más despacio, la última vela es más vieja a propósito
+        vieja = self.scfg.vela_vieja_s + max(0, getattr(self.feed, "intervalo", 60) - 60)
         for t, d in datos.items():
             b = d.get("bars") or []
-            if d.get("dia") == hoy and b and now - E.et_ts(now, b[-1][0] + 1) <= self.scfg.vela_vieja_s:
+            if d.get("dia") == hoy and b and now - E.et_ts(now, b[-1][0] + 1) <= vieja:
                 buenos[t] = d
         if spy.get("bars") and spy.get("dia") != hoy:
             spy = {}
@@ -190,8 +192,9 @@ class EjecutorClaude(E.Ejecutor):
             return
         self.ult_sin_datos = now
         est = self.feed.estado(now)
-        log.warning("Sin datos de Yahoo suficientes (%s de %s acciones, última lectura hace %s s): no pongo órdenes nuevas. %s",
-                    est["feed_n"], est["feed_de"], est["feed_edad_s"], est["feed_error"] or "")
+        log.warning("Sin datos de Yahoo suficientes (%s de %s acciones, última lectura hace %s s, leyendo cada %s s): no pongo "
+                    "órdenes nuevas. %s", est["feed_n"], est["feed_de"], est["feed_edad_s"], est.get("feed_intervalo_s", 60),
+                    est["feed_error"] or "")
 
     def omitir(self, t: str, motivo: str, now: float):
         k = (t, motivo)
