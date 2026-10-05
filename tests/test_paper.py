@@ -40,10 +40,11 @@ def test_sin_ejecutor_no_hay_boton():
     assert arma(p) is None                                              # el ejecutor nunca habló
     p.sync(OK, [])
     o = arma(p)
-    assert o["boton"] and o["qty"] == 49 and o["tipo"] == "stp" and o["gatillo"] == 10.0 and o["limite"] == 10.03, o
+    assert P.ORDEN_USD == 1000 and int(P.ORDEN_USD // 10.03) == 99
+    assert o["boton"] and o["qty"] == 99 and o["tipo"] == "stp" and o["gatillo"] == 10.0 and o["limite"] == 10.03, o
     assert o["trail"] == 0.3 and o["objetivo"] == 10.5, o
     kb = P.boton(o)
-    assert kb["inline_keyboard"][0][0]["callback_data"] == f"x:{o['id']}" and "49 acc" in kb["inline_keyboard"][0][0]["text"]
+    assert kb["inline_keyboard"][0][0]["callback_data"] == f"x:{o['id']}" and "99 acc" in kb["inline_keyboard"][0][0]["text"]
     c.t += 30                                                            # 30 s sin noticias del ejecutor
     assert arma(p, "XYZ") is None
     c.t = T0
@@ -52,7 +53,7 @@ def test_sin_ejecutor_no_hay_boton():
     p.sync({**OK, "ib": False}, [])                                      # ejecutor sin IB Gateway
     assert arma(p, "XYZ") is None
     p.sync(OK, [])
-    assert p.ofrecer("arma", "BIG", 600, 590, 630, 601.8, gatillo=600) is None   # US$500 no alcanza para 1 acción
+    assert p.ofrecer("arma", "BIG", 1200, 1180, 1260, 1203.6, gatillo=1200) is None   # US$1,000 no alcanza para 1 acción
     assert p.ofrecer("arma", "BAD", 10, 10, 10.5, 10.03, gatillo=10) is None      # stop inválido
 
 
@@ -61,12 +62,13 @@ def test_flujo_boton():
     p.sync(OK, [])
     o = arma(p)
     ok, txt = p.pedir(o["id"])
-    assert ok and "ABC 49 acc" in txt, txt
+    assert ok and "ABC 99 acc" in txt, txt
     ok, txt = p.pedir(o["id"])
     assert not ok and "camino" in txt                                    # doble toque: una sola orden
     r = p.sync(OK, [])
     assert [x["id"] for x in r["ordenes"]] == [o["id"]] and r["ordenes"][0]["gatillo"] == 10.0, r
-    assert r["limites"]["orden_usd"] == 500 and r["limites"]["max_abierto"] == 1000 and r["cerrar_id"] is None
+    assert r["limites"]["orden_usd"] == 1000 and r["limites"]["max_abierto"] == 4000 and r["limites"]["perdida_max"] == 250
+    assert r["cerrar_id"] is None
     assert len(p.sync(OK, [])["ordenes"]) == 1                           # se repite hasta que el ejecutor avise
     r = p.sync(OK, [{"id": o["id"], "ev": "puesta", "t": "ABC"}])
     assert r["ordenes"] == [] and p.ofertas[o["id"]]["estado"] == "puesta"
@@ -86,18 +88,20 @@ def test_flujo_boton():
 def test_limites():
     p, c = nuevo()
     p.sync(OK, [])
-    a, b, d = arma(p, "AAA", 10.0), arma(p, "BBB", 20.0), arma(p, "DDD", 30.0)
-    assert p.pedir(a["id"])[0] and p.pedir(b["id"])[0]                  # US$491 + US$481
-    ok, txt = p.pedir(d["id"])
-    assert not ok and "1,000 comprometidos" in txt, txt                  # la tercera pasaría de US$1,000
+    assert P.MAX_ABIERTO == 4000 and P.PERDIDA_MAX == 250
+    cuatro = [arma(p, t, 10.0) for t in ("AAA", "BBB", "CCC", "DDD")]    # 99 acciones: ~US$993 cada una
+    quinta = arma(p, "EEE", 10.0)
+    assert all(p.pedir(o["id"])[0] for o in cuatro)                      # caben 4 en US$4,000
+    ok, txt = p.pedir(quinta["id"])
+    assert not ok and "4,000 comprometidos" in txt, txt                  # la quinta pasaría de US$4,000
     a2 = p.ofrecer("compra", "AAA", 10.1, 9.8, 10.6, 10.13)
     assert a2["estado"] == "omitida" and "ya hay una orden" in a2["nota"] and not a2.get("boton")  # una por acción
     p.sync({**OK, "comprometido": 900}, [])                              # lo que el ejecutor ya tiene puesto cuenta
     p2, c2 = nuevo()
-    p2.sync({**OK, "perdida_dia": 90}, [])
+    p2.sync({**OK, "perdida_dia": 240}, [])
     o = arma(p2, "EEE")
     ok, txt = p2.pedir(o["id"])
-    assert not ok and "pérdida máxima" in txt, txt                       # 90 perdidos + 14.7 de riesgo > 100
+    assert not ok and "pérdida máxima" in txt, txt                       # 240 perdidos + 29.7 de riesgo > 250
     p2.sync({**OK, "parado": True}, [])
     ok, txt = p2.pedir(o["id"])
     assert not ok and "máximo del día" in txt, txt
@@ -242,7 +246,7 @@ def test_eventos_y_estado():
     assert o["estado"] == "omitida"                                      # la posición que informa el ejecutor cuenta
     txt = p.estado_txt()
     assert "Ejecutor conectado (cuenta DUR233329)" in txt and "QQQ 10 @50.10" in txt and "-3.00 US$" in txt, txt
-    assert "/cerrar" in p.ayuda() and "US$500" in p.ayuda()
+    assert "/cerrar" in p.ayuda() and "US$1,000 por operación" in p.ayuda() and "US$4,000 comprometidos" in p.ayuda()
     st = p.status()
     assert st["ejecutor"] and st["modo"] == "boton" and "posiciones" not in st
     c.t += 120
@@ -334,7 +338,7 @@ def test_avisos_con_boton():
     assert "🟡 ARMA BBB" in text and kb["inline_keyboard"][0][0]["callback_data"].startswith("x:"), (text, kb)
     oid = kb["inline_keyboard"][0][0]["callback_data"][2:]
     of = r.paper.ofertas[oid]
-    assert of["tipo"] == "stp" and of["gatillo"] == 20.02 and of["qty"] == 24, of
+    assert of["tipo"] == "stp" and of["gatillo"] == 20.02 and of["qty"] == int(P.ORDEN_USD // 20.08) == 49, of
     # ⚡ de AAA (sin orden paper): trae botón de compra límite; ⚡ de BBB con su orden ya pedida: no ofrece otra
     r.paper.ofertas[oid]["estado"] = "puesta"
     now = datetime(2026, 9, 29, 10, 1, tzinfo=ET)
@@ -361,7 +365,7 @@ def test_endpoint_sync():
         assert cl.post("/api/paper/sync", json={}).status_code == 401
         assert cl.post("/api/paper/sync", json={}, headers={"X-Token": "mala"}).status_code == 401
         r = cl.post("/api/paper/sync", json={"estado": OK, "eventos": []}, headers={"X-Token": "clave-prueba"})
-        assert r.status_code == 200 and r.json()["ordenes"] == [] and r.json()["limites"]["perdida_max"] == 100, r.text
+        assert r.status_code == 200 and r.json()["ordenes"] == [] and r.json()["limites"]["perdida_max"] == 250, r.text
         big = {"estado": OK, "eventos": [{"id": "x" * 100, "ev": "error", "motivo": "y" * 1000}] * 300}
         assert cl.post("/api/paper/sync", json=big, headers={"X-Token": "clave-prueba"}).status_code == 413
         h = cl.get("/health").json()

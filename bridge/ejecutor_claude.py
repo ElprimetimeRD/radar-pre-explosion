@@ -36,7 +36,7 @@ import estrategia_claude as S  # noqa: E402
 from datos_yahoo import Feed  # noqa: E402
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.3"
+VERSION = "1.4"
 LOG_FILE = os.path.join(HERE, "ejecutor_claude.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_claude.json")
 LISTA_FILE = os.path.join(HERE, "lista_claude.txt")
@@ -72,7 +72,9 @@ class EjecutorClaude(E.Ejecutor):
     NOMBRE = "claude"
     DIARIO = "diario_cla.csv"
     ENTRADA_INI_M = S.CFG.ini_m         # 9:50
-    ENTRADA_FIN_M = S.CFG.fin_m         # 15:15 (los límites de dinero y el cierre de las 15:55 son los del motor)
+    ENTRADA_FIN_M = S.CFG.fin_m         # 15:15 (el cierre de las 15:55 es el del motor)
+    # Los topes de dinero de Claude NO suben con los del ejecutor de Priamo (v1.7): su tamaño lo fija su estrategia
+    ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX, MAX_ORDENES_DIA = 500.0, 1000.0, 100.0, 20
 
     def __init__(self, cfg: dict, ib, feed, post=http_post, reloj=time.time, estado_path: str = STATE_FILE,
                  diario_path: str | None = None, scfg: S.Cfg = S.CFG):
