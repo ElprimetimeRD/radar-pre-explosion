@@ -109,6 +109,10 @@ de unas 45 acciones líquidas (`lista_claude.txt` la reemplaza, una por línea).
 - **Vigilante de la PC:** `INSTALAR_ARRANQUE_DIARIO.bat` (una vez) crea la tarea de Windows «Semaforo Paper»: de lunes a viernes, desde las 8:45 (hora de la PC) y cada
   5 min hasta las 17:15, ejecuta `ARRANCAR_PAPER.bat /silencioso`, que abre IB Gateway paper y los dos ejecutores solo si alguno falta. Los ejecutores piden a Windows
   no dormirse (`SetThreadExecutionState`, solo mientras corren y en horario de mercado; no cambia ningún ajuste de energía). Con una laptop, no cierres la tapa.
+  **Nunca dos copias del mismo ejecutor:** tres seguros en cadena: el detector de procesos (`ejecutor_activo.ps1`), la segunda opinión del semáforo (`render_vivo.ps1` mira
+  `/health`: si ve al ejecutor hablando hace menos de 90 s, no abre otro) y el propio programa (reserva un puerto local, 45041 el tuyo y 45042 el de Claude, y una segunda copia sale con
+  código 3 sin que `ejecutor.bat` la reabra; si ese puerto lo usa otro programa, arranca igual sin ese seguro). `DIAGNOSTICO_PAPER.bat` (solo lectura) deja `diagnostico_paper.txt` con
+  lo abierto, los puertos, lo que ven los detectores, si la tarea existe y la configuración de suspensión.
 - **Lo que NO está demostrado:** el backtest de la estrategia (`tools/backtest_claude.py`, sobre `data/diag`) usa un conjunto sesgado (acciones elegidas *después* de
   moverse y controles al azar) y solo sirve para comprobar la mecánica y las órdenes; no es evidencia de ventaja. Unos días de resultados en paper son anécdota: la
   comparación vale con muchas operaciones y regímenes distintos. Entradas de tu ejecutor solo hasta las 12:00 ET (el semáforo no emite COMPRA nuevas después);
