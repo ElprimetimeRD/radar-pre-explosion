@@ -4,3 +4,8 @@ __pycache__/
 data/live/
 bridge/puente.env
 bridge/puente.log*
+bridge/diario_*.csv
+bridge/ejecutor*.json
+bridge/ejecutor*.log*
+bridge/comparacion.txt
+bridge/lista_claude.txt

@@ -83,8 +83,36 @@ Instalación (una vez):
 - **Comandos:** `/estado`, `/pausa`, `/reanuda`, `/auto` (pone cada ARMA y COMPRA que pase los límites sin preguntar), `/boton` (vuelve al botón), `/cerrar` (pide confirmación con un botón que vale 2 min).
 - **Límites, dos veces (semáforo y ejecutor; el ejecutor tiene la última palabra y sus topes están fijos en el código):** US$500 por operación (`ORDEN_USD`), US$1,000 comprometidos entre posiciones y compras puestas (`PAPER_MAX_ABIERTO`), no pone una orden si la pérdida del día más lo que podría perder lo abierto pasaría de US$100 (`PAPER_PERDIDA_MAX`) y al perder US$100 se detiene el día, compras solo 9:30–12:00 ET, una orden viva por acción, 20 órdenes por día y a las 15:55 ET cancela lo suyo y vende lo comprado. Modo inicial: `PAPER_MODO` (`boton`).
 - **Candado del ejecutor:** solo puerto 4002 (IB Gateway paper) y solo si todas las cuentas empiezan por DU; no hay variable para apuntarlo a la cuenta real. Solo toca sus órdenes (referencia `sem-<id>-<rol>`). Seguridad en cada vuelta: cuenta lo que IBKR ejecutó (compras − ventas), no el estado de la orden; una posición sin su Trailing vivo (confirmado con IBKR) se vende; si vendiera de más, recompra; los manejadores de eventos de IBKR solo anotan y todo se hace en el ciclo (la librería no deja esperar dentro de un manejador).
-- **Uso diario (PC):** `ARRANCAR_PAPER.bat` (IB Gateway paper, API sin *Read-Only*) y `ejecutor_paper.bat`, antes de las 9:30 ET; usa la clave de `puente.env`. Pruebas sin IBKR: `python tests/test_ejecutor.py` y `python tests/test_paper.py`.
+- **Uso diario (PC):** `ARRANCAR_PAPER.bat` (IB Gateway paper, API sin *Read-Only*, y los dos ejecutores: el tuyo y el de Claude; lo que ya esté abierto lo deja como está), antes de las 9:30 ET; usa la clave de `puente.env`. Cada ejecutor corre dentro de `ejecutor.bat`, que lo reabre solo si se cae. Los scripts de la PC están en `bridge/pc/` y se copian a `C:\Users\<tú>\Claude\`. Pruebas sin IBKR: `python tests/test_ejecutor.py` y `python tests/test_paper.py`.
 - **Paso a dinero real:** no existe desde aquí. Es una decisión de Priamo y exige cambiar el código del ejecutor a propósito.
+
+**Ejecutor paralelo de Claude (4-oct-2026): otra estrategia, la misma cuenta paper, para comparar.** Corre a la vez que el tuyo en la misma cuenta
+(DUR…), con otro clientId de IBKR (42; el tuyo 41) y sus órdenes marcadas `cla-<id>-<rol>` (las tuyas, `sem-…`): cada uno solo cuenta, cancela y vende lo suyo.
+No recibe órdenes del semáforo: decide solo con velas de 1 min que lee de Yahoo su propio programa (`bridge/datos_yahoo.py`, solo `urllib`) sobre una lista fija
+de unas 45 acciones líquidas (`lista_claude.txt` la reemplaza, una por línea).
+- **Estrategia «pullback con tendencia» (solo largos), `bridge/estrategia_claude.py`:** busca *líderes del día* (sube ≥ max(1.5 %, 0.45×ATR), ≤ +30 %, RVOL ≥ 1.3 con la
+  curva de volumen en U, sobre el VWAP, precio US$5–800); exige un impulso ≥ max(1.2 %, 0.35×ATR) en la última hora y un retroceso sano (4–60 velas, devuelve 25–60 %
+  del impulso, sin romper el VWAP, con menos volumen que el impulso y ya sin nuevos mínimos). Deja una **compra límite** dentro del retroceso (a 30 % entre el mínimo
+  y el último cierre) con **stop fijo** bajo el mínimo del retroceso (nunca menos de 0.6 %) y **objetivo a 2R**; solo si el máximo del día queda a ≥ 1.5R de la
+  entrada. La compra vence a los 10 min y se cancela antes si la jugada se rompe. Filtro de mercado suave (SPY no peor que −0.5 % en el día). Ventana 9:50–15:15 ET.
+  Como entra con órdenes límite en reposo y sale con órdenes nativas en IBKR, tolera el retraso de 1–2 min de Yahoo.
+- **Mismos topes y protecciones que el tuyo** (es el mismo motor, `bridge/ejecutor_paper.py`, parametrizado): US$500 por operación (riesgo ≤ US$15), US$1,000
+  comprometidos, pérdida máxima US$100 al día (detiene el día), 20 órdenes por día, una orden o posición por acción, cierre a las 15:55 ET, candado paper (4002, DU…).
+  Además **no toca nada ajeno**: si en una acción hay una orden que no es `cla-…` o una posición que no es suya, la salta; y si no puede comprobarlo, no opera.
+  `/pausa`, `/reanuda` y `/cerrar` valen para los dos ejecutores.
+- **Telegram y semáforo:** `POST /api/claude/sync` (`BRIDGE_TOKEN`, `live/claude_paper.py`) recibe su estado y lo que pasó (avisos «🤖 Claude: …»); `/claude` (cómo
+  va), `/marcador` (el día, tú contra Claude; llega solo a las 16:10 ET) y avisos de caída: si cualquiera de los dos ejecutores deja de hablar en horario de mercado,
+  si IB Gateway paper se cae o si Claude se queda sin datos de Yahoo, llega un aviso (una vez por caída) y otro cuando vuelve.
+- **Diarios y comparación:** cada operación cerrada, cancelada o rechazada queda en `diario_sem.csv` (tu ejecutor) y `diario_cla.csv` (el de Claude), con precios, P/L,
+  comisión, riesgo y R. `COMPARAR.bat` (`bridge/comparar.py`) los junta: operaciones, aciertos, expectativa, factor de beneficio, caída máxima, resultado por día
+  y la diferencia con su error estándar; no declara ganador si la diferencia cabe en el azar.
+- **Vigilante de la PC:** `INSTALAR_ARRANQUE_DIARIO.bat` (una vez) crea la tarea de Windows «Semaforo Paper»: de lunes a viernes, desde las 8:45 (hora de la PC) y cada
+  5 min hasta las 17:15, ejecuta `ARRANCAR_PAPER.bat /silencioso`, que abre IB Gateway paper y los dos ejecutores solo si alguno falta. Los ejecutores piden a Windows
+  no dormirse (`SetThreadExecutionState`, solo mientras corren y en horario de mercado; no cambia ningún ajuste de energía). Con una laptop, no cierres la tapa.
+- **Lo que NO está demostrado:** el backtest de la estrategia (`tools/backtest_claude.py`, sobre `data/diag`) usa un conjunto sesgado (acciones elegidas *después* de
+  moverse y controles al azar) y solo sirve para comprobar la mecánica y las órdenes; no es evidencia de ventaja. Unos días de resultados en paper son anécdota: la
+  comparación vale con muchas operaciones y regímenes distintos. Entradas de tu ejecutor solo hasta las 12:00 ET (el semáforo no emite COMPRA nuevas después);
+  la tarde no está probada. Días de cierre temprano (13:00 ET: 27-nov-2026 y 24-dic-2026): no los dejes operar, el cierre de las 15:55 llegaría tarde.
 
 **Render (instalado):** servicio `radar-semaforo`, plan Starter (no duerme, 512 MB), Oregón (la configuración que manda es la del panel de Render; `render.yaml` la documenta). Variables: `SEC_USER_AGENT`, `CYCLE_S=60`, `UNIVERSE_N=50`, `RADAR_SCAN_URL`, opcional `WATCHLIST` (coma), las de Telegram y, para el puente IBKR, `BRIDGE_TOKEN` (y opcional `IBKR_TOP`, 12). En plan free el servicio se duerme sin tráfico: `live/keepalive.py` se llama a sí mismo de 4:00 a 16:30 ET y `.github/workflows/keepalive.yml` lo despierta cada 15 min. Con Starter (US$7/mes, 5× CPU, no duerme) sube a `CYCLE_S=60` y `UNIVERSE_N=50`. Los cambios en `data/`, `tests/`, `tools/` y este README no redeployan.
 

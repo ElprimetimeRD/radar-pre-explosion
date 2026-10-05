@@ -5,6 +5,8 @@
   (POST /api/paper/sync con BRIDGE_TOKEN), pone la orden en IBKR y devuelve lo que pasa: puesta, comprada, vendida,
   rechazada. Cada cosa llega por Telegram.
 - /auto: las órdenes entran a la cola sin botón (modo automático). /boton vuelve al botón.
+- /pausa, /reanuda y /cerrar valen también para el ejecutor paralelo de Claude (live/claude_paper.py), que opera en la
+  misma cuenta con órdenes "cla-…" y otra estrategia.
 - Límites (los vuelve a aplicar el ejecutor, que tiene la última palabra): US$500 por operación, US$1,000
   comprometidos (posiciones + compras puestas), no más órdenes si la pérdida del día (realizada + lo que podría perder
   lo abierto) pasaría de US$100, sin compras nuevas fuera de 9:30–12:00 ET, una sola orden viva por acción, y a las
@@ -235,6 +237,13 @@ class Paper:
                     "limites": {"orden_usd": ORDEN_USD, "max_abierto": MAX_ABIERTO, "perdida_max": PERDIDA_MAX,
                                 "entrada_ini_m": ENTRADA_INI_M, "entrada_fin_m": ENTRADA_FIN_M, "cierre_m": CIERRE_M}}
 
+    def adoptar_pausa(self, estado: dict | None):
+        """El ejecutor de Claude habló primero tras un reinicio del semáforo: toma la pausa que él guardó. Deja pendiente
+        la adopción del ejecutor de Priamo, que además guarda el modo (automático o botón)."""
+        with self.lock:
+            if not self._adoptado and isinstance(estado, dict) and "pausa" in estado:
+                self.pausa = bool(estado.get("pausa"))
+
     @staticmethod
     def _limpiar_estado(e: dict) -> dict:
         out = {}
@@ -243,6 +252,9 @@ class Paper:
         for k in ("comprometido", "riesgo_abierto", "pnl_dia", "perdida_dia"):
             v = _num(e.get(k))
             out[k] = round(v, 2) if v is not None else None
+        for k in ("ops", "gan"):                # operaciones cerradas hoy y cuántas ganó (para el marcador)
+            v = _num(e.get(k))
+            out[k] = int(v) if v is not None else None
         out["cuenta"] = str(e.get("cuenta") or "")[:20] or None
         out["bloqueado"] = str(e.get("bloqueado"))[:200] if e.get("bloqueado") else None
         out["version"] = str(e.get("version") or "")[:10] or None
@@ -328,11 +340,11 @@ class Paper:
                 self._adoptado = True   # una orden tuya vale más que lo que guardó el ejecutor
             if cmd == "/pausa":
                 self.pausa = True
-                return ("⏸ Paper en pausa: no pongo órdenes nuevas. Lo que ya está puesto sigue con su stop. "
-                        "/reanuda para seguir."), None
+                return ("⏸ Paper en pausa (tu ejecutor y el de Claude): no pongo órdenes nuevas. Lo que ya está puesto "
+                        "sigue con su stop. /reanuda para seguir."), None
             if cmd == "/reanuda":
                 self.pausa = False
-                return "▶ Paper activo otra vez.", None
+                return "▶ Paper activo otra vez (tu ejecutor y el de Claude).", None
             if cmd == "/auto":
                 self.modo = "auto"
                 return ("🤖 Modo automático: pongo en paper cada ARMA y COMPRA que pase los límites, sin preguntarte. "
@@ -342,8 +354,8 @@ class Paper:
                 return "✅ Modo botón: cada aviso trae «✅ Ejecutar en paper» y solo pongo las que toques.", None
             if cmd == "/cerrar":
                 self.confirma = (secrets.token_hex(4), now)
-                return ("¿Cierro todo lo de paper ahora? Cancelo las compras pendientes y vendo a mercado lo comprado. "
-                        "(Este botón vale 2 min.)",
+                return ("¿Cierro todo lo de paper ahora, lo tuyo y lo de Claude? Cancelo las compras pendientes y vendo a "
+                        "mercado lo comprado. (Este botón vale 2 min.)",
                         {"inline_keyboard": [[{"text": "Sí, cerrar todo", "callback_data": f"c:si:{self.confirma[0]}"},
                                               {"text": "No", "callback_data": "c:no"}]]})
             return self.ayuda(), None
@@ -371,7 +383,8 @@ class Paper:
         return ("Paper (dinero simulado): toca «✅ Ejecutar en paper» en un aviso y la orden se pone sola en IBKR.\n"
                 "/estado · cómo va (posiciones, P/L, límites)\n/pausa · no pongo órdenes nuevas\n/reanuda · sigo\n"
                 "/auto · pongo cada ARMA y COMPRA sin preguntarte\n/boton · solo las que toques\n"
-                "/cerrar · cancelo y vendo todo ya\n"
+                "/cerrar · cancelo y vendo todo ya (también lo de Claude)\n"
+                "/claude · cómo va el ejecutor de Claude\n/marcador · el día: tú contra Claude\n"
                 f"Límites: US${ORDEN_USD:,.0f} por operación · US${MAX_ABIERTO:,.0f} comprometidos · pérdida máx "
                 f"US${PERDIDA_MAX:,.0f} al día · compras {hhmm(ENTRADA_INI_M)}–{hhmm(ENTRADA_FIN_M)} ET · "
                 f"cierro todo a las {hhmm(CIERRE_M)} ET.")
@@ -389,10 +402,11 @@ class Paper:
             elif self.ex_seen:
                 lines.append(f"Ejecutor sin conexión (última vez hace {int((now - self.ex_seen) // 60)} min)")
             else:
-                lines.append("Ejecutor sin conexión: abre ARRANCAR_PAPER.bat y EJECUTOR_PAPER.bat en tu PC")
+                lines.append("Ejecutor sin conexión: abre ARRANCAR_PAPER.bat en tu PC (abre IB Gateway paper y los dos ejecutores)")
             pnl = ex.get("pnl_dia")
+            ops = f" · {ex['ops']} ops ({ex.get('gan') or 0} ganadas)" if ex.get("ops") else ""
             lines.append(f"Comprometido US${ex.get('comprometido') or 0:,.0f} de US${MAX_ABIERTO:,.0f} · "
-                         f"P/L hoy {pnl or 0:+.2f} US$ · pérdida máx US${PERDIDA_MAX:,.0f}"
+                         f"P/L hoy {pnl or 0:+.2f} US${ops} · pérdida máx US${PERDIDA_MAX:,.0f}"
                          + (" · ⛔ parado por pérdida" if ex.get("parado") else ""))
             pos = ex.get("posiciones") or []
             lines.append("Posiciones: " + (", ".join(f"{p['t']} {p['qty'] or 0:g} @{p['px'] or 0:.2f}" for p in pos)

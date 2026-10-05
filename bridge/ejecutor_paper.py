@@ -22,12 +22,17 @@ US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–1
 20 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes ni posiciones que no haya
 puesto él: las reconoce por su referencia "sem-<id>-<rol>".
 
-Uso (Windows): con IB Gateway paper abierto (ARRANCAR_PAPER.bat), doble clic en EJECUTOR_PAPER.bat. Usa la misma
-clave del puente (puente.env). Ctrl+C para salir. Registro: ejecutor.log.
+Uso (Windows): doble clic en ARRANCAR_PAPER.bat (abre IB Gateway paper y este ejecutor; lo que ya esté abierto lo deja
+como está). Usa la misma clave del puente (puente.env). Ctrl+C para salir. Registro: ejecutor.log; cada operación cerrada
+queda también en diario_sem.csv (para compararlas con las de otros ejecutores).
+
+Este archivo es el motor: bridge/ejecutor_claude.py lo reutiliza (otra estrategia, otro prefijo de órdenes "cla-", mismos
+límites y mismas protecciones) para correr en paralelo en la misma cuenta paper sin tocarse.
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
 import logging
@@ -46,7 +51,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.1"
+VERSION = "1.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -121,10 +126,55 @@ def fnum(v) -> float | None:
     return f if math.isfinite(f) else None
 
 
+def mantener_despierto(activo: bool):
+    """Pide a Windows que no se duerma mientras este programa corre en horario de mercado (SetThreadExecutionState: vale
+    solo para este programa y se acaba al cerrarlo; no cambia ningún ajuste de energía). Fuera de Windows no hace nada."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | (0x00000001 if activo else 0))  # CONTINUOUS | SYSTEM
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def configurar_log(archivo: str):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    handlers = [logging.StreamHandler()]
+    try:
+        handlers.append(logging.handlers.RotatingFileHandler(archivo, maxBytes=1_000_000, backupCount=2,
+                                                             encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", handlers=handlers)
+    logging.getLogger("ib_async").setLevel(logging.ERROR)
+
+
+DIARIO_COLS = ["fecha", "hora", "ejecutor", "evento", "simbolo", "qty", "px_entrada", "px_salida", "pnl_usd",
+               "comision_usd", "riesgo_usd", "R", "por", "setup", "motivo"]
+
+
 class Ejecutor:
-    def __init__(self, cfg: dict, ib, post=http_post, reloj=time.time, estado_path: str = STATE_FILE):
+    # Lo que cambia entre los ejecutores que comparten este motor (ejecutor_claude.py lo redefine)
+    PREFIJO = "sem"                 # las órdenes llevan la referencia <prefijo>-<id>-<rol>; nunca toca las de otro prefijo
+    CLIENT_ID = CLIENT_ID
+    RUTA = "/api/paper/sync"
+    NOMBRE = "semáforo"
+    DIARIO = "diario_sem.csv"
+    ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX = ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX
+    ENTRADA_INI_M, ENTRADA_FIN_M, CIERRE_M = ENTRADA_INI_M, ENTRADA_FIN_M, CIERRE_M
+    MAX_ORDENES_DIA = MAX_ORDENES_DIA
+
+    def __init__(self, cfg: dict, ib, post=http_post, reloj=time.time, estado_path: str = STATE_FILE,
+                 diario_path: str | None = None):
         self.ib, self.post, self.reloj, self.path = ib, post, reloj, estado_path
-        self.url = cfg["SEMAFORO_URL"].rstrip("/") + "/api/paper/sync"
+        self.diario = diario_path or (os.path.join(HERE, self.DIARIO) if estado_path == STATE_FILE
+                                      else estado_path + ".diario.csv")
+        self.ref_re = re.compile(rf"{re.escape(self.PREFIJO)}-([0-9a-f]{{8}})-([etoxc])")
+        self.url = cfg["SEMAFORO_URL"].rstrip("/") + self.RUTA
+        self._despierto: bool | None = None
         self.token = cfg["BRIDGE_TOKEN"]
         self.cuenta: str | None = None
         self.paper = False                     # conectado a IBKR y con todas las cuentas paper
@@ -197,7 +247,7 @@ class Ejecutor:
             self.ib.disconnectedEvent += self.on_disconnect
             self._hooked = True
         try:
-            self.ib.connect("127.0.0.1", PUERTO, clientId=CLIENT_ID, timeout=15)
+            self.ib.connect("127.0.0.1", PUERTO, clientId=self.CLIENT_ID, timeout=15)
         except Exception as e:  # noqa: BLE001 (rechazada, tiempo agotado, errores de la API)
             self.paper = False
             if self.err_ib != type(e).__name__:
@@ -230,7 +280,7 @@ class Ejecutor:
             self._mapear(getattr(f.execution, "orderRef", ""), f.execution.orderId, f.contract, None)
 
     def _mapear(self, ref, order_id, contract, order):
-        m = REF.fullmatch(ref or "")
+        m = self.ref_re.fullmatch(ref or "")
         if not m or self.por_oid.get(int(order_id)) == MUERTA:
             return
         oid, rol = m.group(1), m.group(2)
@@ -248,14 +298,20 @@ class Ejecutor:
         if order is not None and o.get("reconstruida"):
             if rol == "e":
                 o["qty"], o["limite"] = int(order.totalQuantity or 0), fnum(order.lmtPrice) or 0.0
+                if o.get("stop") and o["limite"]:
+                    o["trail"] = round(max(0.0, o["limite"] - o["stop"]), 2)
             elif rol == "t":
-                o["trail"] = fnum(order.auxPrice) or 0.0
+                if getattr(order, "orderType", "") == "STP":     # stop fijo: auxPrice es el precio, no la distancia
+                    o["stop"] = fnum(order.auxPrice) or 0.0
+                    o["trail"] = round(max(0.0, (o.get("limite") or 0.0) - o["stop"]), 2) if o.get("limite") else 0.0
+                else:
+                    o["trail"] = fnum(order.auxPrice) or 0.0
 
     # ---------------- cuentas: lo que IBKR ejecutó es la verdad ----------------
     def ejecs(self, oid: str, roles: str) -> list:
         out = []
         for f in self.ib.fills():
-            m = REF.fullmatch(getattr(f.execution, "orderRef", "") or "")
+            m = self.ref_re.fullmatch(getattr(f.execution, "orderRef", "") or "")
             if m and m.group(1) == oid and m.group(2) in roles:
                 out.append(f.execution)
         return out
@@ -272,6 +328,8 @@ class Ejecutor:
     def resumen(self) -> dict:
         comp = riesgo = pnl = 0.0
         pos, vivas = [], []
+        ops = sum(1 for o in self.ord.values() if o["estado"] == "cerrada")
+        gan = sum(1 for o in self.ord.values() if o["estado"] == "cerrada" and (o.get("pnl") or 0) > 0)
         for o in self.ord.values():
             qe, _ = self.cant(o["id"], "e")
             qb, pb = self.cant(o["id"], "ec")
@@ -291,7 +349,7 @@ class Ejecutor:
             if pendiente or abs(ab) > EPS:
                 vivas.append(o["t"])
         return {"comprometido": round(comp, 2), "riesgo_abierto": round(riesgo, 2), "pnl_dia": round(pnl, 2),
-                "perdida_dia": round(max(0.0, -pnl), 2), "posiciones": pos, "vivas_t": vivas}
+                "perdida_dia": round(max(0.0, -pnl), 2), "posiciones": pos, "vivas_t": vivas, "ops": ops, "gan": gan}
 
     # ---------------- límites (el más estricto entre los propios y los del semáforo) ----------------
     def tope(self, k: str, propio: float) -> float:
@@ -299,9 +357,9 @@ class Ejecutor:
         return min(propio, v) if v and v > 0 else propio
 
     def horario(self) -> tuple[int, int, int]:
-        ini = max(ENTRADA_INI_M, int(fnum(self.lim.get("entrada_ini_m")) or 0))
-        fin = min(ENTRADA_FIN_M, int(fnum(self.lim.get("entrada_fin_m")) or ENTRADA_FIN_M))
-        cierre = min(CIERRE_M, int(fnum(self.lim.get("cierre_m")) or CIERRE_M))
+        ini = max(self.ENTRADA_INI_M, int(fnum(self.lim.get("entrada_ini_m")) or 0))
+        fin = min(self.ENTRADA_FIN_M, int(fnum(self.lim.get("entrada_fin_m")) or self.ENTRADA_FIN_M))
+        cierre = min(self.CIERRE_M, int(fnum(self.lim.get("cierre_m")) or self.CIERRE_M))
         return ini, fin, cierre
 
     def motivo(self, o: dict, now: float) -> str | None:
@@ -323,24 +381,26 @@ class Ejecutor:
         lim, trail, obj, qty, gat = o["limite"], o["trail"], o["objetivo"], o["qty"], o["gatillo"]
         if not (lim and lim > 0 and trail and trail > 0 and obj and obj > lim and qty >= 1):
             return "orden incompleta o inválida"
+        if o.get("stop") is not None and not (0 < o["stop"] < lim and abs(lim - o["stop"] - trail) < 0.011):
+            return "stop fijo inválido"
         if o["tipo"] not in ("stp", "lmt") or (o["tipo"] == "stp" and not (gat and 0 < gat <= lim)):
             return "tipo de orden inválido"
         if not o["hasta"] or o["hasta"] <= now:
             return "la orden ya venció"
         costo = qty * lim
-        if costo > self.tope("orden_usd", ORDEN_USD) + 0.01:
-            return f"US${costo:,.0f} pasa del máximo de US${self.tope('orden_usd', ORDEN_USD):,.0f} por operación"
+        if costo > self.tope("orden_usd", self.ORDEN_USD) + 0.01:
+            return f"US${costo:,.0f} pasa del máximo de US${self.tope('orden_usd', self.ORDEN_USD):,.0f} por operación"
         res = self.resumen()
         if o["t"] in res["vivas_t"]:
             return f"ya hay una orden o posición en {o['t']}"
-        tope = self.tope("max_abierto", MAX_ABIERTO)
+        tope = self.tope("max_abierto", self.MAX_ABIERTO)
         if res["comprometido"] + costo > tope + 0.01:
             return f"pasaría de US${tope:,.0f} comprometidos (ya hay US${res['comprometido']:,.0f})"
-        pmax = self.tope("perdida_max", PERDIDA_MAX)
+        pmax = self.tope("perdida_max", self.PERDIDA_MAX)
         if res["perdida_dia"] + res["riesgo_abierto"] + qty * trail > pmax + 0.01:
             return f"podría pasar la pérdida máxima del día (US${pmax:,.0f})"
-        if sum(1 for x in self.ord.values() if x.get("oids", {}).get("e")) >= MAX_ORDENES_DIA:
-            return f"ya puse {MAX_ORDENES_DIA} órdenes hoy"
+        if sum(1 for x in self.ord.values() if x.get("oids", {}).get("e")) >= self.MAX_ORDENES_DIA:
+            return f"ya puse {self.MAX_ORDENES_DIA} órdenes hoy"
         return None
 
     # ---------------- utilidades de IBKR ----------------
@@ -348,11 +408,40 @@ class Ejecutor:
         self.eventos.append({"ev": ev, "id": oid, **kw})
         del self.eventos[:-300]
         log.info("%s %s %s", ev.upper(), oid or "", " ".join(f"{k}={v}" for k, v in kw.items() if k != "detalle"))
+        if ev in ("salida", "cancelada", "rechazada") and oid in self.ord:
+            self.diario_fila(ev, self.ord[oid], kw)
+
+    def diario_fila(self, ev: str, o: dict, kw: dict):
+        """Una línea en el diario CSV (para comparar ejecutores y revisar días pasados). Nunca debe estorbar a las
+        órdenes: cualquier fallo solo se anota."""
+        try:
+            t = et(self.reloj())
+            qty = fnum(kw.get("qty")) or 0.0
+            riesgo = qty * (o.get("trail") or 0.0)
+            pnl = fnum(kw.get("pnl"))
+            com = sum(float(getattr(getattr(f, "commissionReport", None), "commission", 0) or 0)
+                      for f in self.ib.fills() if self.ref_re.fullmatch(getattr(f.execution, "orderRef", "") or "")
+                      and self.ref_re.fullmatch(f.execution.orderRef).group(1) == o["id"]) if ev == "salida" else 0.0
+            fila = [t.date().isoformat(), f"{t:%H:%M:%S}", self.NOMBRE, ev, o.get("t"), qty or "", kw.get("px_e") or "",
+                    kw.get("px") or "", "" if pnl is None else pnl, round(com, 2) if com else "",
+                    round(riesgo, 2) if riesgo else "", round(pnl / riesgo, 2) if (pnl is not None and riesgo) else "",
+                    kw.get("por") or "", o.get("setup") or o.get("tipo") or "", kw.get("motivo") or ""]
+            nuevo = not os.path.exists(self.diario)
+            with open(self.diario, "a", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                if nuevo:
+                    w.writerow(DIARIO_COLS)
+                w.writerow(fila)
+        except Exception as e:  # noqa: BLE001
+            log.warning("No pude escribir el diario %s: %s", self.diario, e)
 
     @staticmethod
     def detalle(o: dict) -> str:
         compra = (f"compra stop {o['gatillo']:.2f} (límite {o['limite']:.2f})" if o["tipo"] == "stp"
                   else f"compra límite {o['limite']:.2f}")
+        if o.get("stop"):
+            return (f"· {o['qty']} acc · {compra} · stop {o['stop']:.2f} · objetivo {o['objetivo']:.2f}"
+                    + (f" · {o['setup']}" if o.get("setup") else ""))
         return f"· {o['qty']} acc · {compra} · Trailing {o['trail']:.2f} · objetivo {o['objetivo']:.2f}"
 
     def _trade(self, order_id):
@@ -411,6 +500,9 @@ class Ejecutor:
              "gatillo": fnum(raw.get("gatillo")), "limite": fnum(raw.get("limite")), "trail": fnum(raw.get("trail")),
              "objetivo": fnum(raw.get("objetivo")), "qty": int(fnum(raw.get("qty")) or 0),
              "hasta": min(hasta, et_ts(now, fin)) if hasta else 0, "estado": "nueva", "oids": {}, "recibida": now}
+        if raw.get("stop") is not None:
+            o["stop"] = fnum(raw.get("stop"))      # stop fijo en vez de Trailing (ejecutor de Claude)
+            o["setup"] = str(raw.get("setup") or "")[:160]
         self.ord[oid] = o
         m = "se canceló antes de llegar" if oid in self.cancel_ids else self.motivo(o, now)
         c = None
@@ -433,12 +525,12 @@ class Ejecutor:
         self.guardar()
 
     def _colocar(self, o: dict, c, con_gtd: bool):
-        """Bracket estándar de IBKR: compra + Trailing + objetivo como hijas (IBKR las enlaza: si una se ejecuta,
+        """Bracket estándar de IBKR: compra + Trailing (o stop fijo) + objetivo como hijas (IBKR las enlaza: si una se ejecuta,
         cancela la otra; si una se llena en parte, reduce la otra). La compra sale con transmit=False y las hijas
         detrás: IBKR recibe las tres al transmitir la última, así nunca hay una compra sin su stop."""
         oid = o["id"]
         e = Order(action="BUY", totalQuantity=o["qty"], orderType="STP LMT" if o["tipo"] == "stp" else "LMT",
-                  lmtPrice=o["limite"], orderRef=f"sem-{oid}-e", transmit=False)
+                  lmtPrice=o["limite"], orderRef=f"{self.PREFIJO}-{oid}-e", transmit=False)
         if o["tipo"] == "stp":
             e.auxPrice = o["gatillo"]
         if con_gtd:
@@ -446,11 +538,15 @@ class Ejecutor:
         else:
             e.tif = "DAY"
         self.ib.placeOrder(c, e)
-        t = Order(action="SELL", totalQuantity=o["qty"], orderType="TRAIL", auxPrice=o["trail"], parentId=e.orderId,
-                  tif="DAY", orderRef=f"sem-{oid}-t", transmit=False)
+        if o.get("stop"):   # stop fijo (nativo de IBKR): sale al mercado si el precio toca el nivel
+            t = Order(action="SELL", totalQuantity=o["qty"], orderType="STP", auxPrice=o["stop"], parentId=e.orderId,
+                      tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-t", transmit=False)
+        else:
+            t = Order(action="SELL", totalQuantity=o["qty"], orderType="TRAIL", auxPrice=o["trail"], parentId=e.orderId,
+                      tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-t", transmit=False)
         self.ib.placeOrder(c, t)
         ob = Order(action="SELL", totalQuantity=o["qty"], orderType="LMT", lmtPrice=o["objetivo"], parentId=e.orderId,
-                   tif="DAY", orderRef=f"sem-{oid}-o", transmit=True)
+                   tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-o", transmit=True)
         self.ib.placeOrder(c, ob)
         o["oids"] = {}
         for rol, x in (("e", e), ("t", t), ("o", ob)):
@@ -502,7 +598,7 @@ class Ejecutor:
                 o["aviso_venta"] = True
                 self.evento("error", o["id"], t=o["t"], motivo=f"No pude vender {o['t']} ({ab:g} acc). Ciérrala tú en IBKR.")
             return
-        orden = Order(action="SELL", totalQuantity=ab, orderType="MKT", tif="DAY", orderRef=f"sem-{o['id']}-x")
+        orden = Order(action="SELL", totalQuantity=ab, orderType="MKT", tif="DAY", orderRef=f"{self.PREFIJO}-{o['id']}-x")
         self.ib.placeOrder(self._contrato(o), orden)
         self._rol(o, "x", orden.orderId)
         o["ventas"] = o.get("ventas", 0) + 1
@@ -520,7 +616,7 @@ class Ejecutor:
             o["aviso_corto"] = True
             self.evento("error", o["id"], t=o["t"], motivo=f"{o['t']}: se vendió de más ({falta:g} acc en corto); "
                                                            f"recompro la diferencia")
-        orden = Order(action="BUY", totalQuantity=falta, orderType="MKT", tif="DAY", orderRef=f"sem-{o['id']}-c")
+        orden = Order(action="BUY", totalQuantity=falta, orderType="MKT", tif="DAY", orderRef=f"{self.PREFIJO}-{o['id']}-c")
         self.ib.placeOrder(self._contrato(o), orden)
         self._rol(o, "c", orden.orderId)
         o["recompras"] = o.get("recompras", 0) + 1
@@ -609,8 +705,9 @@ class Ejecutor:
                 self._recomprar(o, -ab)
             elif ab <= EPS:
                 if qb > 0:
-                    roles = {REF.fullmatch(e.orderRef).group(2) for e in self.ejecs(oid, "tox")}
-                    por = "cierre" if "x" in roles else "trailing" if "t" in roles else "objetivo"
+                    roles = {self.ref_re.fullmatch(e.orderRef).group(2) for e in self.ejecs(oid, "tox")}
+                    por = ("cierre" if "x" in roles else ("stop" if o.get("stop") else "trailing") if "t" in roles
+                           else "objetivo")
                     pnl = qs * ps - qb * pb
                     o["estado"], o["pnl"] = "cerrada", round(pnl, 2)
                     self.evento("salida", oid, t=o["t"], px=round(ps, 4), qty=qs, por=por, pnl=round(pnl, 2),
@@ -701,6 +798,10 @@ class Ejecutor:
         dia = t.date().isoformat()
         if dia != self.dia:
             self.nuevo_dia(dia)
+        despierto = t.weekday() < 5 and 8 * 60 + 30 <= m < 16 * 60 + 30
+        if despierto != self._despierto:   # Windows no se duerme mientras el mercado está abierto (y la PC está prendida)
+            self._despierto = despierto
+            mantener_despierto(despierto)
         if not self.ib.isConnected():
             self.paper = False
             if not self.conectar():
@@ -710,7 +811,7 @@ class Ejecutor:
         self.atender_errores()
         self.revisar(now)
         res = self.resumen()
-        if not self.parado and res["perdida_dia"] >= self.tope("perdida_max", PERDIDA_MAX) - 0.01:
+        if not self.parado and res["perdida_dia"] >= self.tope("perdida_max", self.PERDIDA_MAX) - 0.01:
             self.parado = True
             for o in list(self.ord.values()):
                 if o["estado"] == "puesta":
@@ -733,7 +834,8 @@ class Ejecutor:
         if res is None:
             res = self.resumen() if self.paper else {}
         estado = {"ib": bool(self.paper), "paper": self.paper, "cuenta": self.cuenta, "bloqueado": self.bloqueado,
-                  "parado": self.parado, "pausa": self.pausa, "modo": self.modo, "version": VERSION, **res}
+                  "parado": self.parado, "pausa": self.pausa, "modo": self.modo, "version": VERSION, **res,
+                  **self.extra_estado()}
         lote = self.eventos[:100]
         try:
             out = self.post(self.url, self.token, {"v": 1, "estado": estado, "eventos": lote}, timeout=5)
@@ -752,6 +854,10 @@ class Ejecutor:
             self.err_red = None
         del self.eventos[:len(lote)]
         return out if isinstance(out, dict) else None
+
+    def extra_estado(self) -> dict:
+        """Campos propios de cada ejecutor para el estado que se manda al semáforo (el de Claude añade los suyos)."""
+        return {}
 
     def atender(self, resp: dict, now: float):
         pausa, modo = bool(resp.get("pausa")), resp.get("modo") if resp.get("modo") in ("boton", "auto") else self.modo
@@ -806,26 +912,14 @@ class Ejecutor:
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Ejecutor de órdenes en la cuenta PAPER de IBKR (dinero simulado)")
     ap.parse_args(argv)
-    try:
-        sys.stdout.reconfigure(errors="replace")
-        sys.stderr.reconfigure(errors="replace")
-    except (AttributeError, ValueError):
-        pass
-    handlers = [logging.StreamHandler()]
-    try:
-        handlers.append(logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=2,
-                                                             encoding="utf-8"))
-    except OSError:
-        pass
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", handlers=handlers)
-    logging.getLogger("ib_async").setLevel(logging.ERROR)
+    configurar_log(LOG_FILE)
     cfg = read_env()
     if not cfg["BRIDGE_TOKEN"]:
         print("Falta la clave del semáforo (BRIDGE_TOKEN en puente.env). Es la misma del puente IBKR.")
-        return 1
+        return 2   # 2 = no tiene sentido reintentar: ejecutor.bat no lo reabre
     if IB is None:
         print("Falta la librería de IBKR. Instálala con:  py -m pip install -r requirements.txt")
-        return 1
+        return 2
     no_quickedit()
     log.info("Ejecutor PAPER %s -> %s. Candado: solo IB Gateway paper (puerto %d, cuentas DU). Ctrl+C para salir.",
              VERSION, cfg["SEMAFORO_URL"], PUERTO)
