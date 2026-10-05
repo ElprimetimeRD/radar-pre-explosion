@@ -6,7 +6,7 @@ de paper (empiezan por DU). No hay variable ni archivo que lo apunte a la cuenta
 Cada segundo le pregunta al semáforo (Render) si hay órdenes nuevas: las que tocaste con «✅ Ejecutar en paper» (o
 todas, en modo automático). Las pone en IBKR como una orden con dos hijas (bracket estándar de IBKR):
   - compra: Stop Limit (aviso ARMA: compra sola al romper) o Limit (COMPRA y ⚡), válida hasta la hora del aviso (GTD,
-    nunca después de las 12:00 ET);
+    nunca después de la hora en que se cierran las compras: 15:30 ET, o antes si el semáforo la acorta);
   - Trailing: stop que sube con el precio a la distancia del stop del plan y nunca baja;
   - objetivo: venta límite +5 %. Si se ejecuta una hija, IBKR cancela la otra.
 Y le devuelve al semáforo lo que pasa (puesta, comprada, vendida, rechazada) para que te llegue por Telegram.
@@ -18,7 +18,8 @@ Seguridad, en cada vuelta:
   - los manejadores de eventos de IBKR solo anotan: todo lo que toca IBKR se hace aquí, en el ciclo.
 Límites propios (si el semáforo manda límites más estrictos, usa esos): US$500 por operación · US$1,000 comprometidos
 (posiciones + compras puestas) · no pone una orden si la pérdida del día más lo que podría perder lo abierto pasaría de
-US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–12:00 ET · una orden viva por acción ·
+US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–15:30 ET (la última COMPRA que emite el semáforo;
+si el semáforo cierra las compras antes —ENTRY_END_M en Render— toma esa hora) · una orden viva por acción ·
 20 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes ni posiciones que no haya
 puesto él: las reconoce por su referencia "sem-<id>-<rol>".
 
@@ -55,7 +56,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.5"
+VERSION = "1.6"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -67,7 +68,8 @@ ORDEN_USD = 500.0
 MAX_ABIERTO = 1000.0
 PERDIDA_MAX = 100.0
 ENTRADA_INI_M = 9 * 60 + 30
-ENTRADA_FIN_M = 12 * 60
+ENTRADA_FIN_M = 15 * 60 + 30   # tope propio = la última COMPRA que emite el semáforo; la hora real la manda el semáforo
+                               # (ENTRY_END_M en Render) y el ejecutor toma siempre la más estricta de las dos
 CIERRE_M = 15 * 60 + 55
 MAX_ORDENES_DIA = 20
 LOCK_PORT = 45041        # puerto local (solo 127.0.0.1) que reserva la copia abierta de este ejecutor: una sola a la vez

@@ -27,6 +27,9 @@ if /i "%~1"=="/reiniciar" set "REINICIAR=1"
 shift
 goto args
 :args_ok
+rem Reinicio pedido a distancia: si existe reiniciar.flag, esta pasada se comporta como /reiniciar (y borra la marca para no repetirlo).
+if exist "%AQUI%reiniciar.flag" set "REINICIAR=1"
+if exist "%AQUI%reiniciar.flag" del "%AQUI%reiniciar.flag" >nul 2>&1
 set "D=%USERPROFILE%\Documents\IBC"
 set "INI=%D%\config-paper.ini"
 set "PUENTE=%USERPROFILE%\Claude\radar-puente"

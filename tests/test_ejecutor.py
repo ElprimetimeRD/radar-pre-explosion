@@ -207,10 +207,14 @@ def test_orden_con_hijas():
     assert [a["estado"] for a in evs(posted, "ack")] == ["puesta"]        # le repite al semáforo cómo va
     est = posted[-1]["estado"]
     assert est["comprometido"] == round(49 * 10.03 + 24 * 20.06, 2) and est["vivas_t"] == ["ABC", "XYZ"], est
-    ex2, ib2, c2, p2, r2 = nuevo()                                        # vencimiento: nunca después de las 12:00
-    r2["r"] = {"ordenes": [orden(hasta=at(15, 0))]}
+    ex2, ib2, c2, p2, r2 = nuevo()                                        # vencimiento: nunca después de las 15:30
+    r2["r"] = {"ordenes": [orden(hasta=at(16, 0))]}
     ex2.paso()
-    assert ib2.placed[0][1].goodTillDate == "20261005 12:00:00 US/Eastern"
+    assert ib2.placed[0][1].goodTillDate == "20261005 15:30:00 US/Eastern"
+    ex2b, ib2b, c2b, p2b, r2b = nuevo()                                   # y si el semáforo cierra las compras antes, esa hora
+    r2b["r"] = {"limites": {"entrada_fin_m": 12 * 60}, "ordenes": [orden(hasta=at(16, 0))]}
+    ex2b.paso()
+    assert ib2b.placed[0][1].goodTillDate == "20261005 12:00:00 US/Eastern", [p[1].goodTillDate for p in ib2b.placed]
 
 
 def test_llena_y_sale():
@@ -259,12 +263,22 @@ def test_limites():
     exn.paso()
     vuelta(exn, cn, rn)
     assert ibn.placed == [] and "no reconoce" in evs(pn, "rechazada")[0]["motivo"]
-    for h, m_ in ((12, 1), (9, 29)):                                     # fuera de 9:30–12:00 ET
+    for h, m_ in ((15, 31), (9, 29)):                                    # fuera de 9:30–15:30 ET
         ex2, ib2, c2, p2, r2 = nuevo(now=at(h, m_))
         r2["r"] = {"ordenes": [orden(hasta=at(h, m_) + 600)]}
         ex2.paso()
         vuelta(ex2, c2, r2)
         assert ib2.placed == [] and "horario" in evs(p2, "rechazada")[0]["motivo"]
+    for h, m_ in ((12, 1), (14, 45), (15, 29)):                          # la tarde también vale (ya no se corta a las 12:00)
+        ex2, ib2, c2, p2, r2 = nuevo(now=at(h, m_))
+        r2["r"] = {"ordenes": [orden(hasta=at(h, m_) + 600)]}
+        ex2.paso()
+        assert len(ib2.placed) == 3 and not evs(p2, "rechazada"), (h, m_, [e["motivo"] for e in evs(p2, "rechazada")])
+    ex2, ib2, c2, p2, r2 = nuevo(now=at(12, 1))                           # si el semáforo cierra las compras a las 12:00, manda esa hora
+    r2["r"] = {"limites": {"entrada_fin_m": 12 * 60}, "ordenes": [orden(hasta=at(12, 1) + 600)]}
+    ex2.paso()
+    vuelta(ex2, c2, r2)
+    assert ib2.placed == [] and "9:30–12:00" in evs(p2, "rechazada")[0]["motivo"]
     sab = datetime(2026, 10, 3, 10, 0, tzinfo=NY).timestamp()
     ex3, ib3, c3, p3, r3 = nuevo(now=sab)
     r3["r"] = {"ordenes": [orden(hasta=sab + 600)]}

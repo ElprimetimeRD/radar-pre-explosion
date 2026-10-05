@@ -177,7 +177,7 @@ def informe(sem: list[dict], cla: list[dict], dias_max: int | None = None) -> st
             out.append(f"{nombre}: " + " · ".join(f"{POR.get(k, k)} {n} ({_usd(s)})" for k, (n, s) in sorted(r["por_motivo"].items())))
     out += ["", veredicto(a, b), "",
             "Lo que no dice este marcador: ambos operan la misma cuenta y los mismos precios, pero con reglas distintas "
-            "(tuyo: señales del semáforo y entradas 9:30–12:00 ET con stop que sube; Claude: pullbacks de líderes, "
+            "(tuyo: señales del semáforo y entradas 9:30–15:30 ET con stop que sube; Claude: pullbacks de líderes, "
             "9:50–15:15 ET, stop fijo y objetivo de 2R). Cada uno cuenta solo sus órdenes (cada orden lleva su prefijo en IBKR)."]
     return "\n".join(out)
 
