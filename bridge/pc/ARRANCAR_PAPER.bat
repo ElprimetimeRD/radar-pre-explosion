@@ -101,11 +101,22 @@ timeout /t 20 >nul
 exit /b 0
 
 :ejecutor
+rem Tres seguros contra abrir una copia de mas: 1) el detector de procesos, 2) la segunda opinion del semaforo (si ve al
+rem ejecutor hablando hace menos de 90 s, esta abierto aunque el detector no lo vea; no se consulta en /reiniciar, porque
+rem ahi se acaba de cerrar a proposito) y 3) el propio programa, que se cierra si ya hay otra copia (codigo 3).
 powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%ejecutor_activo.ps1" -Patron "ejecutor_%~1\.py|ejecutor\.bat\W{1,3}%~1"
 if "%errorlevel%"=="1" goto ej_ya
+if defined REINICIAR goto ej_abrir
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%render_vivo.ps1" -Que %~1
+if "%errorlevel%"=="1" goto ej_visto
+:ej_abrir
 start "%~2" /min "%PUENTE%\ejecutor.bat" %~1
 call :log "Ejecutor %~1 lanzado"
 if not defined SILENCIO echo Ejecutor %~1 abierto.
+exit /b 0
+:ej_visto
+call :log "Ejecutor %~1: el detector no lo ve, pero el semaforo lo ve hablando: no abro otro"
+if not defined SILENCIO echo Ejecutor %~1 ya estaba abierto ^(lo ve el semaforo^): no abro otro.
 exit /b 0
 :ej_ya
 call :log "Ejecutor %~1 ya estaba abierto"

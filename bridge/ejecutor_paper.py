@@ -41,6 +41,7 @@ import logging.handlers
 import math
 import os
 import re
+import socket
 import sys
 import time
 
@@ -52,7 +53,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.3"
+VERSION = "1.4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -67,6 +68,7 @@ ENTRADA_INI_M = 9 * 60 + 30
 ENTRADA_FIN_M = 12 * 60
 CIERRE_M = 15 * 60 + 55
 MAX_ORDENES_DIA = 20
+LOCK_PORT = 45041        # puerto local (solo 127.0.0.1) que reserva la copia abierta de este ejecutor: una sola a la vez
 CERRAR_TTL = 300         # s: un /cerrar más viejo que esto (p. ej. de antes de arrancar) no se ejecuta
 CANCEL_ESPERA = 5        # s máximos esperando que IBKR confirme una cancelación antes de recontar
 AVISOS = {161, 202, 399, 404, 2109, 10089, 10090, 10148, 10167, 10168, 10197, 10349}  # informativos, no son problema
@@ -918,6 +920,38 @@ class Ejecutor:
                         "15:55 ET para que las cierre, o ciérralas tú.", ", ".join(abiertas))
 
 
+def tomar_cerrojo(puerto: int):
+    """Una sola copia de cada ejecutor: reserva un puerto local (solo 127.0.0.1) mientras el programa viva; el sistema lo
+    libera solo si el programa se cierra o se cae. Devuelve (socket, hay_otro):
+      (socket, False)  el puerto es nuestro (hay que conservar el socket hasta salir);
+      (None, True)     no se pudo reservar Y alguien contesta en ese puerto: ya hay otra copia abierta;
+      (None, False)    no se pudo reservar pero nadie contesta (puerto bloqueado por el sistema): se sigue sin este
+                       seguro, porque un seguro roto no debe dejar al ejecutor sin arrancar."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if not hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # en Linux/Mac hace falta para reabrir justo tras cerrar; en Windows NO (dejaría compartir el puerto)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", puerto))
+        s.listen(1)
+        return s, False
+    except OSError:
+        s.close()
+    try:                                                   # ¿contesta alguien en ese puerto?
+        with socket.create_connection(("127.0.0.1", puerto), timeout=2):
+            return None, True
+    except OSError:
+        return None, False
+
+
+def ya_hay_otro(puerto: int, nombre: str) -> int:
+    """Mensaje y código de salida 3 cuando ya hay otra copia: ejecutor.bat no la reabre (el que ya corre sigue como está)."""
+    msg = (f"Ya hay otro {nombre} abierto (el puerto local {puerto} está ocupado): este se cierra y el que ya corría "
+           f"sigue como está.")
+    print(msg)
+    log.warning(msg)
+    return 3
+
+
 def esperar(ib, segundos: float):
     """Espera procesando lo que llega de IBKR. Si el Gateway se cae (o se reinicia, como cada noche a las 23:30), la
     librería convierte el corte en un ConnectionError que sale justo de esta espera: no debe matar al programa, el
@@ -970,6 +1004,11 @@ def main(argv=None):
     if IB is None:
         print("Falta la librería de IBKR. Instálala con:  py -m pip install -r requirements.txt")
         return 2
+    cerrojo, hay_otro = tomar_cerrojo(LOCK_PORT)
+    if hay_otro:
+        return ya_hay_otro(LOCK_PORT, "ejecutor paper")
+    if cerrojo is None:
+        log.warning("No pude reservar el puerto local %d (una sola copia a la vez); sigo sin ese seguro.", LOCK_PORT)
     no_quickedit()
     log.info("Ejecutor PAPER %s -> %s. Candado: solo IB Gateway paper (puerto %d, cuentas DU). Ctrl+C para salir.",
              VERSION, cfg["SEMAFORO_URL"], PUERTO)
@@ -981,6 +1020,8 @@ def main(argv=None):
         pass
     finally:
         cerrar(ex, ib)
+        if cerrojo:
+            cerrojo.close()
     log.info("Ejecutor detenido.")
     return 0
 

@@ -694,6 +694,54 @@ def test_el_error_real_de_ib_async():
         E.time.sleep = old
 
 
+def _puerto_libre():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def test_una_sola_copia():
+    """El cerrojo (puerto local): la primera copia lo toma, la segunda ve que ya hay otra, y al cerrar la primera se libera.
+    Si el puerto no se puede reservar y NADIE contesta (p. ej. bloqueado por el sistema), se sigue sin el seguro: un seguro
+    roto no debe dejar al ejecutor sin arrancar."""
+    import socket
+    p = _puerto_libre()
+    s1, otro1 = E.tomar_cerrojo(p)
+    assert s1 is not None and otro1 is False
+    s2, otro2 = E.tomar_cerrojo(p)
+    assert s2 is None and otro2 is True                                   # ya hay otra copia
+    assert E.ya_hay_otro(p, "ejecutor de prueba") == 3                    # y su código de salida es 3
+    s1.close()
+    s3, otro3 = E.tomar_cerrojo(p)                                        # liberado: se puede volver a tomar (reinicio)
+    assert s3 is not None and otro3 is False
+    s3.close()
+    # puerto que el sistema no deja reservar, sin nadie escuchando: no es "otra copia"
+    p4 = _puerto_libre()
+    real = E.socket.socket
+
+    class Bloqueado(real):
+        def bind(self, addr):
+            raise PermissionError(13, "acceso denegado")
+    E.socket.socket = Bloqueado
+    try:
+        s4, otro4 = E.tomar_cerrojo(p4)
+    finally:
+        E.socket.socket = real
+    assert s4 is None and otro4 is False
+    # puerto ocupado por un programa cualquiera que sí contesta: se trata como "ya hay otra copia" (se cierra, no se pelea)
+    ajeno = socket.socket()
+    ajeno.bind(("127.0.0.1", 0))
+    ajeno.listen(1)
+    try:
+        s5, otro5 = E.tomar_cerrojo(ajeno.getsockname()[1])
+    finally:
+        ajeno.close()
+    assert s5 is None and otro5 is True
+
+
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -724,5 +772,6 @@ if __name__ == "__main__":
     test_reconexion_tras_reinicio_del_gateway()
     test_el_corte_de_conexion_no_mata_el_bucle()
     test_el_error_real_de_ib_async()
+    test_una_sola_copia()
     test_hora_et()
     print("OK · ejecutor paper")

@@ -52,6 +52,16 @@ foreach ($t in $pruebas) {
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $act -Patron $t[1] | Out-Null
   Add-Linea ("   {0,-16} -> {1}" -f $t[0], $LASTEXITCODE)
 }
+Add-Linea "   Segunda opinion (render_vivo.ps1): el semaforo en Render ve al ejecutor hablando hace menos de 90 s (1 = si, 0 = no)"
+$rv = Join-Path $PSScriptRoot 'render_vivo.ps1'
+foreach ($q in @('paper', 'claude')) {
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $rv -Que $q | Out-Null
+  Add-Linea ("   {0,-16} -> {1}" -f ('ejecutor ' + $q), $LASTEXITCODE)
+}
+$lk = @(Get-NetTCPConnection -State Listen -LocalPort 45041,45042 | Select-Object -ExpandProperty LocalPort -Unique)
+$lkTxt = 'ninguno'
+if ($lk.Count -gt 0) { $lkTxt = ($lk -join ', ') }
+Add-Linea ("   Cerrojo de una sola copia (45041 = paper, 45042 = claude; solo lo tiene la version nueva del programa): " + $lkTxt)
 Add-Linea ""
 
 # 4) Tarea programada

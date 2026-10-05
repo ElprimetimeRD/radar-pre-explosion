@@ -36,7 +36,7 @@ import estrategia_claude as S  # noqa: E402
 from datos_yahoo import Feed  # noqa: E402
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.1"
+VERSION = "1.2"
 LOG_FILE = os.path.join(HERE, "ejecutor_claude.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_claude.json")
 LISTA_FILE = os.path.join(HERE, "lista_claude.txt")
@@ -60,6 +60,9 @@ def cargar_lista(path: str = LISTA_FILE) -> list[str]:
     except OSError:
         pass
     return list(LISTA)
+
+
+LOCK_PORT = 45042            # una sola copia de este ejecutor (el del semáforo usa 45041)
 
 
 class EjecutorClaude(E.Ejecutor):
@@ -237,6 +240,11 @@ def main(argv=None):
     if E.IB is None:
         print("Falta la librería de IBKR. Instálala con:  py -m pip install -r requirements.txt")
         return 2
+    cerrojo, hay_otro = E.tomar_cerrojo(LOCK_PORT)
+    if hay_otro:
+        return E.ya_hay_otro(LOCK_PORT, "ejecutor de Claude")
+    if cerrojo is None:
+        log.warning("No pude reservar el puerto local %d (una sola copia a la vez); sigo sin ese seguro.", LOCK_PORT)
     no_quickedit()
     lista = cargar_lista()
     log.info("Ejecutor de CLAUDE %s (motor %s) -> %s. Candado: solo IB Gateway paper (puerto %d, cuentas DU). %d acciones. "
@@ -251,6 +259,8 @@ def main(argv=None):
         pass
     finally:
         E.cerrar(ex, ib)
+        if cerrojo:
+            cerrojo.close()
     log.info("Ejecutor de Claude detenido.")
     return 0
 
