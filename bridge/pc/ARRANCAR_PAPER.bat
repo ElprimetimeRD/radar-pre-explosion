@@ -14,7 +14,10 @@ rem    las ordenes. Aqui se deja en "no" SOLO en el .ini paper, antes de abrir e
 rem  - Cada ejecutor corre dentro de radar-puente\ejecutor.bat, que lo vuelve a abrir solo si se cae.
 rem  - Apunta cada paso en arranque_paper.log, para saber que paso si algo no abre.
 rem =====================================================================================================================
-set "LOG=%~dp0arranque_paper.log"
+rem OJO: SHIFT (mas abajo) tambien mueve %0, y despues %~dp0 ya no es esta carpeta sino C:\ . Por eso la carpeta se guarda
+rem en AQUI antes de leer los argumentos y todo lo demas usa %AQUI% (nunca %~dp0).
+set "AQUI=%~dp0"
+set "LOG=%AQUI%arranque_paper.log"
 set "SILENCIO="
 set "REINICIAR="
 :args
@@ -30,7 +33,7 @@ set "PUENTE=%USERPROFILE%\Claude\radar-puente"
 if defined SILENCIO (call :log "---- inicio (silencioso) ----") else (call :log "---- inicio ----")
 
 if not defined REINICIAR goto sin_reinicio
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0parar_ejecutores.ps1" >>"%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%parar_ejecutores.ps1" >>"%LOG%" 2>&1
 call :log "Ejecutores cerrados para volver a abrirlos"
 ping -n 4 127.0.0.1 >nul
 :sin_reinicio
@@ -57,15 +60,15 @@ if defined REAL if not defined SILENCIO echo AVISO: el IB Gateway REAL esta abie
 set "PAPER="
 for /f %%P in ('netstat -ano ^| findstr /r /c:":4002 .*LISTENING"') do set "PAPER=1"
 if defined PAPER goto gw_escucha
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ejecutor_activo.ps1" -Patron "ibcalpha\.ibc\.IbcGateway"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%ejecutor_activo.ps1" -Patron "ibcalpha\.ibc\.IbcGateway"
 if "%errorlevel%"=="1" goto gw_entrando
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0gateway_reciente.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%gateway_reciente.ps1"
 if "%errorlevel%"=="1" goto gw_entrando
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0fijar_ini.ps1" -Archivo "%INI%" -Clave ReadOnlyApi -Valor no >>"%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%fijar_ini.ps1" -Archivo "%INI%" -Clave ReadOnlyApi -Valor no >>"%LOG%" 2>&1
 if errorlevel 1 goto ini_mal
 call :log "Read-Only API en no: ok"
 start "IBC PAPER" /min "%USERPROFILE%\Claude\IBC\StartGatewayPaper.bat"
->"%~dp0gateway_lanzado.txt" echo %date% %time%
+>"%AQUI%gateway_lanzado.txt" echo %date% %time%
 call :log "Gateway paper lanzado"
 if not defined SILENCIO echo IB Gateway paper abierto: entra solo en 1 o 2 minutos.
 goto gw_fin
@@ -98,7 +101,7 @@ timeout /t 20 >nul
 exit /b 0
 
 :ejecutor
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ejecutor_activo.ps1" -Patron "ejecutor_%~1\.py|ejecutor\.bat\W{1,3}%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%ejecutor_activo.ps1" -Patron "ejecutor_%~1\.py|ejecutor\.bat\W{1,3}%~1"
 if "%errorlevel%"=="1" goto ej_ya
 start "%~2" /min "%PUENTE%\ejecutor.bat" %~1
 call :log "Ejecutor %~1 lanzado"
