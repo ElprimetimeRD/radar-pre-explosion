@@ -102,10 +102,10 @@ def test_perfil_volatil():
     bars, _ = barras_lider()
     base = S.con(S.CFG, **S.BASE)
     assert S.BASE["stop_atr"] == 0 and base.chg_max == 0.30 and base.retr_max == 0.60 and base.hod_min_r == 1.5
-    assert S.CFG.chg_max == 0.50 and S.CFG.retr_max == 0.70 and S.CFG.retr_prof == 0.85 and S.CFG.hod_min_r == 1.2
+    assert S.CFG.chg_max == 0.50 and S.CFG.retr_max == 0.70 and S.CFG.retr_prof == 0.85 and S.CFG.hod_min_r == 0.0
     assert S.CFG.stop_atr == 0.33 and S.CFG.stop_max == 0.05 and S.CFG.riesgo_usd == 6.0 and S.CFG.riesgo_max_usd == 15.0
     assert S.CFG.orden_usd == 500.0                                       # los topes de dinero no cambian
-    sin_hod = S.con(S.CFG, hod_min_r=0.0)                                 # aparte: lo que se prueba aquí es el stop
+    sin_hod = S.CFG                                                       # (el máximo del día ya no se exige; ver 4)
     # 1) el stop sigue a la volatilidad: ATR 3 % → piso 1 %, 6 % → 2 %, 12 % → 4 %; el de antes era siempre 0.6 %
     pasos = {}
     for atr in (0.03, 0.06, 0.12):
@@ -129,10 +129,10 @@ def test_perfil_volatil():
     # 3) tope de distancia del stop
     j, m = S.evaluar("X", bars, 90.0, 10e6, 0.12, S.con(sin_hod, stop_max=0.03))
     assert j is None and m.startswith("stop lejos"), m
-    # 4) con ATR 6 % el máximo del día queda a 1.2R: no basta para la regla de antes (1.5R) pero sí para esta
-    j, m = S.evaluar("X", bars, 90.0, 10e6, 0.06, base)
-    assert j is not None
+    # 4) con ATR 6 % el stop (2 %) deja el máximo del día a ~1.2R: la regla de antes (1.5R) la descartaba, esta no la exige
     j, m = S.evaluar("X", bars, 90.0, 10e6, 0.06, S.CFG)
+    assert j is not None, m
+    j, m = S.evaluar("X", bars, 90.0, 10e6, 0.06, S.con(S.CFG, hod_min_r=1.5))
     assert j is None and "máximo del día" in m
     # 5) líderes más extendidos: +45 % en el día se compra, +87 % no; con el perfil de antes +45 % era parabólica
     j, m = S.evaluar("X", bars, 71.0, 10e6, 0.03, S.CFG)

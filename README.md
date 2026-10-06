@@ -98,7 +98,7 @@ de unas 45 acciones líquidas (`lista_claude.txt` la reemplaza, una por línea).
   y el último cierre) con **stop fijo** bajo el mínimo del retroceso (nunca menos de 0.6 %) y **objetivo a 2R**; solo si el máximo del día queda a ≥ 1.5R de la
   entrada. La compra vence a los 10 min y se cancela antes si la jugada se rompe. Filtro de mercado suave (SPY no peor que −0.5 % en el día). Ventana 9:50–15:15 ET.
   **Perfil volátil (ejecutor de Claude 1.4; «más riesgo de volatilidad, no de dinero»):** el stop nunca queda a menos de ⅓ del ATR de la acción (antes siempre 0.6 %) ni a más de 5 % (si no, «stop lejos»);
-  acepta retrocesos de hasta 70 % del impulso (mínimo hasta 85 %, antes 60 / 70 %), líderes de hasta +50 % en el día (antes +30 %) y deja el máximo del día a 1.2R de la entrada (antes 1.5R).
+  acepta retrocesos de hasta 70 % del impulso (mínimo hasta 85 %, antes 60 / 70 %), líderes de hasta +50 % en el día (antes +30 %) y ya no exige que el máximo del día quede a 1.5R de la entrada (con un stop ancho esa regla descartaba 3 de cada 4 jugadas en el repaso histórico).
   El tamaño es el menor entre US$500 y las acciones que pierden como mucho US$6 (`riesgo_usd`) si salta el stop, mínimo 1 acción mientras no pase del tope de US$15: un stop más ancho compra menos acciones.
   Los topes de dinero del ejecutor no cambian. `S.con(S.CFG, **S.BASE)` devuelve las reglas de antes (para `tools/backtest_claude.py --cfg`).
   Como entra con órdenes límite en reposo y sale con órdenes nativas en IBKR, tolera el retraso de 1–2 min de Yahoo.

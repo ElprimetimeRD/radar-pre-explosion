@@ -14,7 +14,8 @@ La idea, en una frase: comprar la pausa de una acción fuerte, sin perseguirla.
      Lo que quede a las 15:55 ET se vende a mercado.
 Perfil volátil (v1.4, pedido de Priamo: «toma tú también mucho más riesgo», entendido como volatilidad, no dinero): acepta
 retrocesos más hondos (hasta el 70 % del impulso, mínimo hasta el 85 %), líderes más extendidos (hasta +50 % en el día),
-deja el máximo del día a 1.2R de la entrada (antes 1.5R) y pone el stop según la volatilidad de la acción. El dinero no
+ya no exige que el máximo del día quede a 1.5R de la entrada (con un stop ancho esa regla descartaba 3 de cada 4 jugadas
+en el repaso histórico) y pone el stop según la volatilidad de la acción. El dinero no
 sube: se compran las acciones que pierden como mucho US$6 (`riesgo_usd`) si salta el stop, con un mínimo de 1 acción
 siempre que no pase del tope de US$15; un stop más ancho compra menos acciones. Las constantes de antes están en
 `BASE` (S.con(CFG, **S.BASE) las devuelve).
@@ -60,7 +61,7 @@ class Cfg:
     stop_atr: float = 0.33         # ...ni a menos de un tercio del ATR diario de la acción (0 lo desactiva)
     stop_max: float = 0.05         # y si el stop queda a más de 5 % de la entrada no se compra («stop lejos»; 0 lo desactiva)
     r_obj: float = 2.0             # objetivo = entrada + 2R
-    hod_min_r: float = 1.2         # el máximo del día tiene que quedar al menos a 1.2R de la entrada (antes 1.5R)
+    hod_min_r: float = 0.0         # el máximo del día tiene que quedar al menos a esta distancia (en R) de la entrada (antes 1.5; 0 la apaga)
     spy_min: float = -0.005        # no se compra si SPY cae más de 0.5 % en el día
     ttl_s: int = 600               # la compra espera 10 min; si no se llena, se cancela
     orden_usd: float = 500.0

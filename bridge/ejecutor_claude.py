@@ -9,7 +9,7 @@ suyas son "sem-…". Mismo motor, mismo candado y mismas protecciones que el de 
 Lo que cambia es el cerebro. En vez de esperar órdenes del semáforo, lee velas de 1 min de Yahoo (datos_yahoo.py, hilo
 aparte) y aplica estrategia_claude.py: «pullback con tendencia» (compra LÍMITE en la pausa de un líder del día, stop fijo
 bajo el mínimo del retroceso, objetivo 2R; ver ese archivo). Compras de 9:50 a 15:15 ET. Desde la 1.4 con perfil volátil
-(stop según el ATR, retrocesos más hondos, líderes más extendidos) pero con el mismo dinero: tamaño por riesgo (US$6).
+(stop según el ATR, retrocesos más hondos, líderes más extendidos, sin exigir distancia al máximo) pero con el mismo dinero: tamaño por riesgo (US$6).
 
 Nunca toca órdenes ni posiciones que no haya puesto él, y antes de comprar una acción confirma que ningún otro ejecutor
 (ni tú a mano en TWS) tenga órdenes o posición en ella, para no cruzar órdenes en la misma cuenta.
