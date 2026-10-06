@@ -268,9 +268,7 @@ class Ejecutor:
             self.ib.errorEvent += self.on_error
             self.ib.disconnectedEvent += self.on_disconnect
             self._hooked = True
-        # Sin esto, una llamada a IBKR que el Gateway no contesta (p. ej. validar un símbolo) espera para siempre y el
-        # ejecutor queda mudo con la ventana abierta (6-oct: 9:37 y 11:20). Con tope, falla a los ESPERA_IB_S y sigue.
-        self.ib.RequestTimeout = ESPERA_IB_S
+        self.ib.RequestTimeout = 0   # conectar y reconciliar usan sus propios tiempos (con tope aquí, la conexión falla)
         try:
             self.ib.connect("127.0.0.1", PUERTO, clientId=self.CLIENT_ID, timeout=15)
         except Exception as e:  # noqa: BLE001 (rechazada, tiempo agotado, errores de la API)
@@ -289,6 +287,9 @@ class Ejecutor:
             return False
         self.bloqueado, self.paper, self.cuenta, self.err_ib = None, True, cuentas[0], None
         self.reconciliar()
+        # Sin tope, una llamada a IBKR que el Gateway no contesta (p. ej. validar un símbolo) espera para siempre y el
+        # ejecutor queda mudo con la ventana abierta (6-oct: 9:37 y 11:20). Con tope, falla a los ESPERA_IB_S y sigue.
+        self.ib.RequestTimeout = ESPERA_IB_S
         log.info("Conectado a IB Gateway PAPER (cuenta %s).", self.cuenta)
         return True
 
