@@ -57,7 +57,7 @@ def test_sin_jugada():
     assert "volumen bajo" in mot(bars, adv=100_000_000)                 # poco volumen para la hora
     assert mot(bars, adv=None) == "sin volumen habitual" and mot(bars, prev=None) == "sin cierre previo"
     assert mot(bars[:10]) == "pocas velas"
-    assert "parabólica" in mot(bars, prev=70.0)
+    assert "parabólica" in mot(bars, prev=55.0)
     assert "fuera del horario" in mot([b for b in bars if b[0] <= 585])        # 9:46: muy temprano
     # el retroceso
     sin_pb, _ = barras_lider(hasta=hod_m + 2)
@@ -76,6 +76,77 @@ def test_sin_jugada():
     feo = list(bars) + [(700, None, 1, 1, 1, 1), ("x",), (701, float("nan"), 1, 1, 1, 1), (570, 1, 1, 1, 1, 1)]
     j, _ = S.evaluar("X", feo, *base)
     assert j is not None                                                  # las velas inválidas o repetidas se ignoran
+
+
+def barras_hondas(baja=0.34):
+    """Como barras_lider, pero con la mañana tranquila muy cargada de volumen (el VWAP queda abajo) y un retroceso que
+    baja `baja` por vela durante 10 velas: con 0.34 retrocede el 65 % del impulso."""
+    out, m, px = [], 570, 100.0
+    for _ in range(20):
+        out.append((m, px, px + 0.15, px - 0.05, px + 0.05, 400_000))
+        m, px = m + 1, px + 0.05
+    for _ in range(20):
+        out.append((m, px, px + 0.25, px - 0.02, px + 0.2, 150_000))
+        m, px = m + 1, px + 0.2
+    for _ in range(10):
+        out.append((m, px, px + 0.05, px - baja - 0.02, px - baja, 60_000))
+        m, px = m + 1, px - baja
+    for _ in range(3):
+        out.append((m, px, px + 0.12, px - 0.01, px + 0.06, 60_000))
+        m, px = m + 1, px + 0.03
+    return out
+
+
+def test_perfil_volatil():
+    """Más volatilidad, no más dinero: stop según el ATR, retrocesos más hondos, líderes más extendidos, tamaño por riesgo."""
+    bars, _ = barras_lider()
+    base = S.con(S.CFG, **S.BASE)
+    assert S.BASE["stop_atr"] == 0 and base.chg_max == 0.30 and base.retr_max == 0.60 and base.hod_min_r == 1.5
+    assert S.CFG.chg_max == 0.50 and S.CFG.retr_max == 0.70 and S.CFG.retr_prof == 0.85 and S.CFG.hod_min_r == 1.2
+    assert S.CFG.stop_atr == 0.33 and S.CFG.stop_max == 0.05 and S.CFG.riesgo_usd == 6.0 and S.CFG.riesgo_max_usd == 15.0
+    assert S.CFG.orden_usd == 500.0                                       # los topes de dinero no cambian
+    sin_hod = S.con(S.CFG, hod_min_r=0.0)                                 # aparte: lo que se prueba aquí es el stop
+    # 1) el stop sigue a la volatilidad: ATR 3 % → piso 1 %, 6 % → 2 %, 12 % → 4 %; el de antes era siempre 0.6 %
+    pasos = {}
+    for atr in (0.03, 0.06, 0.12):
+        j, m = S.evaluar("X", bars, 90.0, 10e6, atr, sin_hod)
+        assert j, m
+        jb, mb = S.evaluar("X", bars, 90.0, 10e6, atr, base)
+        assert jb and abs(jb["stop_pct"] - 0.6) < 0.05, mb
+        pasos[atr] = j
+        assert abs(j["stop_pct"] - max(0.6, 0.33 * atr * 100)) < 0.1, (atr, j["stop_pct"])
+        assert j["atr"] == atr and j["trail"] == round(j["limite"] - j["stop"], 2)
+        assert j["objetivo"] == round(j["limite"] + 2 * j["trail"], 2) and f"stop {j['stop_pct']:.1f}%" in j["texto"]
+    assert pasos[0.03]["stop"] > pasos[0.06]["stop"] > pasos[0.12]["stop"]
+    # 2) el dinero no sube: el stop ancho compra menos acciones (el de antes compraba 4 con 0.6 % → US$2.48 en juego)
+    assert [pasos[a]["qty"] for a in (0.03, 0.06, 0.12)] == [4, 2, 1]
+    assert all(j["riesgo"] <= 6.0 + 1e-9 or j["qty"] == 1 for j in pasos.values())
+    assert pasos[0.12]["riesgo"] == round(pasos[0.12]["trail"], 2) <= 15.0     # mínimo 1 acción, dentro del tope de US$15
+    # y un stop que no cabe ni en una acción dentro del tope de US$15 no se compra
+    caro = [(m, o * 4, h * 4, low * 4, c * 4, v) for m, o, h, low, c, v in bars]          # ~US$414: 1 acción, stop de 4 %
+    j, m = S.evaluar("X", caro, 360.0, 10e6, 0.12, sin_hod)
+    assert j is None and "riesgo muy grande" in m, m
+    # 3) tope de distancia del stop
+    j, m = S.evaluar("X", bars, 90.0, 10e6, 0.12, S.con(sin_hod, stop_max=0.03))
+    assert j is None and m.startswith("stop lejos"), m
+    # 4) con ATR 6 % el máximo del día queda a 1.2R: no basta para la regla de antes (1.5R) pero sí para esta
+    j, m = S.evaluar("X", bars, 90.0, 10e6, 0.06, base)
+    assert j is not None
+    j, m = S.evaluar("X", bars, 90.0, 10e6, 0.06, S.CFG)
+    assert j is None and "máximo del día" in m
+    # 5) líderes más extendidos: +45 % en el día se compra, +87 % no; con el perfil de antes +45 % era parabólica
+    j, m = S.evaluar("X", bars, 71.0, 10e6, 0.03, S.CFG)
+    assert j, m
+    assert S.evaluar("X", bars, 71.0, 10e6, 0.03, base)[1] == "parabólica"
+    assert S.evaluar("X", bars, 55.0, 10e6, 0.03, S.CFG)[1] == "parabólica"
+    # 6) retroceso del 65 %: ahora entra; antes quedaba «fuera de rango»
+    hondas = barras_hondas(0.34)
+    j, m = S.evaluar("X", hondas, 100.0, 10e6, 0.03, S.CFG)
+    assert j and 0.6 < j["retr"] <= 0.7, m
+    assert "fuera de rango" in S.evaluar("X", hondas, 100.0, 10e6, 0.03, base)[1]
+    # 7) sin ATR conocido se supone 3 %: piso de 1 %
+    j, m = S.evaluar("X", bars, 90.0, 10e6, None, sin_hod)
+    assert j and abs(j["stop_pct"] - 1.0) < 0.1, m
 
 
 def test_buscar_y_mercado():
@@ -105,6 +176,7 @@ def test_curva_y_vwap():
 if __name__ == "__main__":
     test_jugada_tipica()
     test_sin_jugada()
+    test_perfil_volatil()
     test_buscar_y_mercado()
     test_curva_y_vwap()
     print("OK · estrategia de Claude")

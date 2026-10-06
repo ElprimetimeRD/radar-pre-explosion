@@ -8,7 +8,8 @@ suyas son "sem-…". Mismo motor, mismo candado y mismas protecciones que el de 
   - lo que cuenta es lo que IBKR ejecutó; una posición sin su stop vivo se vende; si vendiera de más, recompra.
 Lo que cambia es el cerebro. En vez de esperar órdenes del semáforo, lee velas de 1 min de Yahoo (datos_yahoo.py, hilo
 aparte) y aplica estrategia_claude.py: «pullback con tendencia» (compra LÍMITE en la pausa de un líder del día, stop fijo
-bajo el mínimo del retroceso, objetivo 2R; ver ese archivo). Compras de 9:50 a 15:15 ET.
+bajo el mínimo del retroceso, objetivo 2R; ver ese archivo). Compras de 9:50 a 15:15 ET. Desde la 1.4 con perfil volátil
+(stop según el ATR, retrocesos más hondos, líderes más extendidos) pero con el mismo dinero: tamaño por riesgo (US$6).
 
 Nunca toca órdenes ni posiciones que no haya puesto él, y antes de comprar una acción confirma que ningún otro ejecutor
 (ni tú a mano en TWS) tenga órdenes o posición en ella, para no cruzar órdenes en la misma cuenta.
@@ -36,7 +37,7 @@ import estrategia_claude as S  # noqa: E402
 from datos_yahoo import Feed  # noqa: E402
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.3"
+VERSION = "1.4"
 LOG_FILE = os.path.join(HERE, "ejecutor_claude.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_claude.json")
 LISTA_FILE = os.path.join(HERE, "lista_claude.txt")
