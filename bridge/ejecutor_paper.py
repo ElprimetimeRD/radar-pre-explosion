@@ -57,7 +57,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.7"
+VERSION = "1.8"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -66,6 +66,7 @@ STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
 PUERTO = 4002            # IB Gateway en modo PAPER (la cuenta real usa 4001: este programa nunca se conecta ahí)
 CLIENT_ID = 41           # distinto del puente de datos (17) y de las pruebas (31, 32)
 ORDEN_USD = 500.0
+ESPERA_IB_S = 20          # v1.8: tope de espera de las llamadas bloqueantes a IBKR (0 = infinito, como antes)
 RIESGO_USD = 15.0        # v1.7: lo máximo que se pierde por operación si salta el stop (acciones × distancia del stop)
 MAX_ABIERTO = 1000.0
 PERDIDA_MAX = 100.0
@@ -267,6 +268,9 @@ class Ejecutor:
             self.ib.errorEvent += self.on_error
             self.ib.disconnectedEvent += self.on_disconnect
             self._hooked = True
+        # Sin esto, una llamada a IBKR que el Gateway no contesta (p. ej. validar un símbolo) espera para siempre y el
+        # ejecutor queda mudo con la ventana abierta (6-oct: 9:37 y 11:20). Con tope, falla a los ESPERA_IB_S y sigue.
+        self.ib.RequestTimeout = ESPERA_IB_S
         try:
             self.ib.connect("127.0.0.1", PUERTO, clientId=self.CLIENT_ID, timeout=15)
         except Exception as e:  # noqa: BLE001 (rechazada, tiempo agotado, errores de la API)
