@@ -1,19 +1,19 @@
 {
  "days": 6,
  "total": {
-  "n": 87,
-  "filled": 70,
+  "n": 89,
+  "filled": 72,
   "t1": 17,
   "t2": 4,
-  "stop": 31
+  "stop": 34
  },
  "armadas": {
   "n": 32,
   "filled": 11,
   "t1": 4,
   "t2": 1,
-  "stop": 4,
-  "cancelled": 20
+  "stop": 5,
+  "cancelled": 21
  },
  "byDay": [
   {
@@ -74,21 +74,21 @@
   },
   {
    "day": "2026-10-06",
-   "n": 25,
-   "filled": 21,
+   "n": 27,
+   "filled": 23,
    "t1": 4,
    "t2": 1,
-   "stop": 8,
+   "stop": 11,
    "armadas": {
     "n": 12,
     "filled": 4,
     "t1": 0,
     "t2": 0,
-    "stop": 2,
-    "cancelled": 7
+    "stop": 3,
+    "cancelled": 8
    }
   }
  ],
- "lag": 7.3,
- "slip": 0.23
+ "lag": 7.5,
+ "slip": 0.22
 }
