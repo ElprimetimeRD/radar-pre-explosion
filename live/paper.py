@@ -7,13 +7,10 @@
 - /auto: las órdenes entran a la cola sin botón (modo automático). /boton vuelve al botón.
 - /pausa, /reanuda y /cerrar valen también para el ejecutor paralelo de Claude (live/claude_paper.py), que opera en la
   misma cuenta con órdenes "cla-…" y otra estrategia.
-- Límites (los vuelve a aplicar el ejecutor, que tiene la última palabra): US$1,000 por operación (PAPER_ORDEN_USD),
-  US$4,000 comprometidos (PAPER_MAX_ABIERTO; posiciones + compras puestas), no más órdenes si la pérdida del día
-  (realizada + lo que podría perder lo abierto) pasaría de US$250 (PAPER_PERDIDA_MAX), sin compras nuevas fuera del
-  horario de compras (9:30 hasta ENTRY_END_M; 12:00 si no se define), una sola orden viva por acción, y a las
-  15:55 ET el ejecutor cancela lo suyo y vende lo que compró. Hasta el 5-oct-2026 eran US$500 / US$1,000 / US$100.
-  (Claude, el otro ejecutor, conserva US$500 / US$1,000 / US$100: ver live/claude_paper.py. ORDEN_USD, sin PAPER_, solo
-  dimensiona el ejemplo de los avisos de tu operación real.)
+- Límites (los vuelve a aplicar el ejecutor, que tiene la última palabra): US$500 por operación, US$1,000
+  comprometidos (posiciones + compras puestas), no más órdenes si la pérdida del día (realizada + lo que podría perder
+  lo abierto) pasaría de US$100, sin compras nuevas fuera de 9:30–12:00 ET, una sola orden viva por acción, y a las
+  15:55 ET el ejecutor cancela lo suyo y vende lo que compró.
 
 Lógica pura (sin red): la prueban tests/test_paper.py.
 """
@@ -29,11 +26,9 @@ from datetime import datetime
 
 from scanner.util import ET
 
-# Topes de dinero del ejecutor paper de Priamo (subieron el 5-oct-2026: antes 500 / 1000 / 100). Con ~US$2 de comisión por
-# operación, US$500 por orden se comía el 0.4 % en cada una, y US$1,000 comprometidos eran dos posiciones a la vez.
-ORDEN_USD = float(os.environ.get("PAPER_ORDEN_USD", "1000"))
-MAX_ABIERTO = float(os.environ.get("PAPER_MAX_ABIERTO", "4000"))
-PERDIDA_MAX = float(os.environ.get("PAPER_PERDIDA_MAX", "250"))
+ORDEN_USD = float(os.environ.get("ORDEN_USD", "500"))
+MAX_ABIERTO = float(os.environ.get("PAPER_MAX_ABIERTO", "1000"))
+PERDIDA_MAX = float(os.environ.get("PAPER_PERDIDA_MAX", "100"))
 ENTRADA_INI_M = 9 * 60 + 30
 ENTRADA_FIN_M = int(os.environ.get("ENTRY_END_M", str(12 * 60)))  # el mismo corte que las COMPRA del semáforo
 CIERRE_M = 15 * 60 + 55

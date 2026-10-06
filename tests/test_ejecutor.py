@@ -242,25 +242,22 @@ def test_llena_y_sale():
 
 def test_limites():
     ex, ib, clock, posted, resp = nuevo()
-    cap = int(E.ORDEN_USD // 10.03)                                                # acciones que caben en el tope por operación
-    assert E.ORDEN_USD == 1000 and E.MAX_ABIERTO == 4000 and E.PERDIDA_MAX == 250 and E.MAX_ORDENES_DIA == 30
-    resp["r"] = {"ordenes": [orden("00000001", "AAA", qty=cap + 1),                 # US$1,003: pasa del tope por operación
-                             orden("00000002", "BBB", qty=cap), orden("00000003", "CCC", qty=cap),    # ~US$993 cada una:
-                             orden("00000004", "DDD", qty=cap), orden("00000005", "EEE", qty=cap),    # caben 4 en US$4,000
-                             orden("00000006", "FFF", qty=cap),                      # la quinta pasaría de US$4,000
-                             orden("00000007", "BBB", 5.0),                          # BBB ya tiene orden
-                             orden("00000008", "III", objetivo=9.0),                 # objetivo bajo la compra
-                             orden("0000000b", "JJJ", gatillo=10.5),                 # gatillo sobre el límite
-                             orden("0000000c", "bad!"), orden("XYZ", "GGG"),         # símbolo / id inválidos
+    resp["r"] = {"ordenes": [orden("00000001", "AAA", qty=50),                      # US$501.5: pasa de 500
+                             orden("00000002", "BBB"), orden("00000003", "CCC"),    # 491 + 491
+                             orden("00000004", "DDD"),                               # pasaría de 1,000
+                             orden("00000005", "BBB", 5.0),                          # BBB ya tiene orden
+                             orden("00000006", "EEE", objetivo=9.0),                 # objetivo bajo la compra
+                             orden("00000007", "FFF", gatillo=10.5),                 # gatillo sobre el límite
+                             orden("00000008", "bad!"), orden("XYZ", "GGG"),         # símbolo / id inválidos
                              orden("0000000a", "HHH", hasta=T0 - 1)]}               # ya vencida
     ex.paso()
     vuelta(ex, clock, resp)
     rech = {e["id"]: e["motivo"] for e in evs(posted, "rechazada")}
-    assert "por operación" in rech["00000001"] and "4,000 comprometidos" in rech["00000006"], rech
-    assert "ya hay una orden" in rech["00000007"] and "inválida" in rech["00000008"]
-    assert "tipo de orden" in rech["0000000b"] and "símbolo inválido" in rech["0000000c"]
+    assert "por operación" in rech["00000001"] and "1,000" in rech["00000004"], rech
+    assert "ya hay una orden" in rech["00000005"] and "inválida" in rech["00000006"]
+    assert "tipo de orden" in rech["00000007"] and "símbolo inválido" in rech["00000008"]
     assert "venció" in rech["0000000a"] and "XYZ" not in rech
-    assert {p[1].orderRef[4:12] for p in ib.placed} == {"00000002", "00000003", "00000004", "00000005"}
+    assert {p[1].orderRef[4:12] for p in ib.placed} == {"00000002", "00000003"}
     exn, ibn, cn, pn, rn = nuevo()
     rn["r"] = {"ordenes": [orden("00000009", "NOPE")]}                    # IBKR no conoce el símbolo
     exn.paso()
@@ -296,7 +293,7 @@ def test_limites():
     ex5.paso()
     vuelta(ex5, c5, r5, r={"limites": {"orden_usd": 300}, "ordenes": [orden()]})
     assert ib5.placed == []
-    vuelta(ex5, c5, r5, r={"limites": {"orden_usd": 5000, "max_abierto": 99999}, "ordenes": [orden("bbbbbbbb", qty=cap + 1)]})
+    vuelta(ex5, c5, r5, r={"limites": {"orden_usd": 5000, "max_abierto": 99999}, "ordenes": [orden("bbbbbbbb", qty=100)]})
     assert ib5.placed == []                                               # los propios nunca se aflojan
     ex6, ib6, c6, p6, r6 = nuevo()                                        # cancelada antes de llegar
     r6["r"] = {"cancelar": ["cccccccc"]}
@@ -314,16 +311,15 @@ def test_perdida_maxima():
     resp["r"] = {"ordenes": [orden("00000001", "AAA", 50.0, qty=9), orden("00000002", "BBB", 10.0)]}
     ex.paso()
     a = ex.ord["00000001"]["oids"]
-    assert E.PERDIDA_MAX == 250
     ib.fill(a["e"], 9, 50.0)
-    ib.fill(a["t"], 9, 23.34)                                             # pierde 239.94
-    vuelta(ex, clock, resp, r={"ordenes": [orden("00000003", "CCC", 10.0)]})   # 239.94 + 14.7 + 14.7 de riesgo > 250
+    ib.fill(a["t"], 9, 40.0)                                              # pierde 90
+    vuelta(ex, clock, resp, r={"ordenes": [orden("00000003", "CCC", 10.0)]})   # 90 + 14.7 de riesgo > 100
     vuelta(ex, clock, resp)
     r3 = evs(posted, "rechazada")[-1]
     assert r3["id"] == "00000003" and "pérdida máxima" in r3["motivo"], r3
     b = ex.ord["00000002"]["oids"]
     ib.fill(b["e"], 49, 10.03)
-    ib.fill(b["t"], 49, 9.80)                                             # pierde 11.27 más: 251.21
+    ib.fill(b["t"], 49, 9.80)                                             # pierde 11.27 más: 101.27
     vuelta(ex, clock, resp)
     assert ex.parado and evs(posted, "parada", ex)
     vuelta(ex, clock, resp, r={"ordenes": [orden("00000004", "DDD", 2.0)]})
@@ -844,37 +840,6 @@ def test_windows_bloquea_archivos():
         E.__dict__.pop("open", None)
 
 
-def test_anota_limites():
-    """Los límites que manda el semáforo y los que quedan vigentes quedan en el registro (solo cuando cambian)."""
-    import logging
-    ex, ib, clock, posted, resp = nuevo()
-    lineas = []
-
-    class H(logging.Handler):
-        def emit(self, record):
-            lineas.append(record.getMessage())
-    h, nivel = H(), E.log.level
-    E.log.addHandler(h)
-    E.log.setLevel(logging.INFO)
-    try:
-        viejos = {"orden_usd": 500, "max_abierto": 1000, "perdida_max": 100, "entrada_ini_m": 570, "entrada_fin_m": 720,
-                  "cierre_m": 955}
-        resp["r"] = {"limites": viejos}
-        ex.paso()
-        vuelta(ex, clock, resp, r={"limites": dict(viejos)})              # lo mismo otra vez: no se repite
-        vuelta(ex, clock, resp, r={"limites": {"orden_usd": 5000, "max_abierto": 99999, "perdida_max": 9999,
-                                               "entrada_ini_m": 570, "entrada_fin_m": 930, "cierre_m": 955}})
-        vuelta(ex, clock, resp, r={})                                     # sin límites: no inventa ninguna línea
-    finally:
-        E.log.removeHandler(h)
-        E.log.setLevel(nivel)
-    l = [x for x in lineas if x.startswith("Límites del semáforo")]
-    assert len(l) == 2, lineas
-    assert "US$500 por operación" in l[0] and "compras 9:30–12:00 ET" in l[0], l[0]
-    assert "US$500 · US$1,000 · US$100 · compras 9:30–12:00 ET, cierre 15:55" in l[0], l[0]       # el semáforo más estricto manda
-    assert "US$5,000 por operación" in l[1] and "US$1,000 · US$4,000 · US$250 · compras 9:30–15:30 ET" in l[1], l[1]  # los propios no se aflojan
-
-
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -907,6 +872,5 @@ if __name__ == "__main__":
     test_el_error_real_de_ib_async()
     test_una_sola_copia()
     test_windows_bloquea_archivos()
-    test_anota_limites()
     test_hora_et()
     print("OK · ejecutor paper")

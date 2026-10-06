@@ -223,7 +223,7 @@ def test_comandos_telegram():
         tg.on_message({"chat": {"id": 555}, "from": {"id": 555}, "date": c.t, "text": cmd})
     assert "🤖 Claude (paper)" in enviados[0] and "Ejecutor conectado" in enviados[0]
     assert "Marcador de hoy" in enviados[1] and "🤖 Claude (paper)" in enviados[2]
-    assert "/claude" in enviados[3] and "/marcador" in enviados[3] and "US$1,000 por operación" in enviados[3]   # la ayuda es la del ejecutor de Priamo
+    assert "/claude" in enviados[3] and "/marcador" in enviados[3] and "US$500" in enviados[3]
     sin = TgIn(p, token="TKN", chat_id="555", http=H(), clock=c)           # sin ejecutor de Claude: cae en la ayuda
     sin.on_message({"chat": {"id": 555}, "from": {"id": 555}, "date": c.t, "text": "/claude"})
     assert "/pausa" in enviados[-1]

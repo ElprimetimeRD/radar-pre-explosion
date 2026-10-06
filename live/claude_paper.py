@@ -15,11 +15,7 @@ from __future__ import annotations
 import threading
 import time
 
-from .paper import _num
-
-# Topes de dinero de Claude: los mismos que tiene fijos su ejecutor (bridge/ejecutor_claude.py). No suben con los del
-# ejecutor de Priamo (live/paper.py): el tamaño de Claude lo fija su estrategia.
-ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX = 500.0, 1000.0, 100.0
+from .paper import MAX_ABIERTO, ORDEN_USD, PERDIDA_MAX, _num
 
 # Días en que la bolsa de EE. UU. no abre (entre semana), para no avisar de «ejecutor caído» en un feriado. Mejor esfuerzo:
 # si falta uno, solo llega un aviso de más. Los días de cierre temprano (13:00 ET) NO están aquí: ver el README.

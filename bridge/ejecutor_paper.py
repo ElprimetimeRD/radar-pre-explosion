@@ -16,12 +16,12 @@ Seguridad, en cada vuelta:
   - si hay acciones compradas sin un stop vivo que las cubra, lo confirma con IBKR y, si de verdad falta, las vende;
   - si alguna vez vendiera de más (quedaría en corto), recompra la diferencia y avisa;
   - los manejadores de eventos de IBKR solo anotan: todo lo que toca IBKR se hace aquí, en el ciclo.
-Límites propios (si el semáforo manda límites más estrictos, usa esos): US$1,000 por operación · US$4,000 comprometidos
+Límites propios (si el semáforo manda límites más estrictos, usa esos): US$500 por operación · US$1,000 comprometidos
 (posiciones + compras puestas) · no pone una orden si la pérdida del día más lo que podría perder lo abierto pasaría de
-US$250, y al perder US$250 se detiene el resto del día · compras solo 9:30–15:30 ET (la última COMPRA que emite el semáforo;
+US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–15:30 ET (la última COMPRA que emite el semáforo;
 si el semáforo cierra las compras antes —ENTRY_END_M en Render— toma esa hora) · una orden viva por acción ·
-30 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes ni posiciones que no haya
-puesto él: las reconoce por su referencia "sem-<id>-<rol>". (Hasta la v1.6 eran US$500 / US$1,000 / US$100 / 20 órdenes.)
+20 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes ni posiciones que no haya
+puesto él: las reconoce por su referencia "sem-<id>-<rol>".
 
 Uso (Windows): doble clic en ARRANCAR_PAPER.bat (abre IB Gateway paper y este ejecutor; lo que ya esté abierto lo deja
 como está). Usa la misma clave del puente (puente.env). Ctrl+C para salir. Registro: ejecutor.log; cada operación cerrada
@@ -56,7 +56,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.7"
+VERSION = "1.6"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -64,14 +64,14 @@ STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
 # ---- Candado y límites: fijos aquí, a propósito ----
 PUERTO = 4002            # IB Gateway en modo PAPER (la cuenta real usa 4001: este programa nunca se conecta ahí)
 CLIENT_ID = 41           # distinto del puente de datos (17) y de las pruebas (31, 32)
-ORDEN_USD = 1000.0       # v1.7 (antes 500): con ~US$2 de comisión por operación, US$500 se comía el 0.4 % en cada una
-MAX_ABIERTO = 4000.0     # (antes 1,000: dos posiciones a la vez dejaban fuera señales)
-PERDIDA_MAX = 250.0      # (antes 100)
+ORDEN_USD = 500.0
+MAX_ABIERTO = 1000.0
+PERDIDA_MAX = 100.0
 ENTRADA_INI_M = 9 * 60 + 30
 ENTRADA_FIN_M = 15 * 60 + 30   # tope propio = la última COMPRA que emite el semáforo; la hora real la manda el semáforo
                                # (ENTRY_END_M en Render) y el ejecutor toma siempre la más estricta de las dos
 CIERRE_M = 15 * 60 + 55
-MAX_ORDENES_DIA = 30     # (antes 20)
+MAX_ORDENES_DIA = 20
 LOCK_PORT = 45041        # puerto local (solo 127.0.0.1) que reserva la copia abierta de este ejecutor: una sola a la vez
 CERRAR_TTL = 300         # s: un /cerrar más viejo que esto (p. ej. de antes de arrancar) no se ejecuta
 CANCEL_ESPERA = 5        # s máximos esperando que IBKR confirme una cancelación antes de recontar
@@ -373,25 +373,6 @@ class Ejecutor:
     def tope(self, k: str, propio: float) -> float:
         v = fnum(self.lim.get(k))
         return min(propio, v) if v and v > 0 else propio
-
-    def anotar_limites(self):
-        """Deja en el registro qué límites manda el semáforo y cuáles quedan vigentes aquí (el más estricto de los dos).
-        Solo cuando cambian: así se ve en ejecutor.log, sin mirar Telegram, con qué horario y topes está operando."""
-        lim = self.lim
-        if not lim:
-            return
-
-        def usd(k, propio):
-            v = fnum(lim.get(k))
-            return (f"US${v:,.0f}" if v is not None else "sin tope"), f"US${self.tope(k, propio):,.0f}"
-        (o, ov), (a, av), (p, pv) = (usd("orden_usd", self.ORDEN_USD), usd("max_abierto", self.MAX_ABIERTO),
-                                     usd("perdida_max", self.PERDIDA_MAX))
-        ini_s, fin_s = fnum(lim.get("entrada_ini_m")), fnum(lim.get("entrada_fin_m"))
-        ini, fin, cierre = self.horario()
-        hs = f"{hhmm(int(ini_s))}–{hhmm(int(fin_s))}" if ini_s is not None and fin_s is not None else "sin dato"
-        log.info("Límites del semáforo: %s por operación · %s comprometidos · pérdida máx %s · compras %s ET. "
-                 "Vigentes aquí (el más estricto de los dos): %s · %s · %s · compras %s–%s ET, cierre %s.",
-                 o, a, p, hs, ov, av, pv, hhmm(ini), hhmm(fin), hhmm(cierre))
 
     def horario(self) -> tuple[int, int, int]:
         ini = max(self.ENTRADA_INI_M, int(fnum(self.lim.get("entrada_ini_m")) or 0))
@@ -932,10 +913,7 @@ class Ejecutor:
         if (pausa, modo) != (self.pausa, self.modo):
             self.pausa, self.modo = pausa, modo   # se guarda: si el semáforo se reinicia, lo recupera de aquí
             self.guardar()
-        lim = resp.get("limites") if isinstance(resp.get("limites"), dict) else {}
-        if lim != self.lim:
-            self.lim = lim
-            self.anotar_limites()
+        self.lim = resp.get("limites") if isinstance(resp.get("limites"), dict) else {}
         cid, hace = resp.get("cerrar_id"), fnum(resp.get("cerrar_hace_s"))
         if cid and cid != self.cerrar_visto:
             self.cerrar_visto = cid
