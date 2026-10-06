@@ -7,10 +7,12 @@
 - /auto: las órdenes entran a la cola sin botón (modo automático). /boton vuelve al botón.
 - /pausa, /reanuda y /cerrar valen también para el ejecutor paralelo de Claude (live/claude_paper.py), que opera en la
   misma cuenta con órdenes "cla-…" y otra estrategia.
-- Límites (los vuelve a aplicar el ejecutor, que tiene la última palabra): US$500 por operación, US$1,000
-  comprometidos (posiciones + compras puestas), no más órdenes si la pérdida del día (realizada + lo que podría perder
-  lo abierto) pasaría de US$100, sin compras nuevas fuera de 9:30–12:00 ET, una sola orden viva por acción, y a las
-  15:55 ET el ejecutor cancela lo suyo y vende lo que compró.
+- Límites (los vuelve a aplicar el ejecutor, que tiene la última palabra): US$500 por operación y, además, no más de
+  US$6 (RIESGO_USD) que se pierdan si salta el stop (con un stop ancho se compran menos acciones: más volatilidad no es
+  más dinero), US$1,000 comprometidos (posiciones + compras puestas), no más órdenes si la pérdida del día (realizada + lo
+  que podría perder lo abierto) pasaría de US$100, compras solo entre 9:30 y la hora de ENTRY_END_M (el ejecutor además
+  nunca compra después de las 15:30 ET), una sola orden viva por acción, y a las 15:55 ET el ejecutor cancela lo suyo y
+  vende lo que compró.
 
 Lógica pura (sin red): la prueban tests/test_paper.py.
 """
@@ -27,6 +29,9 @@ from datetime import datetime
 from scanner.util import ET
 
 ORDEN_USD = float(os.environ.get("ORDEN_USD", "500"))
+# Lo máximo que se pierde por operación si salta el stop (acciones × distancia del stop). 6 = lo que tus operaciones de paper
+# arriesgaron en promedio el 5-oct (mediana 5.3, máximo 10.9). Es el tope de dinero que NO sube con el perfil volátil.
+RIESGO_USD = float(os.environ.get("RIESGO_USD", "6"))
 MAX_ABIERTO = float(os.environ.get("PAPER_MAX_ABIERTO", "1000"))
 PERDIDA_MAX = float(os.environ.get("PAPER_PERDIDA_MAX", "100"))
 ENTRADA_INI_M = 9 * 60 + 30
@@ -41,7 +46,7 @@ ORDEN_ESTADOS = {"oferta": 0, "cola": 1, "enviada": 2, "puesta": 3, "llena": 4,
                  "cerrada": 5, "cancelada": 5, "rechazada": 5}   # un aviso viejo nunca hace retroceder el estado
 CANCEL_ESPERA = 120    # s: una orden marcada para cancelar de la que el ejecutor no dice nada se da por cancelada
 ID = re.compile(r"[0-9a-f]{8}")
-POR = {"trailing": "el stop que sube", "objetivo": "el objetivo +5%", "cierre": "el cierre"}
+POR = {"trailing": "el stop que sube", "objetivo": "el objetivo", "cierre": "el cierre"}
 
 
 def _num(v) -> float | None:
@@ -50,6 +55,18 @@ def _num(v) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if math.isfinite(f) else None
+
+
+def qty_por_riesgo(usd: float, limite: float, trail: float, riesgo_usd: float | None = None) -> int:
+    """Acciones de una orden: las que caben en `usd` y, además, las que no pierden más de `riesgo_usd` si salta el stop
+    (acciones × `trail`, la distancia del stop). Con un stop ancho se compran menos: más volatilidad no es más dinero."""
+    if not limite or limite <= 0:
+        return 0
+    qty = int(usd // limite)
+    tope = RIESGO_USD if riesgo_usd is None else riesgo_usd
+    if tope and tope > 0 and trail and trail > 0:
+        qty = min(qty, int(tope / trail + 1e-9))
+    return max(qty, 0)
 
 
 def et_min(ts: float) -> int:
@@ -140,10 +157,10 @@ class Paper:
         if not self.disponible(now) or not entry or not stop or stop >= entry or not limite or limite <= 0:
             return None
         limite = round(limite, 2)
-        qty = int(ORDEN_USD // limite)
+        trail = max(0.01, round(entry - stop, 2))
+        qty = qty_por_riesgo(ORDEN_USD, limite, trail)
         if qty < 1:
             return None
-        trail = max(0.01, round(entry - stop, 2))
         o = {"id": secrets.token_hex(4), "kind": kind, "t": t, "tipo": "stp" if gatillo else "lmt",
              "gatillo": round(gatillo, 2) if gatillo else None, "limite": limite, "trail": trail,
              "objetivo": round(t2 or entry * 1.05, 2), "qty": qty, "hasta": hasta or now + OFERTA_TTL.get(kind, 120),
@@ -234,8 +251,9 @@ class Paper:
             return {"ordenes": ordenes, "cancelar": cancelar, "pausa": self.pausa, "modo": self.modo,
                     "cerrar_id": self.cerrar_id,
                     "cerrar_hace_s": round(now - self.cerrar_ts, 1) if self.cerrar_id else None,
-                    "limites": {"orden_usd": ORDEN_USD, "max_abierto": MAX_ABIERTO, "perdida_max": PERDIDA_MAX,
-                                "entrada_ini_m": ENTRADA_INI_M, "entrada_fin_m": ENTRADA_FIN_M, "cierre_m": CIERRE_M}}
+                    "limites": {"orden_usd": ORDEN_USD, "riesgo_usd": RIESGO_USD, "max_abierto": MAX_ABIERTO,
+                                "perdida_max": PERDIDA_MAX, "entrada_ini_m": ENTRADA_INI_M, "entrada_fin_m": ENTRADA_FIN_M,
+                                "cierre_m": CIERRE_M}}
 
     def adoptar_pausa(self, estado: dict | None):
         """El ejecutor de Claude habló primero tras un reinicio del semáforo: toma la pausa que él guardó. Deja pendiente
@@ -295,7 +313,7 @@ class Paper:
             if o:
                 o["estado"], o["px_e"], o["qty_e"] = "llena", px, qty
             self._msg(f"paper:{oid}:llena", f"📥 Paper: compré {qty or 0:g} {t} a {px or 0:.2f}. "
-                                             f"Lo cuida el stop que sube y el objetivo +5%.")
+                                             f"Lo cuida el stop que sube y el objetivo.")
         elif ev == "salida":
             pnl, pe = _num(e.get("pnl")), _num(e.get("px_e")) or (o or {}).get("px_e")
             if o:
@@ -385,7 +403,8 @@ class Paper:
                 "/auto · pongo cada ARMA y COMPRA sin preguntarte\n/boton · solo las que toques\n"
                 "/cerrar · cancelo y vendo todo ya (también lo de Claude)\n"
                 "/claude · cómo va el ejecutor de Claude\n/marcador · el día: tú contra Claude\n"
-                f"Límites: US${ORDEN_USD:,.0f} por operación · US${MAX_ABIERTO:,.0f} comprometidos · pérdida máx "
+                f"Límites: US${ORDEN_USD:,.0f} por operación (y no más de US${RIESGO_USD:,.0f} de pérdida si salta el stop) · "
+                f"US${MAX_ABIERTO:,.0f} comprometidos · pérdida máx "
                 f"US${PERDIDA_MAX:,.0f} al día · compras {hhmm(ENTRADA_INI_M)}–{hhmm(ENTRADA_FIN_M)} ET · "
                 f"cierro todo a las {hhmm(CIERRE_M)} ET.")
 

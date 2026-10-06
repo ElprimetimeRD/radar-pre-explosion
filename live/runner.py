@@ -26,7 +26,7 @@ from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMI
 from .decide import ALTO, RIESGO, RVOL_NEWS
 from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
 from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
-from .paper import Paper, boton, et_ts
+from .paper import RIESGO_USD, Paper, boton, et_ts, qty_por_riesgo
 from .positions import Positions
 from .tgbot import TgIn
 
@@ -260,7 +260,7 @@ def new_trade(r: dict, day: str, t_str: str, m: int) -> dict:
     lim = bool(p.get("limit"))
     return {"t": r["t"], "day": day, "time": t_str, "m": m, "entry": p["entry"], "stop": p["stop"], "t1": p["t1"],
             "t2": p["t2"], "risk": p.get("risk"), "score": r["score"], "limit": lim,
-            "valid_m": m + (p.get("valid_min") or 10) if lim else None,
+            "valid_m": m + (p.get("valid_min") or 10) if lim else None, "perfil": RIESGO, "atr": r.get("atr"),
             "status": "pendiente" if lim else "abierta", "hit1": False, "mfe": 0.0, "mae": 0.0, "last": p["entry"]}
 
 
@@ -271,7 +271,8 @@ def new_arm(t: str, a: dict, day: str | None, t_str: str, m: int, valid_m: int) 
     return {"t": t, "day": day, "time": t_str, "m": m, "kind": "armada", "order": "stop", "level": a["level"],
             "entry": e, "cap": round(e * 1.003, 4), "stop": a["stop"], "t1": a["t1"],
             "t2": a.get("t2") or round(e * (1 + T2 / 100), 4), "risk": a["risk"], "score": a["score"], "limit": False,
-            "valid_m": valid_m, "status": "pendiente", "hit1": False, "mfe": 0.0, "mae": 0.0, "last": a.get("px") or e}
+            "valid_m": valid_m, "perfil": RIESGO, "status": "pendiente", "hit1": False, "mfe": 0.0, "mae": 0.0,
+            "last": a.get("px") or e}
 
 
 def break_lag(df, level: float | None, t_et: datetime) -> int | None:
@@ -308,25 +309,35 @@ def perfil() -> dict:
     from . import decide as D
     return {"riesgo": RIESGO, "arm_near": ARM_NEAR, "arm_min": ARM_MIN, "arm_max": ARM_MAX, "fast_s": FAST_S,
             "rvol": D.RVOL_IN_PLAY, "rvol_noticia": D.RVOL_NEWS, "rvol15": D.RVOL15_IN_PLAY, "fuerza_compra": D.BUY_MIN,
-            "perseguir_max": D.CHASE_MAX, "ext_max": D.EXT_MAX, "riesgo_max": D.RISK_MAX}
+            "perseguir_max": D.CHASE_MAX, "ext_max": D.EXT_MAX, "ext_parabolico": D.EXT_PARABOLIC,
+            "riesgo_max": D.RISK_MAX, "stop_atr": D.STOP_ATR, "riesgo_usd": RIESGO_USD}
 
 
 ORDEN_USD = float(os.environ.get("ORDEN_USD", "500"))
 
 
+def pct_obj(px: float, entry: float) -> str:
+    """Objetivo como % sobre la entrada para los avisos: «+2», «+5» y, con un stop ancho del perfil volátil, «+3.3», «+8.3»."""
+    v = 100 * (px / entry - 1)
+    return f"{v:+.0f}" if abs(v - round(v)) < 0.05 else f"{v:+.1f}"
+
+
 def orden_ibkr(entry: float, stop: float, t2: float | None, limite: float, gatillo: float | None = None,
-               usd: float | None = None) -> str:
+               usd: float | None = None, riesgo_usd: float | None = None) -> str:
     """Línea lista para teclear en IBKR, en el orden de la boleta: cantidad, compra, stop que sube solo (Trailing) y
-    objetivo +5 %. gatillo → Stop Limit (orden puesta antes de la ruptura: IBKR compra sola al romper, sin esperar a que
+    objetivo (+5 %, más si el stop es ancho). gatillo → Stop Limit (orden puesta antes de la ruptura: IBKR compra sola al romper, sin esperar a que
     reacciones); sin gatillo → Limit (la ruptura ya pasó). La distancia del Trailing es la del stop del plan, así que la
-    pérdida máxima es cantidad × distancia (más deslizamiento). Vacía si el presupuesto no alcanza para 1 acción.
+    pérdida máxima es cantidad × distancia (más deslizamiento) y no pasa de RIESGO_USD: con un stop ancho salen menos
+    acciones (más volatilidad no es más dinero). Vacía si el presupuesto no alcanza para 1 acción.
     En Hapi no hay Trailing ni órdenes adjuntas: ahí va la compra y el stop fijo de la línea anterior."""
     usd = usd or ORDEN_USD
     limite = round(limite, 2)
-    qty = int(usd // limite) if limite > 0 else 0
-    if qty < 1 or not stop or stop >= entry:
+    if not stop or stop >= entry:
         return ""
     trail = max(0.01, round(entry - stop, 2))
+    qty = qty_por_riesgo(usd, limite, trail, riesgo_usd)
+    if qty < 1:
+        return ""
     obj = round(t2 or entry * (1 + T2 / 100), 2)
     compra = f"Stop Limit {gatillo:.2f} / {limite:.2f}" if gatillo else f"Limit {limite:.2f}"
     return (f"\n📲 IBKR {qty} acc · {compra} + Trailing {trail:.2f} ({100 * trail / entry:.1f}%) + objetivo {obj:.2f}"
@@ -1011,7 +1022,7 @@ class Radar:
                 continue
             text = (f"🟡 ARMA {t} · {a['px']:.2f} ({(a['chg'] or 0):+.1f}%) · fuerza {a['score']}\n"
                     f"Gatillo: rompe {a['level']:.2f}. Orden: compra stop {a['entry']:.2f} (límite {a['entry'] * 1.003:.2f}) · "
-                    f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}"
+                    f"stop {a['stop']:.2f} (−{a['risk']:.1f}%) · {pct_obj(a['t1'], a['entry'])}%: {a['t1']:.2f}"
                     f"{orden_ibkr(a['entry'], a['stop'], a.get('t2'), a['entry'] * 1.003, gatillo=a['entry'])}\n"
                     f"{a['reason']}. Si rompe, te aviso al instante; si la jugada se daña antes, te aviso para cancelarla.")
             o = self.paper.ofrecer("arma", t, a["entry"], a["stop"], a.get("t2"), a["entry"] * 1.003,
@@ -1040,7 +1051,7 @@ class Radar:
                 after = d[(d["day"] == t_et.date()) & (d["m"] > o["m"]) & (d["m"] < 16 * 60)]
                 for ev in advance(o, after):
                     msg = {"fill": f"📥 {s}: se activó la compra stop {o['entry']:.2f} (≈{o.get('fill', o['entry']):.2f}). "
-                                   f"Stop {o['stop']:.2f} · +2 %: {o['t1']:.2f}.",
+                                   f"Stop {o['stop']:.2f} · {pct_obj(o['t1'], o['entry'])} %: {o['t1']:.2f}.",
                            "invalid": f"❌ {s} perdió {o['stop']:.2f} sin romper: cancela la compra stop {o['entry']:.2f}.",
                            "gap": f"⚠ {s} saltó por encima de {o['cap']:.2f}: la orden no se llena. Cancélala y no persigas.",
                            "expired": f"⌛ {s}: la compra stop {o['entry']:.2f} no se activó a tiempo. Cancélala."}.get(ev)
@@ -1111,7 +1122,7 @@ class Radar:
                 markup = None
                 if p <= a["entry"] * 1.004:
                     msg = (f"⚡ {s} rompe {a['level']:.2f} ahora ({p:.2f}{', IBKR' if ib else ''}). Entrada ≤ "
-                           f"{a['entry'] * 1.003:.2f} · stop {a['stop']:.2f} (−{a['risk']:.1f}%) · +2%: {a['t1']:.2f}"
+                           f"{a['entry'] * 1.003:.2f} · stop {a['stop']:.2f} (−{a['risk']:.1f}%) · {pct_obj(a['t1'], a['entry'])}%: {a['t1']:.2f}"
                            f"{orden_ibkr(a['entry'], a['stop'], a.get('t2'), a['entry'] * 1.003)}\n"
                            f"Si dejaste la orden del ARMA, ya está puesta. Confirma volumen; el semáforo lo reevalúa ya.")
                     if self.paper.modo == "boton" and not self.paper.viva(s):  # en automático ya la puso el ARMA
@@ -1222,7 +1233,8 @@ class Radar:
                 continue
             text = (f"🟢 COMPRA {r['t']} {how}{orden_ibkr(tr['entry'], tr['stop'], tr['t2'], lim_px)}\n"
                     f"Fuerza {r['score']}/100 · {why}\n"
-                    f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · +2%: {tr['t1']:.2f} · +5%: {tr['t2']:.2f}\nMercado: {reg_txt}{late}")
+                    f"Stop {tr['stop']:.2f} (−{tr['risk']:.1f}%) · {pct_obj(tr['t1'], tr['entry'])}%: {tr['t1']:.2f} · "
+                    f"{pct_obj(tr['t2'], tr['entry'])}%: {tr['t2']:.2f}\nMercado: {reg_txt}{late}")
             hasta = et_ts(time.time(), tr["valid_m"]) if tr["limit"] and tr.get("valid_m") else None
             o = self.paper.ofrecer("compra", r["t"], tr["entry"], tr["stop"], tr["t2"], lim_px, hasta=hasta)
             if not o:
@@ -1240,8 +1252,8 @@ class Radar:
                 msg = {"fill": f"📥 {s}: se llenó la límite a {tr['entry']:.2f}. Pon el stop en {tr['stop']:.2f}.",
                        "expired": f"⌛ {s}: la límite {tr['entry']:.2f} no se llenó en {LIMIT_MIN} min. Cancelada, no persigas.",
                        "stop": f"🛑 {s} perdió el stop {tr['stop']:.2f}. Sal.",
-                       "t1": f"✅ {s} tocó +2% ({tr['t1']:.2f}). Asegura: sube el stop a la entrada {tr['entry']:.2f}.",
-                       "t2": f"🎯 {s} tocó +5% ({tr['t2']:.2f}). Objetivo cumplido.",
+                       "t1": f"✅ {s} tocó {pct_obj(tr['t1'], tr['entry'])}% ({tr['t1']:.2f}). Asegura: sube el stop a la entrada {tr['entry']:.2f}.",
+                       "t2": f"🎯 {s} tocó {pct_obj(tr['t2'], tr['entry'])}% ({tr['t2']:.2f}). Objetivo cumplido.",
                        "be": None}.get(ev)
                 if msg:
                     self.tg(f"{ev}:{s}", msg)

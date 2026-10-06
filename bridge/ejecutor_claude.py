@@ -8,7 +8,8 @@ suyas son "sem-…". Mismo motor, mismo candado y mismas protecciones que el de 
   - lo que cuenta es lo que IBKR ejecutó; una posición sin su stop vivo se vende; si vendiera de más, recompra.
 Lo que cambia es el cerebro. En vez de esperar órdenes del semáforo, lee velas de 1 min de Yahoo (datos_yahoo.py, hilo
 aparte) y aplica estrategia_claude.py: «pullback con tendencia» (compra LÍMITE en la pausa de un líder del día, stop fijo
-bajo el mínimo del retroceso, objetivo 2R; ver ese archivo). Compras de 9:50 a 15:15 ET.
+bajo el mínimo del retroceso, objetivo 2R; ver ese archivo). Compras de 9:50 a 15:15 ET. Desde la 1.4 con perfil volátil
+(stop según el ATR, retrocesos más hondos, líderes más extendidos, sin exigir distancia al máximo) pero con el mismo dinero: tamaño por riesgo (US$6).
 
 Nunca toca órdenes ni posiciones que no haya puesto él, y antes de comprar una acción confirma que ningún otro ejecutor
 (ni tú a mano en TWS) tenga órdenes o posición en ella, para no cruzar órdenes en la misma cuenta.
@@ -36,7 +37,7 @@ import estrategia_claude as S  # noqa: E402
 from datos_yahoo import Feed  # noqa: E402
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.0"
+VERSION = "1.4"
 LOG_FILE = os.path.join(HERE, "ejecutor_claude.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_claude.json")
 LISTA_FILE = os.path.join(HERE, "lista_claude.txt")
@@ -62,6 +63,9 @@ def cargar_lista(path: str = LISTA_FILE) -> list[str]:
     return list(LISTA)
 
 
+LOCK_PORT = 45042            # una sola copia de este ejecutor (el del semáforo usa 45041)
+
+
 class EjecutorClaude(E.Ejecutor):
     PREFIJO = "cla"
     CLIENT_ID = 42                      # el de Priamo usa 41, el puente de datos 17, las pruebas 31 y 32
@@ -80,6 +84,7 @@ class EjecutorClaude(E.Ejecutor):
         self.ult_eval = 0.0
         self.cand: list[dict] = []
         self.ult_resumen = 0.0
+        self.ult_sin_datos = 0.0
         self.vetadas: dict[str, float] = {}          # acciones que IBKR rechazó: no se reintentan por un rato
         self.omitidas: dict[tuple[str, str], float] = {}   # (acción, motivo) -> última vez que se anotó en el registro
 
@@ -127,9 +132,11 @@ class EjecutorClaude(E.Ejecutor):
         hoy = E.et(now).date().isoformat()
         datos, spy = self.feed.snapshot(hoy)
         buenos = {}
+        # si Yahoo limitó las peticiones y el lector va más despacio, la última vela es más vieja a propósito
+        vieja = self.scfg.vela_vieja_s + max(0, getattr(self.feed, "intervalo", 60) - 60)
         for t, d in datos.items():
             b = d.get("bars") or []
-            if d.get("dia") == hoy and b and now - E.et_ts(now, b[-1][0] + 1) <= self.scfg.vela_vieja_s:
+            if d.get("dia") == hoy and b and now - E.et_ts(now, b[-1][0] + 1) <= vieja:
                 buenos[t] = d
         if spy.get("bars") and spy.get("dia") != hoy:
             spy = {}
@@ -145,7 +152,12 @@ class EjecutorClaude(E.Ejecutor):
             return
         ini, fin, _ = self.horario()
         m = t.hour * 60 + t.minute
-        if not ini <= m < fin or not self.feed.ok(now) or self.feed.ult_barrido == self.ult_eval:
+        if not ini <= m < fin:
+            return
+        if not self.feed.ok(now):
+            self.sin_datos_log(now)
+            return
+        if self.feed.ult_barrido == self.ult_eval:
             return
         self.ult_eval = self.feed.ult_barrido        # una evaluación por cada lectura nueva de Yahoo (cada minuto)
         buenos, spy = self.datos_hoy(now)
@@ -177,6 +189,16 @@ class EjecutorClaude(E.Ejecutor):
                 pend += 1
             elif o and o["estado"] == "rechazada":
                 self.vetadas[j["t"]] = now + 1800
+
+    def sin_datos_log(self, now: float):
+        """Yahoo no responde o respondió a medias: lo deja en el registro cada 5 min (si no, el día entero pasa en silencio)."""
+        if now - self.ult_sin_datos < 300:
+            return
+        self.ult_sin_datos = now
+        est = self.feed.estado(now)
+        log.warning("Sin datos de Yahoo suficientes (%s de %s acciones, última lectura hace %s s, leyendo cada %s s): no pongo "
+                    "órdenes nuevas. %s", est["feed_n"], est["feed_de"], est["feed_edad_s"], est.get("feed_intervalo_s", 60),
+                    est["feed_error"] or "")
 
     def omitir(self, t: str, motivo: str, now: float):
         k = (t, motivo)
@@ -219,6 +241,11 @@ def main(argv=None):
     if E.IB is None:
         print("Falta la librería de IBKR. Instálala con:  py -m pip install -r requirements.txt")
         return 2
+    cerrojo, hay_otro = E.tomar_cerrojo(LOCK_PORT, "claude")
+    if hay_otro:
+        return E.ya_hay_otro(LOCK_PORT, "ejecutor de Claude")
+    if cerrojo is None:
+        log.warning("No pude reservar el puerto local %d (una sola copia a la vez); sigo sin ese seguro.", LOCK_PORT)
     no_quickedit()
     lista = cargar_lista()
     log.info("Ejecutor de CLAUDE %s (motor %s) -> %s. Candado: solo IB Gateway paper (puerto %d, cuentas DU). %d acciones. "
@@ -228,24 +255,13 @@ def main(argv=None):
     ib = E.IB()
     ex = EjecutorClaude(cfg, ib, feed)
     try:
-        while True:
-            try:
-                espera = ex.paso()
-            except Exception:  # noqa: BLE001 (nunca dejarlo caer en plena sesión)
-                log.exception("Error inesperado en el ejecutor de Claude; sigo en 5 s.")
-                espera = 5
-            ib.sleep(espera)
+        E.bucle(ex, ib, "ejecutor de Claude")   # un corte de IB Gateway (reinicio de las 23:30) no lo detiene: reconecta
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            ex.salir()
-            if ib.isConnected():
-                ib.sleep(1)
-                ex.sync(ex.reloj())
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
+        E.cerrar(ex, ib)
+        if cerrojo:
+            cerrojo.close()
     log.info("Ejecutor de Claude detenido.")
     return 0
 

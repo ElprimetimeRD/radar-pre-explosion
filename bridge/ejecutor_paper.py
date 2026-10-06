@@ -6,9 +6,9 @@ de paper (empiezan por DU). No hay variable ni archivo que lo apunte a la cuenta
 Cada segundo le pregunta al semáforo (Render) si hay órdenes nuevas: las que tocaste con «✅ Ejecutar en paper» (o
 todas, en modo automático). Las pone en IBKR como una orden con dos hijas (bracket estándar de IBKR):
   - compra: Stop Limit (aviso ARMA: compra sola al romper) o Limit (COMPRA y ⚡), válida hasta la hora del aviso (GTD,
-    nunca después de las 12:00 ET);
+    nunca después de la hora en que se cierran las compras: 15:30 ET, o antes si el semáforo la acorta);
   - Trailing: stop que sube con el precio a la distancia del stop del plan y nunca baja;
-  - objetivo: venta límite +5 %. Si se ejecuta una hija, IBKR cancela la otra.
+  - objetivo: venta límite en el objetivo del plan (+5 %; más si el stop es ancho). Si se ejecuta una hija, IBKR cancela la otra.
 Y le devuelve al semáforo lo que pasa (puesta, comprada, vendida, rechazada) para que te llegue por Telegram.
 
 Seguridad, en cada vuelta:
@@ -16,11 +16,13 @@ Seguridad, en cada vuelta:
   - si hay acciones compradas sin un stop vivo que las cubra, lo confirma con IBKR y, si de verdad falta, las vende;
   - si alguna vez vendiera de más (quedaría en corto), recompra la diferencia y avisa;
   - los manejadores de eventos de IBKR solo anotan: todo lo que toca IBKR se hace aquí, en el ciclo.
-Límites propios (si el semáforo manda límites más estrictos, usa esos): US$500 por operación · US$1,000 comprometidos
-(posiciones + compras puestas) · no pone una orden si la pérdida del día más lo que podría perder lo abierto pasaría de
-US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–12:00 ET · una orden viva por acción ·
-20 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes ni posiciones que no haya
-puesto él: las reconoce por su referencia "sem-<id>-<rol>".
+Límites propios (si el semáforo manda límites más estrictos, usa esos): US$500 por operación y no más de US$15 que se
+pierdan si salta el stop (el semáforo manda US$6: con un stop ancho compra menos acciones; más volatilidad no es más
+dinero) · US$1,000 comprometidos (posiciones + compras puestas) · no pone una orden si la pérdida del día más lo que
+podría perder lo abierto pasaría de US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–15:30 ET
+(la última COMPRA que emite el semáforo; si el semáforo cierra las compras antes —ENTRY_END_M en Render— toma esa hora) ·
+una orden viva por acción · 20 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes
+ni posiciones que no haya puesto él: las reconoce por su referencia "sem-<id>-<rol>".
 
 Uso (Windows): doble clic en ARRANCAR_PAPER.bat (abre IB Gateway paper y este ejecutor; lo que ya esté abierto lo deja
 como está). Usa la misma clave del puente (puente.env). Ctrl+C para salir. Registro: ejecutor.log; cada operación cerrada
@@ -32,15 +34,19 @@ límites y mismas protecciones) para correr en paralelo en la misma cuenta paper
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import datetime as dt
+import io
 import json
 import logging
 import logging.handlers
 import math
 import os
 import re
+import socket
 import sys
+import threading
 import time
 
 try:
@@ -51,7 +57,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.2"
+VERSION = "1.7"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -60,12 +66,15 @@ STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
 PUERTO = 4002            # IB Gateway en modo PAPER (la cuenta real usa 4001: este programa nunca se conecta ahí)
 CLIENT_ID = 41           # distinto del puente de datos (17) y de las pruebas (31, 32)
 ORDEN_USD = 500.0
+RIESGO_USD = 15.0        # v1.7: lo máximo que se pierde por operación si salta el stop (acciones × distancia del stop)
 MAX_ABIERTO = 1000.0
 PERDIDA_MAX = 100.0
 ENTRADA_INI_M = 9 * 60 + 30
-ENTRADA_FIN_M = 12 * 60
+ENTRADA_FIN_M = 15 * 60 + 30   # tope propio = la última COMPRA que emite el semáforo; la hora real la manda el semáforo
+                               # (ENTRY_END_M en Render) y el ejecutor toma siempre la más estricta de las dos
 CIERRE_M = 15 * 60 + 55
 MAX_ORDENES_DIA = 20
+LOCK_PORT = 45041        # puerto local (solo 127.0.0.1) que reserva la copia abierta de este ejecutor: una sola a la vez
 CERRAR_TTL = 300         # s: un /cerrar más viejo que esto (p. ej. de antes de arrancar) no se ejecuta
 CANCEL_ESPERA = 5        # s máximos esperando que IBKR confirme una cancelación antes de recontar
 AVISOS = {161, 202, 399, 404, 2109, 10089, 10090, 10148, 10167, 10168, 10197, 10349}  # informativos, no son problema
@@ -164,6 +173,7 @@ class Ejecutor:
     NOMBRE = "semáforo"
     DIARIO = "diario_sem.csv"
     ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX = ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX
+    RIESGO_USD = RIESGO_USD
     ENTRADA_INI_M, ENTRADA_FIN_M, CIERRE_M = ENTRADA_INI_M, ENTRADA_FIN_M, CIERRE_M
     MAX_ORDENES_DIA = MAX_ORDENES_DIA
 
@@ -195,9 +205,12 @@ class Ejecutor:
         self.ack_t: dict[str, float] = {}
         self.err_red: str | None = None
         self.err_ib: str | None = None
+        self.fallos_ib = 0                     # intentos seguidos de conectar con IB Gateway que fallaron
         self.errores_vistos: set[tuple[str, int]] = set()
         self._vivas: set[int] | None = None    # orderIds que IBKR dice abiertos (se pide solo si hace falta)
         self._hooked = False
+        self.diario_pend: list[list] = []      # filas del diario que aún no entraron al CSV (p. ej. lo tienes abierto en Excel)
+        self.diario_aviso = False
         self.cargar()
 
     # ---------------- estado del día (sobrevive reinicios del programa) ----------------
@@ -221,15 +234,23 @@ class Ejecutor:
                     self.por_oid[int(n)] = MUERTA
 
     def guardar(self):
+        """Guarda el estado (archivo temporal y reemplazo). En Windows el reemplazo falla un instante («Acceso denegado») si otro
+        programa tiene el archivo abierto (antivirus, indexador, alguien leyéndolo): se reintenta unas décimas de segundo."""
         tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"dia": self.dia, "ord": self.ord, "cerrar_visto": self.cerrar_visto, "pausa": self.pausa,
-                           "modo": self.modo, "cerrado_hoy": self.cerrado_hoy, "parado": self.parado}, f,
-                          ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except OSError as e:
-            log.warning("No pude guardar %s: %s", self.path, e)
+        for intento in range(4):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"dia": self.dia, "ord": self.ord, "cerrar_visto": self.cerrar_visto, "pausa": self.pausa,
+                               "modo": self.modo, "cerrado_hoy": self.cerrado_hoy, "parado": self.parado}, f,
+                              ensure_ascii=False)
+                os.replace(tmp, self.path)
+                return
+            except OSError as e:
+                if isinstance(e, PermissionError) and intento < 3:
+                    time.sleep(0.1)
+                    continue
+                log.warning("No pude guardar %s: %s", self.path, e)
+                return
 
     def nuevo_dia(self, dia: str):
         if self.dia and self.dia != dia and any(abs(self.abierta(o)) > EPS or o["estado"] in ("puesta", "cancelando")
@@ -356,6 +377,25 @@ class Ejecutor:
         v = fnum(self.lim.get(k))
         return min(propio, v) if v and v > 0 else propio
 
+    def anotar_limites(self):
+        """Deja en el registro qué límites manda el semáforo y cuáles quedan vigentes aquí (el más estricto de los dos).
+        Solo cuando cambian: así se ve en ejecutor.log, sin mirar Telegram, con qué horario y topes está operando."""
+        lim = self.lim
+        if not lim:
+            return
+
+        def usd(k, propio):
+            v = fnum(lim.get(k))
+            return (f"US${v:,.0f}" if v is not None else "sin tope"), f"US${self.tope(k, propio):,.0f}"
+        (o, ov), (r, rv), (a, av), (p, pv) = (usd("orden_usd", self.ORDEN_USD), usd("riesgo_usd", self.RIESGO_USD),
+                                              usd("max_abierto", self.MAX_ABIERTO), usd("perdida_max", self.PERDIDA_MAX))
+        ini_s, fin_s = fnum(lim.get("entrada_ini_m")), fnum(lim.get("entrada_fin_m"))
+        ini, fin, cierre = self.horario()
+        hs = f"{hhmm(int(ini_s))}–{hhmm(int(fin_s))}" if ini_s is not None and fin_s is not None else "sin dato"
+        log.info("Límites del semáforo: %s por operación (pérdida si salta el stop %s) · %s comprometidos · pérdida máx %s "
+                 "al día · compras %s ET. Vigentes aquí (el más estricto de los dos): %s (%s) · %s · %s · compras %s–%s ET, "
+                 "cierre %s.", o, r, a, p, hs, ov, rv, av, pv, hhmm(ini), hhmm(fin), hhmm(cierre))
+
     def horario(self) -> tuple[int, int, int]:
         ini = max(self.ENTRADA_INI_M, int(fnum(self.lim.get("entrada_ini_m")) or 0))
         fin = min(self.ENTRADA_FIN_M, int(fnum(self.lim.get("entrada_fin_m")) or self.ENTRADA_FIN_M))
@@ -390,6 +430,9 @@ class Ejecutor:
         costo = qty * lim
         if costo > self.tope("orden_usd", self.ORDEN_USD) + 0.01:
             return f"US${costo:,.0f} pasa del máximo de US${self.tope('orden_usd', self.ORDEN_USD):,.0f} por operación"
+        rmax = self.tope("riesgo_usd", self.RIESGO_USD)
+        if qty * trail > rmax * 1.05 + 0.01:   # 5 %: el stop llega redondeado a centavos
+            return f"perdería US${qty * trail:,.2f} si salta el stop, más del máximo de US${rmax:,.0f} por operación"
         res = self.resumen()
         if o["t"] in res["vivas_t"]:
             return f"ya hay una orden o posición en {o['t']}"
@@ -426,14 +469,36 @@ class Ejecutor:
                     kw.get("px") or "", "" if pnl is None else pnl, round(com, 2) if com else "",
                     round(riesgo, 2) if riesgo else "", round(pnl / riesgo, 2) if (pnl is not None and riesgo) else "",
                     kw.get("por") or "", o.get("setup") or o.get("tipo") or "", kw.get("motivo") or ""]
-            nuevo = not os.path.exists(self.diario)
-            with open(self.diario, "a", encoding="utf-8", newline="") as f:
-                w = csv.writer(f)
-                if nuevo:
-                    w.writerow(DIARIO_COLS)
-                w.writerow(fila)
         except Exception as e:  # noqa: BLE001
-            log.warning("No pude escribir el diario %s: %s", self.diario, e)
+            log.warning("No pude armar la fila del diario %s: %s", self.diario, e)
+            return
+        self.diario_pend.append(fila)
+        self.diario_vaciar()
+
+    def diario_vaciar(self):
+        """Escribe en el CSV las filas que esperan. En Windows, mientras el CSV está abierto en Excel el archivo queda bloqueado y no
+        se le puede añadir nada: las filas esperan en memoria, se reintentan en cada vuelta y entran todas, en orden, en cuanto se
+        cierra Excel. Nunca debe estorbar a las órdenes: un fallo solo se anota (una vez)."""
+        if not self.diario_pend:
+            return
+        try:
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            if not os.path.exists(self.diario):
+                w.writerow(DIARIO_COLS)
+            w.writerows(self.diario_pend)
+            with open(self.diario, "a", encoding="utf-8", newline="") as f:
+                f.write(buf.getvalue())
+        except Exception as e:  # noqa: BLE001
+            if not self.diario_aviso:
+                self.diario_aviso = True
+                log.warning("No pude escribir el diario %s (¿lo tienes abierto en Excel? ciérralo): %s. %d fila(s) esperan y se "
+                            "reintentan solas.", self.diario, e, len(self.diario_pend))
+            return
+        if self.diario_aviso:
+            log.info("Diario %s al día otra vez (%d fila(s) que esperaban).", self.diario, len(self.diario_pend))
+        self.diario_pend.clear()
+        self.diario_aviso = False
 
     @staticmethod
     def detalle(o: dict) -> str:
@@ -798,6 +863,8 @@ class Ejecutor:
         dia = t.date().isoformat()
         if dia != self.dia:
             self.nuevo_dia(dia)
+        if self.diario_pend:
+            self.diario_vaciar()   # filas que no pudieron entrar al CSV (abierto en Excel): se reintentan en cada vuelta
         despierto = t.weekday() < 5 and 8 * 60 + 30 <= m < 16 * 60 + 30
         if despierto != self._despierto:   # Windows no se duerme mientras el mercado está abierto (y la PC está prendida)
             self._despierto = despierto
@@ -805,8 +872,15 @@ class Ejecutor:
         if not self.ib.isConnected():
             self.paper = False
             if not self.conectar():
+                self.fallos_ib += 1
                 self.sync(now)  # el semáforo ve «desconectado» (o el candado) y no ofrece botón
-                return 10
+                en_horas = t.weekday() < 5 and 9 * 60 + 20 <= m < 16 * 60 + 5
+                # IB Gateway tarda 1-2 min en volver tras su reinicio de cada noche: con el mercado abierto se insiste
+                # cada 10 s; fuera de horario, tras unos intentos, se espera más para no llenar el registro.
+                return 10 if en_horas or self.fallos_ib <= 6 else 30
+            if self.fallos_ib:
+                log.info("Reconectado con IB Gateway tras %d intento(s) fallido(s).", self.fallos_ib)
+            self.fallos_ib = 0
         self._vivas = None
         self.atender_errores()
         self.revisar(now)
@@ -864,7 +938,10 @@ class Ejecutor:
         if (pausa, modo) != (self.pausa, self.modo):
             self.pausa, self.modo = pausa, modo   # se guarda: si el semáforo se reinicia, lo recupera de aquí
             self.guardar()
-        self.lim = resp.get("limites") if isinstance(resp.get("limites"), dict) else {}
+        lim = resp.get("limites") if isinstance(resp.get("limites"), dict) else {}
+        if lim != self.lim:
+            self.lim = lim
+            self.anotar_limites()
         cid, hace = resp.get("cerrar_id"), fnum(resp.get("cerrar_hace_s"))
         if cid and cid != self.cerrar_visto:
             self.cerrar_visto = cid
@@ -897,7 +974,10 @@ class Ejecutor:
 
     def salir(self):
         """Al cerrar el programa: cancela las compras que aún no se llenaron (nadie las vigilaría). Lo comprado queda
-        en IBKR con su stop y su objetivo hasta las 16:00."""
+        en IBKR con su stop y su objetivo hasta las 16:00. Si el diario sigue bloqueado, sus filas pendientes quedan en el registro."""
+        self.diario_vaciar()
+        for fila in self.diario_pend:
+            log.warning("Fila del diario sin escribir (el CSV seguía bloqueado): %s", ",".join(str(x) for x in fila))
         if not self.ib.isConnected():
             return
         for o in list(self.ord.values()):
@@ -907,6 +987,129 @@ class Ejecutor:
         if abiertas:
             log.warning("Quedan posiciones paper con su stop en IBKR: %s. Vuelve a abrir el ejecutor antes de las "
                         "15:55 ET para que las cierre, o ciérralas tú.", ", ".join(abiertas))
+
+
+SALUDO = b"radar-ejecutor-"   # lo primero que contesta la copia abierta a quien se conecte a su puerto del cerrojo
+
+
+class Cerrojo:
+    """Puerto local (solo 127.0.0.1) reservado mientras el programa viva. Contesta con un saludo a quien se conecte, para que otra
+    copia sepa que ahí hay un ejecutor y no un programa cualquiera. Se libera con close(), o solo si el programa se cierra o se cae."""
+
+    def __init__(self, sock, nombre: str):
+        self.sock, self.vivo = sock, True
+        self.saludo = SALUDO + nombre.encode("ascii", "ignore") + b"\n"
+        sock.settimeout(1.0)
+        self.hilo = threading.Thread(target=self._atender, name="cerrojo", daemon=True)
+        self.hilo.start()
+
+    def _atender(self):
+        while self.vivo:
+            try:
+                c, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                c.sendall(self.saludo)
+                c.settimeout(2.0)
+                c.recv(16)               # espera a que el otro cuelgue primero: así el TIME_WAIT queda de su lado y no en nuestro puerto
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    def close(self):
+        self.vivo = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)       # despierta el accept() en Linux (en Windows da error y no hace falta)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.hilo.join(1.5)                            # al volver, el puerto ya está libre
+
+
+def tomar_cerrojo(puerto: int, nombre: str = "ejecutor"):
+    """Una sola copia de cada ejecutor: reserva un puerto local mientras el programa viva. Devuelve (cerrojo, hay_otro):
+      (Cerrojo, False)  el puerto es nuestro (hay que conservar el cerrojo hasta salir);
+      (None, True)      no se pudo reservar y quien contesta en ese puerto es otra copia de un ejecutor: ya hay otro abierto;
+      (None, False)     no se pudo reservar y no es otra copia (puerto bloqueado por el sistema o usado por otro programa):
+                        se sigue sin este seguro, porque un seguro roto no debe dejar al ejecutor sin arrancar."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except Exception:  # noqa: BLE001
+        return None, False
+    try:
+        if not hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # Linux/Mac: hace falta para reabrir justo tras cerrar; en Windows NO (dejaría compartir el puerto)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", puerto))
+        s.listen(5)
+        return Cerrojo(s, nombre), False
+    except Exception:  # noqa: BLE001
+        try:
+            s.close()
+        except Exception:  # noqa: BLE001
+            pass
+    try:                                                   # no se pudo reservar: ¿quién contesta ahí?
+        with socket.create_connection(("127.0.0.1", puerto), timeout=2) as c:
+            c.settimeout(2)
+            return None, c.recv(64).startswith(SALUDO)
+    except Exception:  # noqa: BLE001
+        return None, False
+
+
+def ya_hay_otro(puerto: int, nombre: str) -> int:
+    """Mensaje y código de salida 3 cuando ya hay otra copia: ejecutor.bat no la reabre (el que ya corre sigue como está)."""
+    msg = (f"Ya hay otro {nombre} abierto (el puerto local {puerto} está ocupado): este se cierra y el que ya corría "
+           f"sigue como está.")
+    print(msg)
+    log.warning(msg)
+    return 3
+
+
+def esperar(ib, segundos: float):
+    """Espera procesando lo que llega de IBKR. Si el Gateway se cae (o se reinicia, como cada noche a las 23:30), la
+    librería convierte el corte en un ConnectionError que sale justo de esta espera: no debe matar al programa, el
+    siguiente paso() ve que no hay conexión y reconecta."""
+    try:
+        ib.sleep(segundos)
+    except (Exception, asyncio.CancelledError) as e:   # noqa: BLE001 (Ctrl+C no entra aquí: es BaseException)
+        log.warning("Espera interrumpida (%s: %s); sigo.", type(e).__name__, e)
+        time.sleep(1)
+
+
+def bucle(ex, ib, nombre: str = "ejecutor"):
+    """El ciclo de siempre: un paso, esperar, otro paso. Solo sale con Ctrl+C. Ningún error de un paso, ni un corte de
+    la conexión con IBKR, lo detiene."""
+    while True:
+        try:
+            espera = ex.paso()
+        except (ConnectionError, asyncio.CancelledError) as e:   # corte con IBKR a mitad de un paso: se reconecta solo
+            log.warning("Se cortó la conexión con IBKR en mitad de un paso (%s); reintento en 3 s.", type(e).__name__)
+            espera = 3
+        except Exception:  # noqa: BLE001 (nunca dejarlo caer en plena sesión)
+            log.exception("Error inesperado en el %s; sigo en 5 s.", nombre)
+            espera = 5
+        esperar(ib, espera)   # mientras espera, procesa lo que llega de IBKR (aquí sí se puede esperar)
+
+
+def cerrar(ex, ib):
+    """Al salir con Ctrl+C: cancela las compras sin llenar, avisa al semáforo y desconecta. Un fallo aquí no impide
+    desconectar."""
+    try:
+        ex.salir()
+        if ib.isConnected():
+            esperar(ib, 1)   # que salgan las cancelaciones antes de desconectar
+            ex.sync(ex.reloj())
+    except (Exception, asyncio.CancelledError):  # noqa: BLE001
+        log.exception("Error al cerrar el ejecutor.")
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
 
 
 def main(argv=None):
@@ -920,30 +1123,24 @@ def main(argv=None):
     if IB is None:
         print("Falta la librería de IBKR. Instálala con:  py -m pip install -r requirements.txt")
         return 2
+    cerrojo, hay_otro = tomar_cerrojo(LOCK_PORT, "paper")
+    if hay_otro:
+        return ya_hay_otro(LOCK_PORT, "ejecutor paper")
+    if cerrojo is None:
+        log.warning("No pude reservar el puerto local %d (una sola copia a la vez); sigo sin ese seguro.", LOCK_PORT)
     no_quickedit()
     log.info("Ejecutor PAPER %s -> %s. Candado: solo IB Gateway paper (puerto %d, cuentas DU). Ctrl+C para salir.",
              VERSION, cfg["SEMAFORO_URL"], PUERTO)
     ib = IB()
     ex = Ejecutor(cfg, ib)
     try:
-        while True:
-            try:
-                espera = ex.paso()
-            except Exception:  # noqa: BLE001 (nunca dejarlo caer en plena sesión)
-                log.exception("Error inesperado en el ejecutor; sigo en 5 s.")
-                espera = 5
-            ib.sleep(espera)  # mientras espera, procesa lo que llega de IBKR (aquí sí se puede esperar)
+        bucle(ex, ib, "ejecutor")
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            ex.salir()
-            if ib.isConnected():
-                ib.sleep(1)   # que salgan las cancelaciones antes de desconectar
-                ex.sync(ex.reloj())
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
+        cerrar(ex, ib)
+        if cerrojo:
+            cerrojo.close()
     log.info("Ejecutor detenido.")
     return 0
 

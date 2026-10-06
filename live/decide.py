@@ -10,9 +10,17 @@ import os
 from .metrics import OPEN_M, OR_MINUTES
 
 # ---------- Umbrales ----------
-# Perfil de riesgo (RIESGO en Render): "alto" avisa antes a cambio de más avisos que fallan; "normal" es el de siempre.
-RIESGO = "normal" if os.environ.get("RIESGO", "alto").strip().lower() == "normal" else "alto"
-ALTO = RIESGO == "alto"
+# Perfil de riesgo (RIESGO en Render), de menos a más:
+#   normal  los umbrales de siempre.
+#   alto    avisa antes a cambio de más avisos que fallan.
+#   volatil (por defecto) todo lo de «alto» y además acepta más VOLATILIDAD: stops más anchos (nunca a menos de un tercio del
+#           rango diario típico de la acción, hasta 5 %), acciones más extendidas sobre el VWAP y objetivos que crecen con el
+#           stop. Más volatilidad NO es más dinero: el tamaño de la orden se calcula por riesgo en dólares (live/paper.py,
+#           RIESGO_USD), así que un stop más ancho compra menos acciones y lo que se pierde si salta sigue siendo lo mismo.
+_PERFIL = os.environ.get("RIESGO", "volatil").strip().lower()
+RIESGO = _PERFIL if _PERFIL in ("normal", "volatil") else "alto"
+ALTO = RIESGO != "normal"
+VOLATIL = RIESGO == "volatil"
 MIN_PRICE = 1.0            # debajo: NO (spreads y dilución)
 MIN_USD_VOL = 3_000_000    # dólares negociados hoy en sesión
 MAX_SPREAD = 0.8           # % (1.5 % si el precio < 5)
@@ -21,11 +29,15 @@ RVOL_NEWS = 1.2 if ALTO else 1.5     # ...con noticia fresca
 # RVOL de los últimos 15 min que pone en juego a una acción aunque su RVOL acumulado no llegue (ruptura de media mañana
 # con volumen nuevo). 0 = apagado: se calcula y se muestra, pero no decide hasta medir con los resultados si ayuda.
 RVOL15_IN_PLAY = float(os.environ.get("RVOL15_IN_PLAY", "3" if ALTO else "0"))
-EXT_MAX = 5.0 if ALTO else 4.0  # % sobre VWAP: más que esto = esperar retroceso
-EXT_PARABOLIC = 10.0       # % sobre VWAP: no perseguir
-CHG15_PARABOLIC = 15.0     # % en 15 minutos: no perseguir
-RISK_MAX = 3.0 if ALTO else 2.5  # % máximo entre entrada y stop (alto: admite acciones más volátiles)
+EXT_MAX = 7.0 if VOLATIL else 5.0 if ALTO else 4.0  # % sobre VWAP: más que esto = esperar retroceso
+EXT_PARABOLIC = 14.0 if VOLATIL else 10.0       # % sobre VWAP: no perseguir
+CHG15_PARABOLIC = 20.0 if VOLATIL else 15.0     # % en 15 minutos: no perseguir
+RISK_MAX = 5.0 if VOLATIL else 3.0 if ALTO else 2.5  # % máximo entre entrada y stop (alto y volátil: acciones más volátiles)
 RISK_MIN = 0.7             # stop nunca más cerca que esto (ruido)
+# Volátil: el stop nunca más cerca que esta fracción del rango diario típico (ATR %). Los stops van pegados al VWAP o al último
+# mínimo (mediana 1.1 % en 56 señales llenadas, 29-sep a 5-oct) y en 20 de las 42 con stop < 1.5 % saltó el stop; 0 = sin piso.
+STOP_ATR = float(os.environ.get("STOP_ATR", "0.33" if VOLATIL else "0"))
+RISK_BASE = 3.0            # % de stop hasta el que los objetivos son T1/T2; con un stop más ancho (solo el perfil volátil) crecen
 MIN_ATR = 2.0              # % rango diario típico; debajo difícilmente da +2 %
 BUY_MIN = 55 if ALTO else 60  # fuerza mínima para COMPRA (+5 con mercado amarillo)
 LAST_ENTRY_M = 15 * 60 + 30  # 15:30 ET: fin de la fase de seguimiento
@@ -119,18 +131,26 @@ def strength(m: dict, ctx: dict) -> tuple[int, list[str]]:
 
 
 def _plan(entry: float, stop: float) -> dict | None:
+    """Con un stop de hasta RISK_BASE % los objetivos son T1/T2 (+2 % / +5 %), como siempre. Con uno más ancho (solo el
+    perfil volátil lo admite) crecen en la misma proporción: no se paga más riesgo por el mismo premio, y la relación
+    objetivo/riesgo nunca baja de la que ya tenía un stop de RISK_BASE %."""
     if not entry or not stop or stop <= 0 or stop >= entry:
         return None
     risk = 100 * (entry / stop - 1)
-    return {"entry": round(entry, 4), "stop": round(stop, 4), "t1": round(entry * (1 + T1 / 100), 4),
-            "t2": round(entry * (1 + T2 / 100), 4), "risk": round(risk, 2),
-            "rr1": round(T1 / risk, 2), "rr2": round(T2 / risk, 2)}
+    k = max(1.0, risk / RISK_BASE) if VOLATIL else 1.0
+    t1, t2 = T1 * k, T2 * k
+    return {"entry": round(entry, 4), "stop": round(stop, 4), "t1": round(entry * (1 + t1 / 100), 4),
+            "t2": round(entry * (1 + t2 / 100), 4), "risk": round(risk, 2),
+            "rr1": round(t1 / risk, 2), "rr2": round(t2 / risk, 2)}
 
 
-def _stop(entry: float, m: dict) -> float:
-    """Debajo del VWAP o del último mínimo (el más alto), nunca a menos de RISK_MIN % de la entrada."""
+def _stop(entry: float, m: dict, atr: float | None = None) -> float:
+    """Debajo del VWAP o del último mínimo (el más alto), nunca a menos de RISK_MIN % de la entrada y, con STOP_ATR
+    (perfil volátil), nunca a menos de esa fracción del rango diario típico: un stop dentro del ruido normal de una acción
+    que se mueve mucho salta por nada."""
     stop = max(m.get("vwap") or 0, m.get("swing_low") or 0) * 0.999
-    return min(stop, entry * (1 - RISK_MIN / 100))
+    piso = max(RISK_MIN, STOP_ATR * atr) if STOP_ATR and atr else RISK_MIN
+    return min(stop, entry * (1 - piso / 100))
 
 
 def decide(t: str, m: dict, ctx: dict) -> dict:
@@ -139,6 +159,7 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     `level` en la respuesta = precio que hay que romper (gatillo de ruptura) cuando lo hay: con él se arma la orden."""
     score, why = strength(m, ctx)
     px = m.get("px")
+    atr = ctx.get("atr")
     out = {"t": t, "name": ctx.get("name"), "px": px, "chg": m.get("chg"), "score": score, "why": why,
            "rvol": m.get("rvol"), "ext": m.get("ext"), "vwap": m.get("vwap"), "orh": m.get("orh"),
            "hod": m.get("hod"), "pmh": m.get("pm_high"), "atr": ctx.get("atr"), "spread": ctx.get("spread"),
@@ -161,7 +182,7 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     def wait_break(reason, lvl):
         """ESPERA con gatillo de ruptura: compra stop un 0.1 % sobre el nivel, con su stop y objetivos."""
         entry = lvl * 1.001
-        return res("ESPERA", reason, f"compra si rompe {lvl:.2f} con volumen", _plan(entry, _stop(entry, m)), lvl)
+        return res("ESPERA", reason, f"compra si rompe {lvl:.2f} con volumen", _plan(entry, _stop(entry, m, atr)), lvl)
 
     # ---- 1. Vetos duros ----
     if not px:
@@ -210,7 +231,6 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
         return res("NO", f"sin volumen relativo (RVOL {rv:.1f}×)")
     if (m.get("usd_vol") or 0) < MIN_USD_VOL and now_m >= OPEN_M + OR_MINUTES:
         return res("NO", "poca liquidez en dólares")
-    atr = ctx.get("atr")
     if atr is not None and atr < MIN_ATR and rv < 4:
         return res("NO", f"se mueve poco (rango diario {atr:.1f}%)")
     vwap, orh = m.get("vwap"), m.get("orh")
@@ -258,7 +278,7 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     # Entrada: no perseguir. Si el precio ya se alejó del nivel roto, orden límite en el retesteo.
     limit = px > level * (1 + CHASE_MAX / 100)
     entry = level * 1.002 if limit else px
-    stop = _stop(entry, m)
+    stop = _stop(entry, m, atr)
     risk = 100 * (entry / stop - 1)
     if risk > RISK_MAX:
         return res("ESPERA", f"stop lejos ({risk:.1f}%)", f"espera retroceso cerca de {entry * (1 - (risk - RISK_MAX) / 100):.2f}")

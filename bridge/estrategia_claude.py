@@ -9,8 +9,16 @@ La idea, en una frase: comprar la pausa de una acción fuerte, sin perseguirla.
      menos volumen que el impulso y ya con dos velas sin hacer mínimo nuevo (la caída se detuvo).
   3. Entrada: compra LÍMITE un poco por encima del mínimo del retroceso (no corre tras el precio: si la acción sigue
      subiendo sin volver, no compra).
-  4. Salida: stop fijo (nativo en IBKR) bajo el mínimo del retroceso, con una distancia mínima del 0.6 %, y objetivo de 2R
-     (R = distancia al stop). Lo que quede a las 15:55 ET se vende a mercado.
+  4. Salida: stop fijo (nativo en IBKR) bajo el mínimo del retroceso, con una distancia mínima que crece con la volatilidad
+     de la acción (un tercio de su ATR; nunca menos del 0.6 %) y máxima del 5 %, y objetivo de 2R (R = distancia al stop).
+     Lo que quede a las 15:55 ET se vende a mercado.
+Perfil volátil (v1.4, pedido de Priamo: «toma tú también mucho más riesgo», entendido como volatilidad, no dinero): acepta
+retrocesos más hondos (hasta el 70 % del impulso, mínimo hasta el 85 %), líderes más extendidos (hasta +50 % en el día),
+ya no exige que el máximo del día quede a 1.5R de la entrada (con un stop ancho esa regla descartaba 3 de cada 4 jugadas
+en el repaso histórico) y pone el stop según la volatilidad de la acción. El dinero no
+sube: se compran las acciones que pierden como mucho US$6 (`riesgo_usd`) si salta el stop, con un mínimo de 1 acción
+siempre que no pase del tope de US$15; un stop más ancho compra menos acciones. Las constantes de antes están en
+`BASE` (S.con(CFG, **S.BASE) las devuelve).
 Es la antítesis operativa del semáforo: él compra rupturas (fuerza) con un stop que sube; esta compra debilidad dentro de
 la fuerza, con orden límite y stop fijo, durante toda la sesión. Funciona con velas de Yahoo con 1–2 min de retraso
 porque la entrada es una orden que ya espera en IBKR y las salidas son órdenes nativas (no dependen de ver el precio).
@@ -34,14 +42,14 @@ class Cfg:
     max_precio: float = 800.0
     chg_min: float = 0.015         # sube al menos 1.5 % sobre el cierre de ayer...
     chg_atr: float = 0.45          # ...y al menos 0.45 × su ATR diario (una acción nerviosa necesita subir más)
-    chg_max: float = 0.30          # más de +30 % es parabólica: no se persigue
+    chg_max: float = 0.50          # más de +50 % es parabólica: no se persigue (antes 30 %)
     rvol_min: float = 1.3          # volumen acumulado / el habitual a esta hora
     leg_min: float = 0.012         # el impulso (mínimo previo → máximo del día) mide al menos 1.2 %...
     leg_atr: float = 0.35          # ...y 0.35 × ATR
     leg_ventana: int = 60          # velas antes del máximo en las que se busca el inicio del impulso
     retr_min: float = 0.25         # el cierre actual retrocedió entre el 25 %...
-    retr_max: float = 0.60         # ...y el 60 % del impulso
-    retr_prof: float = 0.70        # y el mínimo del retroceso nunca pasó del 70 %
+    retr_max: float = 0.70         # ...y el 70 % del impulso (antes 60 %)
+    retr_prof: float = 0.85        # y el mínimo del retroceso nunca pasó del 85 % (antes 70 %)
     pb_min_velas: int = 4          # el retroceso lleva al menos 4 velas...
     pb_max_velas: int = 60         # ...y no más de 60 (si no, ya es otra cosa)
     pausa_velas: int = 2           # velas seguidas sin mínimo nuevo del retroceso
@@ -50,16 +58,22 @@ class Cfg:
     entrada_f: float = 0.30        # la compra límite va al 30 % del camino entre el mínimo del retroceso y el último cierre
     stop_buf: float = 0.0015       # el stop va 0.15 % bajo el mínimo del retroceso...
     riesgo_min: float = 0.006      # ...pero nunca a menos de 0.6 % de la entrada (el ruido sacaría el stop)
+    stop_atr: float = 0.33         # ...ni a menos de un tercio del ATR diario de la acción (0 lo desactiva)
+    stop_max: float = 0.05         # y si el stop queda a más de 5 % de la entrada no se compra («stop lejos»; 0 lo desactiva)
     r_obj: float = 2.0             # objetivo = entrada + 2R
-    hod_min_r: float = 1.5         # el máximo del día tiene que quedar al menos a 1.5R de la entrada
+    hod_min_r: float = 0.0         # el máximo del día tiene que quedar al menos a esta distancia (en R) de la entrada (antes 1.5; 0 la apaga)
     spy_min: float = -0.005        # no se compra si SPY cae más de 0.5 % en el día
     ttl_s: int = 600               # la compra espera 10 min; si no se llena, se cancela
     orden_usd: float = 500.0
+    riesgo_usd: float = 6.0        # se compran las acciones que pierden como mucho esto si salta el stop (0 lo desactiva)
     riesgo_max_usd: float = 15.0   # pérdida máxima por operación (por si el precio es raro)
     vela_vieja_s: int = 240        # si la última vela completa tiene más de 4 min, no hay datos fiables
 
 
 CFG = Cfg()
+# lo que había antes del perfil volátil (v1.3): S.con(S.CFG, **S.BASE)
+BASE = {"chg_max": 0.30, "retr_max": 0.60, "retr_prof": 0.70, "hod_min_r": 1.5, "stop_atr": 0.0, "stop_max": 0.0,
+        "riesgo_usd": 0.0}
 
 # fracción del volumen del día que suele estar hecha a cada hora (curva en U de la bolsa de EE. UU.)
 _CURVA = [(570, 0.0), (575, 0.05), (585, 0.10), (600, 0.145), (630, 0.22), (660, 0.29), (720, 0.40), (780, 0.49),
@@ -183,26 +197,31 @@ def evaluar(t: str, bars, prev_close, adv, atr_pct, cfg: Cfg = CFG) -> tuple[dic
         return None, "el retroceso trae mucho volumen"
     # --- la orden ---
     entrada = round(pb_lo + cfg.entrada_f * (px - pb_lo), 2)
-    stop = round(min(pb_lo * (1 - cfg.stop_buf), entrada * (1 - cfg.riesgo_min)), 2)
+    piso = max(cfg.riesgo_min, cfg.stop_atr * atr_pct) if cfg.stop_atr else cfg.riesgo_min
+    stop = round(min(pb_lo * (1 - cfg.stop_buf), entrada * (1 - piso)), 2)
     r = round(entrada - stop, 2)
     if r <= 0 or entrada <= stop:
         return None, "stop inválido"
+    if cfg.stop_max and r / entrada > cfg.stop_max + 1e-9:
+        return None, f"stop lejos ({r / entrada * 100:.1f}%)"
     if hod < entrada + cfg.hod_min_r * r:
         return None, "el máximo del día queda muy cerca"
     objetivo = round(entrada + cfg.r_obj * r, 2)
     qty = int(cfg.orden_usd // entrada)
     if qty < 1:
         return None, "no alcanza para 1 acción"
+    if cfg.riesgo_usd:                      # el dinero en juego no sube con el stop: stop más ancho, menos acciones
+        qty = min(qty, max(1, int(cfg.riesgo_usd / r + 1e-9)))
     if qty * r > cfg.riesgo_max_usd:
         qty = int(cfg.riesgo_max_usd // r)
         if qty < 1:
             return None, "riesgo muy grande"
     score = rvol * min(chg / atr_pct, 3.0)
     texto = (f"pullback {retr * 100:.0f}% · {'+' if chg >= 0 else ''}{chg * 100:.1f}% en el día · RVOL {rvol:.1f} · "
-             f"sobre VWAP {vw:.2f}")
+             f"sobre VWAP {vw:.2f} · stop {r / entrada * 100:.1f}%")
     return {"t": t, "tipo": "lmt", "limite": entrada, "stop": stop, "objetivo": objetivo, "trail": r, "qty": qty,
             "riesgo": round(qty * r, 2), "rvol": round(rvol, 2), "chg": round(chg, 4), "retr": round(retr, 3),
-            "score": round(score, 2), "texto": texto, "hod": hod, "pb_lo": pb_lo, "vwap": round(vw, 2),
+            "score": round(score, 2), "atr": round(atr_pct, 4), "stop_pct": round(r / entrada * 100, 2), "texto": texto, "hod": hod, "pb_lo": pb_lo, "vwap": round(vw, 2),
             "m": last[0]}, "jugada"
 
 

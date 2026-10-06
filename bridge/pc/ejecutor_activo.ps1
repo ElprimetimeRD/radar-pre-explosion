@@ -6,7 +6,7 @@ param([string]$Patron = 'ejecutor_paper\.py')
 try {
   $yo = $PID
   $hay = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-      $_.ProcessId -ne $yo -and $_.CommandLine -and $_.Name -notmatch '^(powershell|pwsh|wscript)\.exe$' -and ($_.CommandLine -match $Patron) })
+      $_.ProcessId -ne $yo -and $_.CommandLine -and $_.Name -match '^(python|pythonw|py|java|javaw|cmd)\.exe$' -and ($_.CommandLine -match $Patron) })
   if ($hay.Count -gt 0) { exit 1 } else { exit 0 }
 } catch {
   exit 0

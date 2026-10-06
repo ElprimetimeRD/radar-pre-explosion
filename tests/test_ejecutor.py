@@ -5,6 +5,8 @@ import copy
 import os
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace as NS
 from zoneinfo import ZoneInfo
@@ -205,10 +207,14 @@ def test_orden_con_hijas():
     assert [a["estado"] for a in evs(posted, "ack")] == ["puesta"]        # le repite al semáforo cómo va
     est = posted[-1]["estado"]
     assert est["comprometido"] == round(49 * 10.03 + 24 * 20.06, 2) and est["vivas_t"] == ["ABC", "XYZ"], est
-    ex2, ib2, c2, p2, r2 = nuevo()                                        # vencimiento: nunca después de las 12:00
-    r2["r"] = {"ordenes": [orden(hasta=at(15, 0))]}
+    ex2, ib2, c2, p2, r2 = nuevo()                                        # vencimiento: nunca después de las 15:30
+    r2["r"] = {"ordenes": [orden(hasta=at(16, 0))]}
     ex2.paso()
-    assert ib2.placed[0][1].goodTillDate == "20261005 12:00:00 US/Eastern"
+    assert ib2.placed[0][1].goodTillDate == "20261005 15:30:00 US/Eastern"
+    ex2b, ib2b, c2b, p2b, r2b = nuevo()                                   # y si el semáforo cierra las compras antes, esa hora
+    r2b["r"] = {"limites": {"entrada_fin_m": 12 * 60}, "ordenes": [orden(hasta=at(16, 0))]}
+    ex2b.paso()
+    assert ib2b.placed[0][1].goodTillDate == "20261005 12:00:00 US/Eastern", [p[1].goodTillDate for p in ib2b.placed]
 
 
 def test_llena_y_sale():
@@ -257,12 +263,22 @@ def test_limites():
     exn.paso()
     vuelta(exn, cn, rn)
     assert ibn.placed == [] and "no reconoce" in evs(pn, "rechazada")[0]["motivo"]
-    for h, m_ in ((12, 1), (9, 29)):                                     # fuera de 9:30–12:00 ET
+    for h, m_ in ((15, 31), (9, 29)):                                    # fuera de 9:30–15:30 ET
         ex2, ib2, c2, p2, r2 = nuevo(now=at(h, m_))
         r2["r"] = {"ordenes": [orden(hasta=at(h, m_) + 600)]}
         ex2.paso()
         vuelta(ex2, c2, r2)
         assert ib2.placed == [] and "horario" in evs(p2, "rechazada")[0]["motivo"]
+    for h, m_ in ((12, 1), (14, 45), (15, 29)):                          # la tarde también vale (ya no se corta a las 12:00)
+        ex2, ib2, c2, p2, r2 = nuevo(now=at(h, m_))
+        r2["r"] = {"ordenes": [orden(hasta=at(h, m_) + 600)]}
+        ex2.paso()
+        assert len(ib2.placed) == 3 and not evs(p2, "rechazada"), (h, m_, [e["motivo"] for e in evs(p2, "rechazada")])
+    ex2, ib2, c2, p2, r2 = nuevo(now=at(12, 1))                           # si el semáforo cierra las compras a las 12:00, manda esa hora
+    r2["r"] = {"limites": {"entrada_fin_m": 12 * 60}, "ordenes": [orden(hasta=at(12, 1) + 600)]}
+    ex2.paso()
+    vuelta(ex2, c2, r2)
+    assert ib2.placed == [] and "9:30–12:00" in evs(p2, "rechazada")[0]["motivo"]
     sab = datetime(2026, 10, 3, 10, 0, tzinfo=NY).timestamp()
     ex3, ib3, c3, p3, r3 = nuevo(now=sab)
     r3["r"] = {"ordenes": [orden(hasta=sab + 600)]}
@@ -549,6 +565,347 @@ def test_red_y_reinicio():
     assert ex6.pausa is True and ex6.modo == "auto"
 
 
+class IBCaido(FakeIB):
+    """IB Gateway reiniciándose: rechaza las conexiones las primeras `fallar` veces."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.fallar = 0
+
+    def connect(self, host, port, clientId, timeout):
+        if self.fallar > 0:
+            self.fallar -= 1
+            raise ConnectionRefusedError("IB Gateway no contesta")
+        super().connect(host, port, clientId, timeout)
+
+
+def test_reconexion_tras_reinicio_del_gateway():
+    """El Gateway se reinicia solo cada noche (23:30). El ejecutor debe reconectar solo y seguir con lo suyo."""
+    ib = IBCaido()
+    clock, resp = Clock(T0), {"r": {"ordenes": [orden()]}}
+    ex = E.Ejecutor({"SEMAFORO_URL": "https://sem.test/", "BRIDGE_TOKEN": "clave"}, ib, post=lambda *a, **k: resp["r"],
+                    reloj=clock, estado_path=tempfile.mktemp(suffix=".json"))
+    ex.paso()
+    oids = dict(ex.ord["a1b2c3d4"]["oids"])
+    ib.fill(oids["e"], 49, 10.02)
+    clock.t += 1
+    ex.paso()
+    assert ex.ord["a1b2c3d4"]["estado"] == "llena" and ex.paper
+    colocadas = len(ib.placed)
+    # Corte: el Gateway se va y tarda 8 intentos en volver. Con el mercado abierto se insiste cada 10 s.
+    ib.conn, ib.fallar = False, 8
+    resp["r"] = {}
+    esperas = []
+    for _ in range(8):
+        clock.t += 10
+        esperas.append(ex.paso())
+        assert not ex.paper and ex.fallos_ib == len(esperas)
+    assert esperas == [10] * 8, esperas
+    clock.t += 10
+    ex.paso()                                                           # vuelve: reconoce lo suyo y sigue
+    assert ex.paper and ib.isConnected() and ex.fallos_ib == 0
+    assert ex.ord["a1b2c3d4"]["estado"] == "llena" and ex.por_oid[oids["t"]] == ("a1b2c3d4", "t")
+    assert len(ib.placed) == colocadas, "reconectar no debe poner órdenes nuevas"
+    ib.fill(oids["o"], 49, 10.5)                                        # y sigue gestionando la posición
+    vuelta(ex, clock, resp)
+    assert ex.ord["a1b2c3d4"]["estado"] == "cerrada"
+    # De noche (domingo 22:00 ET, mercado cerrado): 10 s los primeros 6 intentos y luego 30 s, sin llenar el registro.
+    ib2 = IBCaido()
+    ib2.fallar = 9
+    dom = datetime(2026, 10, 4, 22, 0, tzinfo=NY).timestamp()
+    ex2 = E.Ejecutor({"SEMAFORO_URL": "https://sem.test/", "BRIDGE_TOKEN": "clave"}, ib2, post=lambda *a, **k: {},
+                     reloj=Clock(dom), estado_path=tempfile.mktemp(suffix=".json"))
+    esp = [ex2.paso() for _ in range(9)]
+    assert esp == [10] * 6 + [30] * 3, esp
+    assert ex2.paso() == 10 and ex2.paper                                # al fin conecta (domingo: ritmo de reposo)
+    assert ex2.fallos_ib == 0
+
+
+def _bucle_con(pasos, sleeps):
+    """Corre E.bucle con un ejecutor y un ib falsos que van lanzando lo indicado; termina con Ctrl+C simulado."""
+    llamadas = {"paso": 0, "sleep": 0, "esperas": []}
+
+    class Ej:
+        def paso(self):
+            i = llamadas["paso"]
+            llamadas["paso"] += 1
+            r = pasos[i] if i < len(pasos) else 0
+            if isinstance(r, BaseException):
+                raise r
+            return r
+
+    class Ib:
+        def sleep(self, s):
+            i = llamadas["sleep"]
+            llamadas["sleep"] += 1
+            llamadas["esperas"].append(s)
+            r = sleeps[i] if i < len(sleeps) else KeyboardInterrupt()
+            if isinstance(r, BaseException):
+                raise r
+    old = E.time.sleep
+    E.time.sleep = lambda s: None                                       # sin esperas de verdad
+    try:
+        try:
+            E.bucle(Ej(), Ib(), "ejecutor de prueba")
+        except KeyboardInterrupt:
+            llamadas["ctrl_c"] = True
+    finally:
+        E.time.sleep = old
+    return llamadas
+
+
+def test_el_corte_de_conexion_no_mata_el_bucle():
+    """Lo que pasó de verdad a las 23:30: el Gateway se reinicia, la librería lanza ConnectionError desde ib.sleep() y el
+    ejecutor se cerraba sin avisar. Ahora el bucle sigue y solo Ctrl+C lo detiene."""
+    import asyncio
+    # 1) el error sale de la espera (el caso real)
+    ll = _bucle_con([5, 5, 5], [ConnectionError("Socket disconnect"), None, RuntimeError("raro"), KeyboardInterrupt()])
+    assert ll["ctrl_c"] and ll["paso"] == 4 and ll["sleep"] == 4, ll
+    # 2) la cancelación de asyncio también (otra forma en que la librería corta una espera)
+    ll = _bucle_con([5, 5], [asyncio.CancelledError(), KeyboardInterrupt()])
+    assert ll["ctrl_c"] and ll["paso"] == 2, ll
+    # 3) el corte llega a mitad de un paso (p. ej. mientras pide las órdenes abiertas): reintenta pronto, sin traceback
+    ll = _bucle_con([ConnectionError("Socket disconnect"), 5, asyncio.CancelledError(), 5], [None, None, None, KeyboardInterrupt()])
+    assert ll["ctrl_c"] and ll["esperas"][:3] == [3, 5, 3], ll
+    # 4) un error cualquiera en un paso: reintenta en 5 s
+    ll = _bucle_con([ValueError("x"), 7], [None, KeyboardInterrupt()])
+    assert ll["esperas"][0] == 5 and ll["esperas"][1] == 7, ll
+    # 5) Ctrl+C sale (no se traga): también si llega durante un paso
+    ll = _bucle_con([KeyboardInterrupt()], [])
+    assert ll["ctrl_c"] and ll["sleep"] == 0, ll
+    # 6) cerrar() desconecta aunque falle algo al despedirse
+    ib = FakeIB()
+    ib.conn = True
+    ex = E.Ejecutor({"SEMAFORO_URL": "https://sem.test/", "BRIDGE_TOKEN": "clave"}, ib, post=lambda *a, **k: {},
+                    reloj=Clock(T0), estado_path=tempfile.mktemp(suffix=".json"))
+    ex.salir = lambda: (_ for _ in ()).throw(ConnectionError("Socket disconnect"))
+    E.cerrar(ex, ib)
+    assert not ib.isConnected()
+
+
+def test_el_error_real_de_ib_async():
+    """Con la librería de verdad: un corte de conexión sale como ConnectionError de ib.sleep(); esperar() lo absorbe y la
+    librería sigue sirviendo para la siguiente espera. (Sin ib_async instalado no se prueba.)"""
+    if E.IB is None:
+        return
+    from ib_async import util
+    ib = E.IB()
+    loop = util.getLoop()
+
+    def corte():
+        util.globalErrorEvent.emit(ConnectionError("Socket disconnect"))
+    loop.call_later(0.1, corte)
+    try:
+        ib.sleep(1)
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("la librería ya no lanza ConnectionError desde sleep(): revisa esperar()/bucle()")
+    old = E.time.sleep
+    E.time.sleep = lambda s: None
+    try:
+        loop.call_later(0.1, corte)
+        E.esperar(ib, 1)                                                # no lanza
+        assert ib.sleep(0.05) in (True, None)                           # y la siguiente espera funciona
+    finally:
+        E.time.sleep = old
+
+
+def _puerto_libre():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def test_una_sola_copia():
+    """El cerrojo (puerto local): la primera copia lo toma y saluda a quien se conecte, la segunda ve que ya hay otra, y al cerrar
+    la primera se libera. Si el puerto no se puede reservar y quien contesta NO es otro ejecutor (nadie, o un programa cualquiera),
+    se sigue sin el seguro: un seguro roto no debe dejar al ejecutor sin arrancar."""
+    import socket
+    p = _puerto_libre()
+    c1, otro1 = E.tomar_cerrojo(p, "paper")
+    assert isinstance(c1, E.Cerrojo) and otro1 is False
+    c2, otro2 = E.tomar_cerrojo(p, "paper")
+    assert c2 is None and otro2 is True                                   # ya hay otra copia
+    assert E.ya_hay_otro(p, "ejecutor de prueba") == 3                    # y su código de salida es 3
+    t0 = time.time()
+    c1.close()
+    assert time.time() - t0 < 1.4                                         # cerrar no se queda esperando
+    c3, otro3 = E.tomar_cerrojo(p, "paper")                               # liberado: se puede volver a tomar (reinicio)
+    assert c3 is not None and otro3 is False
+    c3.close()
+    # puerto que el sistema no deja reservar, sin nadie escuchando: no es "otra copia"
+    p4 = _puerto_libre()
+    real = E.socket.socket
+
+    class Bloqueado(real):
+        def bind(self, addr):
+            raise PermissionError(13, "acceso denegado")
+    E.socket.socket = Bloqueado
+    try:
+        c4, otro4 = E.tomar_cerrojo(p4)
+    finally:
+        E.socket.socket = real
+    assert c4 is None and otro4 is False
+    # puerto ocupado por un programa cualquiera (calla o contesta otra cosa): no es un ejecutor, se sigue sin el seguro
+    for saludo in (None, b"HTTP/1.1 400 Bad Request\r\n"):
+        ajeno = socket.socket()
+        ajeno.bind(("127.0.0.1", 0))
+        ajeno.listen(5)
+        parar = []
+
+        def servir(srv=ajeno, msg=saludo):
+            srv.settimeout(0.3)
+            while not parar:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    continue
+                if msg:
+                    c.sendall(msg)
+                c.close()
+        th = threading.Thread(target=servir, daemon=True)
+        th.start()
+        try:
+            c5, otro5 = E.tomar_cerrojo(ajeno.getsockname()[1])
+        finally:
+            parar.append(1)
+            th.join(2)
+            ajeno.close()
+        assert c5 is None and otro5 is False, (saludo, c5, otro5)
+
+
+def test_windows_bloquea_archivos():
+    """En Windows, el diario abierto en Excel no deja añadirle filas y el estado puede fallar un instante al reemplazarse. Ninguna fila se
+    pierde (esperan y entran todas, en orden, sin repetir la cabecera, cuando se libera) y el estado se guarda al reintentar."""
+    import csv
+    import json
+    import logging
+    ex, ib, clock, posted, resp = nuevo()
+    ex.diario = tempfile.mktemp(suffix=".csv")
+    avisos = []
+
+    class Cap(logging.Handler):
+        def emit(self, rec):
+            avisos.append(rec.getMessage())
+    cap = Cap(level=logging.WARNING)
+    E.log.addHandler(cap)
+    real_open = open
+
+    def excel(path, *a, **kw):                                           # el CSV está abierto en Excel: Windows no deja añadir
+        if str(path) == ex.diario:
+            raise PermissionError(13, "Permission denied", path)
+        return real_open(path, *a, **kw)
+    try:
+        E.open = excel
+        ex.diario_fila("cancelada", orden("11111111", "AAA"), {"motivo": "venció sin activarse"})
+        ex.diario_fila("cancelada", orden("22222222", "BBB"), {"motivo": "venció sin activarse"})
+        ex.diario_vaciar()                                               # sigue bloqueado: no pierde nada ni repite el aviso
+        assert len(ex.diario_pend) == 2 and not os.path.exists(ex.diario)
+        assert len([a for a in avisos if "diario" in a]) == 1, avisos      # un solo aviso, no uno por vuelta
+        ex.salir()                                                       # si se cierra el programa así, las filas quedan en el registro
+        assert len([a for a in avisos if "sin escribir" in a]) == 2 and any("AAA" in a for a in avisos), avisos
+        del E.open                                                       # Excel se cerró: en la siguiente vuelta entran las dos
+        vuelta(ex, clock, resp)
+        assert ex.diario_pend == [] and ex.diario_aviso is False
+        ex.diario_fila("cancelada", orden("33333333", "CCC"), {"motivo": "venció sin activarse"})   # y las siguientes, directas
+        with real_open(ex.diario, encoding="utf-8", newline="") as f:
+            filas = list(csv.DictReader(f))
+        assert [r["simbolo"] for r in filas] == ["AAA", "BBB", "CCC"], filas   # en orden, y una sola cabecera
+        # el estado: un bloqueo momentáneo del reemplazo se supera reintentando
+        real_replace, sleep, n = E.os.replace, E.time.sleep, {"n": 0}
+
+        def replace_flojo(a, b):
+            n["n"] += 1
+            if n["n"] <= 2:
+                raise PermissionError(5, "Access is denied")             # WinError 5
+            return real_replace(a, b)
+        E.os.replace, E.time.sleep = replace_flojo, lambda s: None
+        try:
+            ex.pausa = True
+            ex.guardar()
+            assert n["n"] == 3
+            with real_open(ex.path, encoding="utf-8") as f:
+                assert json.load(f)["pausa"] is True                     # quedó guardado, pese a los dos bloqueos
+            n["n"] = -100                                                # bloqueado todo el rato: se rinde sin lanzar nada
+            avisos.clear()
+            ex.guardar()
+            assert n["n"] == -96 and any("No pude guardar" in a for a in avisos), (n, avisos)
+        finally:
+            E.os.replace, E.time.sleep = real_replace, sleep
+    finally:
+        E.log.removeHandler(cap)
+        E.__dict__.pop("open", None)
+
+
+def test_riesgo_por_operacion():
+    """Tope de lo que se pierde si salta el stop (acciones × distancia del stop): propio US$15; el semáforo lo baja a US$6 y
+    nunca lo sube. Más volatilidad (un stop más ancho) no puede ser más dinero en riesgo."""
+    assert E.RIESGO_USD == 15 and E.Ejecutor.RIESGO_USD == 15
+    ex, ib, clock, posted, resp = nuevo()
+    resp["r"] = {"ordenes": [orden("00000001", "AAA"),                              # 49 × 0.30 = US$14.70: pasa
+                             orden("00000002", "BBB", trail=0.5)]}                  # 49 × 0.50 = US$24.50: más de US$15
+    ex.paso()
+    vuelta(ex, clock, resp)
+    rech = {e["id"]: e["motivo"] for e in evs(posted, "rechazada")}
+    assert "00000001" not in rech and "stop" in rech["00000002"] and "US$24.50" in rech["00000002"] \
+        and "US$15 por operación" in rech["00000002"], rech
+    assert {p[1].orderRef[4:12] for p in ib.placed} == {"00000001"}
+    ex2, ib2, c2, p2, r2 = nuevo()                                                   # el semáforo manda US$6
+    r2["r"] = {"limites": {"riesgo_usd": 6},
+               "ordenes": [orden("00000003", "CCC"),                                 # 49 × 0.30 = 14.70: ya no
+                           orden("00000004", "DDD", qty=20),                         # 20 × 0.30 = 6.00: justo
+                           orden("00000005", "EEE", px=50.0, trail=3.0, qty=2)]}     # 2 × 3.00 = 6.00 (un stop de 6 %)
+    ex2.paso()
+    vuelta(ex2, c2, r2)
+    rech = {e["id"]: e["motivo"] for e in evs(p2, "rechazada")}
+    assert list(rech) == ["00000003"] and "US$14.70" in rech["00000003"] and "US$6 por operación" in rech["00000003"], rech
+    assert {p[1].orderRef[4:12] for p in ib2.placed} == {"00000004", "00000005"}
+    ex3, ib3, c3, p3, r3 = nuevo()                                                   # nunca lo sube
+    r3["r"] = {"limites": {"riesgo_usd": 500}, "ordenes": [orden("00000006", "FFF", trail=0.5)]}
+    ex3.paso()
+    vuelta(ex3, c3, r3)
+    assert ib3.placed == [] and "por operación" in evs(p3, "rechazada")[0]["motivo"]
+    ex4, ib4, c4, p4, r4 = nuevo()                                                   # el stop llega redondeado a centavos: 5 % de margen
+    r4["r"] = {"ordenes": [orden("00000007", "GGG", px=5.0, qty=99, trail=0.15)]}    # 99 × 0.15 = 14.85
+    ex4.paso()
+    assert len(ib4.placed) == 3 and not evs(p4, "rechazada")
+
+
+def test_anota_limites():
+    """Los límites que manda el semáforo y los que quedan vigentes quedan en el registro (solo cuando cambian)."""
+    import logging
+    ex, ib, clock, posted, resp = nuevo()
+    lineas = []
+
+    class H(logging.Handler):
+        def emit(self, record):
+            lineas.append(record.getMessage())
+    h, nivel = H(), E.log.level
+    E.log.addHandler(h)
+    E.log.setLevel(logging.INFO)
+    try:
+        estrictos = {"orden_usd": 300, "riesgo_usd": 6, "max_abierto": 800, "perdida_max": 80, "entrada_ini_m": 570,
+                     "entrada_fin_m": 720, "cierre_m": 955}
+        resp["r"] = {"limites": estrictos}
+        ex.paso()
+        vuelta(ex, clock, resp, r={"limites": dict(estrictos)})           # lo mismo otra vez: no se repite
+        vuelta(ex, clock, resp, r={"limites": {"orden_usd": 5000, "riesgo_usd": 99, "max_abierto": 99999,
+                                               "perdida_max": 9999, "entrada_ini_m": 570, "entrada_fin_m": 930,
+                                               "cierre_m": 955}})
+        vuelta(ex, clock, resp, r={})                                     # sin límites: no inventa ninguna línea
+    finally:
+        E.log.removeHandler(h)
+        E.log.setLevel(nivel)
+    l = [x for x in lineas if x.startswith("Límites del semáforo")]
+    assert len(l) == 2, lineas
+    assert "US$300 por operación (pérdida si salta el stop US$6)" in l[0] and "compras 9:30–12:00 ET" in l[0], l[0]
+    assert "(el más estricto de los dos): US$300 (US$6) · US$800 · US$80 · compras 9:30–12:00 ET, cierre 15:55" in l[0], l[0]
+    assert "US$500 (US$15) · US$1,000 · US$100 · compras 9:30–15:30 ET" in l[1], l[1]   # más holgado: rigen los propios
+
+
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -576,5 +933,12 @@ if __name__ == "__main__":
     test_cierre_1555_y_cerrar()
     test_rechazos()
     test_red_y_reinicio()
+    test_reconexion_tras_reinicio_del_gateway()
+    test_el_corte_de_conexion_no_mata_el_bucle()
+    test_el_error_real_de_ib_async()
+    test_una_sola_copia()
+    test_windows_bloquea_archivos()
+    test_riesgo_por_operacion()
+    test_anota_limites()
     test_hora_et()
     print("OK · ejecutor paper")

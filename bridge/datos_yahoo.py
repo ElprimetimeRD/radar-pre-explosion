@@ -23,6 +23,8 @@ log = logging.getLogger("ejecutor.datos")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
 OPEN_M, CLOSE_M = 9 * 60 + 30, 16 * 60
+INTERVALO_MIN, INTERVALO_MAX = 60, 240   # s entre barridos: sube si Yahoo limita las peticiones (429) y baja al normalizarse
+LIMPIOS_PARA_BAJAR = 8                   # barridos seguidos sin 429 para volver a leer más seguido
 
 
 class SinDatos(Exception):
@@ -122,6 +124,9 @@ class Feed:
         self.n_ok = self.n_total = 0
         self.error: str | None = None
         self.pausa_hasta = 0.0
+        self.intervalo = INTERVALO_MIN          # s entre barridos (se duplica si Yahoo responde 429, hasta INTERVALO_MAX)
+        self.limpios = 0                        # barridos seguidos sin 429
+        self.limitado = False                   # hubo un 429 en el barrido en curso
         self._hilo: threading.Thread | None = None
         self.lock = threading.Lock()
 
@@ -133,12 +138,15 @@ class Feed:
     def _pedir(self, t: str, rango: str, intervalo: str) -> dict:
         ultimo = None
         for k in range(2):                       # un reintento por el otro servidor de Yahoo
+            if self.reloj() < self.pausa_hasta:  # Yahoo acaba de decir 429: no se sigue insistiendo (empeora el castigo)
+                raise SinDatos("HTTP 429 (en pausa)")
             try:
                 return self.fetch(self._url(t, rango, intervalo, k))
             except SinDatos as e:
                 ultimo = e
                 if "429" in str(e):
-                    self.pausa_hasta = self.reloj() + 60
+                    self.limitado = True
+                    self.pausa_hasta = self.reloj() + max(60, self.intervalo)
                     break
         raise ultimo or SinDatos("sin respuesta")
 
@@ -163,8 +171,10 @@ class Feed:
         hoy = hoy or self.et(ahora).date().isoformat()
         lista = self.simbolos + [self.spy]
         ok, err = 0, None
+        self.limitado = False
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
             res = list(ex.map(lambda s: self._uno(s, ahora, hoy), lista))
+        self._ajustar_ritmo()
         with self.lock:
             for t, datos, extra in res:
                 if datos is None:
@@ -183,11 +193,30 @@ class Feed:
             self.error = err if ok < len(lista) else None
         return ok
 
+    def _ajustar_ritmo(self):
+        """Si Yahoo limitó las peticiones (429), lee más despacio (se duplica el intervalo, hasta 4 min) en vez de seguir
+        chocando; tras LIMPIOS_PARA_BAJAR barridos sin límite vuelve a acercarse al ritmo normal (cada minuto)."""
+        if self.limitado:
+            nuevo = min(INTERVALO_MAX, self.intervalo * 2)
+            log.warning("Yahoo limitó las lecturas (429): %s", f"paso de leer cada {self.intervalo} s a cada {nuevo} s."
+                        if nuevo != self.intervalo else f"sigo leyendo cada {nuevo} s (el máximo).")
+            self.intervalo, self.limpios = nuevo, 0
+            self.pausa_hasta = self.reloj() + self.intervalo
+            return
+        self.limpios += 1
+        if self.intervalo > INTERVALO_MIN and self.limpios >= LIMPIOS_PARA_BAJAR:
+            self.intervalo, self.limpios = max(INTERVALO_MIN, self.intervalo // 2), 0
+            log.info("Yahoo responde bien otra vez: leo cada %d s.", self.intervalo)
+
+    def espera_barrido(self) -> float:
+        """Segundos hasta el próximo barrido: a los 6 s de cada minuto o, si Yahoo limitó, cada `intervalo` s."""
+        return max(5.0, self.intervalo - (self.reloj() % 60) + 6)
+
     # ---------------- uso ----------------
     def ok(self, now: float | None = None) -> bool:
         """Datos recientes de casi todas las acciones (si no, el ejecutor no pone órdenes nuevas)."""
         now = now or self.reloj()
-        return now - self.ult_barrido <= 150 and self.n_ok >= max(3, int(0.6 * self.n_total))
+        return now - self.ult_barrido <= self.intervalo + 90 and self.n_ok >= max(3, int(0.6 * self.n_total))
 
     def snapshot(self, hoy: str | None = None) -> tuple[dict, dict]:
         """({t: datos para la estrategia}, datos de SPY). Copia: el hilo puede estar actualizando. Solo acciones con sus
@@ -211,7 +240,8 @@ class Feed:
     def estado(self, now: float | None = None) -> dict:
         now = now or self.reloj()
         return {"feed_ok": self.ok(now), "feed_n": self.n_ok, "feed_de": self.n_total,
-                "feed_edad_s": round(now - self.ult_barrido) if self.ult_barrido else None, "feed_error": self.error}
+                "feed_edad_s": round(now - self.ult_barrido) if self.ult_barrido else None, "feed_error": self.error,
+                "feed_intervalo_s": self.intervalo}
 
     # ---------------- hilo ----------------
     def start(self):
@@ -229,7 +259,7 @@ class Feed:
                     self.barrido()
                 except Exception:  # noqa: BLE001 (el hilo no debe morir)
                     log.exception("Error leyendo datos de Yahoo")
-                espera = 60 - (self.reloj() % 60) + 6   # la próxima a los 6 s de cada minuto
+                espera = self.espera_barrido()          # la próxima a los 6 s de cada minuto (más espaciada si Yahoo limitó)
             else:
                 espera = 30
             time.sleep(max(5, espera))
