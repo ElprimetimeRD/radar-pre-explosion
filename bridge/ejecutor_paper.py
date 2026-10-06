@@ -8,7 +8,7 @@ todas, en modo automático). Las pone en IBKR como una orden con dos hijas (brac
   - compra: Stop Limit (aviso ARMA: compra sola al romper) o Limit (COMPRA y ⚡), válida hasta la hora del aviso (GTD,
     nunca después de la hora en que se cierran las compras: 15:30 ET, o antes si el semáforo la acorta);
   - Trailing: stop que sube con el precio a la distancia del stop del plan y nunca baja;
-  - objetivo: venta límite +5 %. Si se ejecuta una hija, IBKR cancela la otra.
+  - objetivo: venta límite en el objetivo del plan (+5 %; más si el stop es ancho). Si se ejecuta una hija, IBKR cancela la otra.
 Y le devuelve al semáforo lo que pasa (puesta, comprada, vendida, rechazada) para que te llegue por Telegram.
 
 Seguridad, en cada vuelta:
@@ -16,12 +16,13 @@ Seguridad, en cada vuelta:
   - si hay acciones compradas sin un stop vivo que las cubra, lo confirma con IBKR y, si de verdad falta, las vende;
   - si alguna vez vendiera de más (quedaría en corto), recompra la diferencia y avisa;
   - los manejadores de eventos de IBKR solo anotan: todo lo que toca IBKR se hace aquí, en el ciclo.
-Límites propios (si el semáforo manda límites más estrictos, usa esos): US$500 por operación · US$1,000 comprometidos
-(posiciones + compras puestas) · no pone una orden si la pérdida del día más lo que podría perder lo abierto pasaría de
-US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–15:30 ET (la última COMPRA que emite el semáforo;
-si el semáforo cierra las compras antes —ENTRY_END_M en Render— toma esa hora) · una orden viva por acción ·
-20 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes ni posiciones que no haya
-puesto él: las reconoce por su referencia "sem-<id>-<rol>".
+Límites propios (si el semáforo manda límites más estrictos, usa esos): US$500 por operación y no más de US$15 que se
+pierdan si salta el stop (el semáforo manda US$6: con un stop ancho compra menos acciones; más volatilidad no es más
+dinero) · US$1,000 comprometidos (posiciones + compras puestas) · no pone una orden si la pérdida del día más lo que
+podría perder lo abierto pasaría de US$100, y al perder US$100 se detiene el resto del día · compras solo 9:30–15:30 ET
+(la última COMPRA que emite el semáforo; si el semáforo cierra las compras antes —ENTRY_END_M en Render— toma esa hora) ·
+una orden viva por acción · 20 órdenes por día · a las 15:55 ET cancela lo suyo y vende lo que compró. Nunca toca órdenes
+ni posiciones que no haya puesto él: las reconoce por su referencia "sem-<id>-<rol>".
 
 Uso (Windows): doble clic en ARRANCAR_PAPER.bat (abre IB Gateway paper y este ejecutor; lo que ya esté abierto lo deja
 como está). Usa la misma clave del puente (puente.env). Ctrl+C para salir. Registro: ejecutor.log; cada operación cerrada
@@ -56,7 +57,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.6"
+VERSION = "1.7"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -65,6 +66,7 @@ STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
 PUERTO = 4002            # IB Gateway en modo PAPER (la cuenta real usa 4001: este programa nunca se conecta ahí)
 CLIENT_ID = 41           # distinto del puente de datos (17) y de las pruebas (31, 32)
 ORDEN_USD = 500.0
+RIESGO_USD = 15.0        # v1.7: lo máximo que se pierde por operación si salta el stop (acciones × distancia del stop)
 MAX_ABIERTO = 1000.0
 PERDIDA_MAX = 100.0
 ENTRADA_INI_M = 9 * 60 + 30
@@ -171,6 +173,7 @@ class Ejecutor:
     NOMBRE = "semáforo"
     DIARIO = "diario_sem.csv"
     ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX = ORDEN_USD, MAX_ABIERTO, PERDIDA_MAX
+    RIESGO_USD = RIESGO_USD
     ENTRADA_INI_M, ENTRADA_FIN_M, CIERRE_M = ENTRADA_INI_M, ENTRADA_FIN_M, CIERRE_M
     MAX_ORDENES_DIA = MAX_ORDENES_DIA
 
@@ -374,6 +377,25 @@ class Ejecutor:
         v = fnum(self.lim.get(k))
         return min(propio, v) if v and v > 0 else propio
 
+    def anotar_limites(self):
+        """Deja en el registro qué límites manda el semáforo y cuáles quedan vigentes aquí (el más estricto de los dos).
+        Solo cuando cambian: así se ve en ejecutor.log, sin mirar Telegram, con qué horario y topes está operando."""
+        lim = self.lim
+        if not lim:
+            return
+
+        def usd(k, propio):
+            v = fnum(lim.get(k))
+            return (f"US${v:,.0f}" if v is not None else "sin tope"), f"US${self.tope(k, propio):,.0f}"
+        (o, ov), (r, rv), (a, av), (p, pv) = (usd("orden_usd", self.ORDEN_USD), usd("riesgo_usd", self.RIESGO_USD),
+                                              usd("max_abierto", self.MAX_ABIERTO), usd("perdida_max", self.PERDIDA_MAX))
+        ini_s, fin_s = fnum(lim.get("entrada_ini_m")), fnum(lim.get("entrada_fin_m"))
+        ini, fin, cierre = self.horario()
+        hs = f"{hhmm(int(ini_s))}–{hhmm(int(fin_s))}" if ini_s is not None and fin_s is not None else "sin dato"
+        log.info("Límites del semáforo: %s por operación (pérdida si salta el stop %s) · %s comprometidos · pérdida máx %s "
+                 "al día · compras %s ET. Vigentes aquí (el más estricto de los dos): %s (%s) · %s · %s · compras %s–%s ET, "
+                 "cierre %s.", o, r, a, p, hs, ov, rv, av, pv, hhmm(ini), hhmm(fin), hhmm(cierre))
+
     def horario(self) -> tuple[int, int, int]:
         ini = max(self.ENTRADA_INI_M, int(fnum(self.lim.get("entrada_ini_m")) or 0))
         fin = min(self.ENTRADA_FIN_M, int(fnum(self.lim.get("entrada_fin_m")) or self.ENTRADA_FIN_M))
@@ -408,6 +430,9 @@ class Ejecutor:
         costo = qty * lim
         if costo > self.tope("orden_usd", self.ORDEN_USD) + 0.01:
             return f"US${costo:,.0f} pasa del máximo de US${self.tope('orden_usd', self.ORDEN_USD):,.0f} por operación"
+        rmax = self.tope("riesgo_usd", self.RIESGO_USD)
+        if qty * trail > rmax * 1.05 + 0.01:   # 5 %: el stop llega redondeado a centavos
+            return f"perdería US${qty * trail:,.2f} si salta el stop, más del máximo de US${rmax:,.0f} por operación"
         res = self.resumen()
         if o["t"] in res["vivas_t"]:
             return f"ya hay una orden o posición en {o['t']}"
@@ -913,7 +938,10 @@ class Ejecutor:
         if (pausa, modo) != (self.pausa, self.modo):
             self.pausa, self.modo = pausa, modo   # se guarda: si el semáforo se reinicia, lo recupera de aquí
             self.guardar()
-        self.lim = resp.get("limites") if isinstance(resp.get("limites"), dict) else {}
+        lim = resp.get("limites") if isinstance(resp.get("limites"), dict) else {}
+        if lim != self.lim:
+            self.lim = lim
+            self.anotar_limites()
         cid, hace = resp.get("cerrar_id"), fnum(resp.get("cerrar_hace_s"))
         if cid and cid != self.cerrar_visto:
             self.cerrar_visto = cid

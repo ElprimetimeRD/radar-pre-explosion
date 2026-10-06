@@ -1171,36 +1171,111 @@ def test_armed_survives_missing_data():
 
 
 def test_risk_profile():
-    """Perfil de riesgo: sin RIESGO (o RIESGO=alto) avisa antes (umbrales más bajos); RIESGO=normal vuelve a los de
-    siempre; una variable de Render con su nombre manda sobre el perfil. /health muestra el perfil activo."""
+    """Perfil de riesgo: sin RIESGO es «volatil» (todo lo de «alto» y más volatilidad); RIESGO=alto avisa antes (umbrales más
+    bajos) sin la parte volátil; RIESGO=normal vuelve a los de siempre; una variable de Render con su nombre manda sobre el
+    perfil. /health muestra el perfil activo."""
     import subprocess
     import sys
 
     def consts(**env):
-        e = {k: v for k, v in _os.environ.items() if k not in ("RIESGO", "ARM_NEAR", "RVOL15_IN_PLAY")}
+        e = {k: v for k, v in _os.environ.items() if k not in ("RIESGO", "ARM_NEAR", "RVOL15_IN_PLAY", "STOP_ATR", "RIESGO_USD")}
         e.update(env, NO_LOOP="1", NO_NOTIFY="1")
         code = "import json; from live import runner as R; print(json.dumps(R.perfil()))"
         out = subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True, check=True).stdout
         import json
         return json.loads(out.strip().splitlines()[-1])
-    alto = consts()
+    alto = consts(RIESGO="alto")
     assert alto["riesgo"] == "alto" and alto["arm_near"] == 2.5 and alto["arm_min"] == 50 and alto["rvol"] == 1.5, alto
     assert alto["rvol15"] == 3.0 and alto["fuerza_compra"] == 55 and alto["riesgo_max"] == 3.0 and alto["fast_s"] == 10
+    assert alto["ext_max"] == 5.0 and alto["ext_parabolico"] == 10.0 and alto["stop_atr"] == 0 and alto["riesgo_usd"] == 6
+    vol = consts()                                                             # sin RIESGO: volátil
+    assert vol["riesgo"] == "volatil" and vol["arm_near"] == 2.5 and vol["arm_min"] == 50 and vol["rvol"] == 1.5, vol
+    assert vol["fuerza_compra"] == 55 and vol["fast_s"] == 10                  # todo lo de «alto»...
+    assert vol["riesgo_max"] == 5.0 and vol["ext_max"] == 7.0 and vol["ext_parabolico"] == 14.0, vol   # ...y más volatilidad
+    assert vol["stop_atr"] == 0.33 and vol["riesgo_usd"] == 6                  # el dinero por operación no sube
+    assert consts(RIESGO="cualquier cosa")["riesgo"] == "alto"                 # un valor desconocido no activa el volátil
+    assert consts(STOP_ATR="0.5")["stop_atr"] == 0.5 and consts(RIESGO_USD="9")["riesgo_usd"] == 9   # variables de Render
     normal = consts(RIESGO="normal")
     assert normal["arm_near"] == 1.0 and normal["rvol"] == 2.0 and normal["rvol15"] == 0 and normal["fuerza_compra"] == 60
     assert consts(ARM_NEAR="1.5")["arm_near"] == 1.5                           # la variable de Render manda
+
+
+def _volatil(on=True):
+    """Pone en `decide` los umbrales del perfil volátil (test_risk_profile comprueba en un proceso limpio que son los del
+    perfil) y devuelve cómo dejarlos. Las demás pruebas corren con RIESGO=normal."""
+    names = ("VOLATIL", "STOP_ATR", "RISK_MAX", "EXT_MAX", "EXT_PARABOLIC", "CHG15_PARABOLIC")
+    old = {k: getattr(D, k) for k in names}
+    new = dict(VOLATIL=True, STOP_ATR=0.33, RISK_MAX=5.0, EXT_MAX=7.0, EXT_PARABOLIC=14.0, CHG15_PARABOLIC=20.0)
+    for k, v in (new if on else old).items():
+        setattr(D, k, v)
+    return lambda: [setattr(D, k, v) for k, v in old.items()]
+
+
+def test_perfil_volatil(m):
+    """Perfil volátil: más volatilidad sin tocar lo que ya había. (1) Hasta un stop de 3 % el plan es idéntico al de siempre;
+    más ancho, los objetivos crecen en la misma proporción y la relación objetivo/riesgo no baja. (2) El stop nunca queda a
+    menos de un tercio del rango diario de la acción. (3) Acepta acciones más extendidas sobre el VWAP y stops de hasta 5 %."""
+    normal_plan = D._plan(100.0, 97.1)                                   # 3.0 % de stop
+    base = D.decide("X", m, ctx(atr=12.0))
+    assert base["decision"] == "COMPRA", base
+    restore = _volatil()
+    try:
+        # (1) objetivos
+        p3 = D._plan(100.0, 97.1)
+        assert p3 == normal_plan and p3["t1"] == 102.0 and p3["t2"] == 105.0, p3
+        p2 = D._plan(100.0, 98.0)
+        assert p2["t1"] == 102.0 and p2["t2"] == 105.0, p2               # por debajo de 3 %: como siempre
+        p5 = D._plan(100.0, 95.238)                                      # 5 % de stop
+        assert p5["risk"] == 5.0 and abs(p5["t1"] - 103.3333) < 1e-3 and abs(p5["t2"] - 108.3333) < 1e-3, p5
+        assert abs(p5["rr1"] - 0.67) < 0.01 and abs(p5["rr2"] - 1.67) < 0.01, p5   # la misma relación que un stop de 3 %
+        assert normal_plan["rr1"] >= 0.66 and normal_plan["rr2"] >= 1.66
+        # (2) piso del stop según el rango diario
+        v = {"vwap": 99.5, "swing_low": 99.6}                            # estructura pegada al precio
+        assert abs(D._stop(100.0, v) - 99.3) < 1e-6                      # sin ATR: el piso de siempre (0.7 %)
+        assert abs(D._stop(100.0, v, 9.0) - 97.03) < 1e-6                # ATR 9 %: un tercio = 2.97 %
+        assert abs(D._stop(100.0, v, 1.0) - 99.3) < 1e-6                 # ATR bajo: no lo acerca más que 0.7 %
+        assert D._stop(100.0, {"vwap": 95.0, "swing_low": 94.0}, 9.0) < 95.0   # estructura lejana: manda la estructura
+        # el mismo cuadro con una acción que se mueve 12 % al día: stop más ancho, objetivos proporcionales
+        r = D.decide("X", m, ctx(atr=12.0))
+        assert r["decision"] == "COMPRA", r
+        pr, pb = r["plan"], base["plan"]
+        assert pr["risk"] >= 3.9 and pr["risk"] > pb["risk"] and pr["stop"] < pb["stop"], (pr, pb)
+        k = pr["risk"] / 3.0
+        assert abs(pr["t2"] / pr["entry"] - 1 - 0.05 * k) < 1e-3 and pr["rr2"] >= 1.66 and pr["rr1"] >= 0.66, pr
+        # (3) más extendida y stops de hasta 5 %
+        e6 = D.decide("X", {**m, "ext": 6.0}, ctx())
+        assert e6["decision"] == "COMPRA", e6                           # +6 % sobre el VWAP: normal/alto esperan el retroceso
+        assert "extendido" in D.decide("X", {**m, "ext": 8.0}, ctx())["reason"]
+        assert D.decide("X", {**m, "ext": 12.0}, ctx())["decision"] != "NO"           # +12 %: ya no es parabólico (14)
+        assert D.decide("X", {**m, "ext": 15.0}, ctx())["decision"] == "NO"           # +15 %: parabólico
+        assert D.decide("X", {**m, "chg15": 18.0}, ctx())["decision"] != "NO"         # +18 % en 15 min: bajo 20
+        assert D.decide("X", {**m, "chg15": 21.0}, ctx())["decision"] == "NO"
+        lejos = D.decide("X", m, ctx(atr=20.0))                                        # un tercio de 20 % = 6.6 %: pasa de 5 %
+        assert lejos["decision"] == "ESPERA" and "stop lejos" in lejos["reason"], lejos
+    finally:
+        restore()
+    # con los umbrales de siempre ese mismo cuadro sigue igual
+    assert D.decide("X", {**m, "ext": 6.0}, ctx())["decision"] == "ESPERA"
+    assert D.decide("X", {**m, "ext": 12.0}, ctx())["decision"] == "NO"
+    assert D._plan(100.0, 95.238)["t2"] == 105.0 and D._stop(100.0, {"vwap": 99.5, "swing_low": 99.6}, 9.0) < 99.31
 
 
 def test_orden_ibkr():
     """Línea de orden para IBKR: ARMA = Stop Limit puesto antes de la ruptura; COMPRA y ⚡ = Limit. Trailing a la
     distancia del stop del plan, objetivo +5 % y riesgo en dólares; nada si el presupuesto no alcanza."""
     arma = runner.orden_ibkr(10.0, 9.7, 10.5, 10.03, gatillo=10.0, usd=500)
-    assert arma == "\n📲 IBKR 49 acc · Stop Limit 10.00 / 10.03 + Trailing 0.30 (3.0%) + objetivo 10.50 · riesgo ~$15", arma
+    # stop de 3 %: no se compran los 49 que caben en US$500 sino los 20 que pierden US$6 si salta el stop
+    assert arma == "\n📲 IBKR 20 acc · Stop Limit 10.00 / 10.03 + Trailing 0.30 (3.0%) + objetivo 10.50 · riesgo ~$6", arma
+    assert "49 acc" in runner.orden_ibkr(10.0, 9.7, 10.5, 10.03, gatillo=10.0, usd=500, riesgo_usd=15)   # con el tope de antes
     compra = runner.orden_ibkr(10.412, 10.3391, 10.9326, 10.412, usd=500)
     assert compra == "\n📲 IBKR 48 acc · Limit 10.41 + Trailing 0.07 (0.7%) + objetivo 10.93 · riesgo ~$3", compra
     assert "objetivo 21.00" in runner.orden_ibkr(20.0, 19.5, None, 20.06, usd=500)     # sin t2: +5 %
     assert runner.orden_ibkr(600.0, 590.0, 630.0, 601.8, usd=500) == ""              # no alcanza para 1 acción
     assert runner.orden_ibkr(10.0, 10.0, 10.5, 10.03, usd=500) == ""                 # stop inválido
+    ancho = runner.orden_ibkr(50.0, 47.5, 54.17, 50.15, gatillo=50.0, usd=500)         # stop de 5 %: 2 acciones, US$5 de riesgo
+    assert ancho.startswith("\n📲 IBKR 2 acc") and "Trailing 2.50 (5.0%)" in ancho and ancho.endswith("riesgo ~$5"), ancho
+    assert runner.orden_ibkr(100.0, 90.0, 110.0, 100.3, gatillo=100.0, usd=500) == ""  # US$6 no alcanzan ni para 1 acción
+    assert runner.pct_obj(102.0, 100.0) == "+2" and runner.pct_obj(105.0, 100.0) == "+5" and runner.pct_obj(108.33, 100.0) == "+8.3"
     # el aviso ⚡ de ruptura trae la orden límite para quien no dejó puesta la del ARMA
     now = DAY.replace(hour=10, minute=0)
     r = runner.Radar(notify=False)
@@ -1254,6 +1329,7 @@ if __name__ == "__main__":
     test_background_needs_sec_before_buy()
     test_armed_survives_missing_data()
     test_risk_profile()
+    test_perfil_volatil(m)
     test_orden_ibkr()
     snap = test_cycle()
     print("OK · ejemplo:", {k: snap["rows"][0][k] for k in ("t", "decision", "score", "reason", "why", "plan")})

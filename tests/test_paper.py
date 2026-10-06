@@ -40,10 +40,11 @@ def test_sin_ejecutor_no_hay_boton():
     assert arma(p) is None                                              # el ejecutor nunca habló
     p.sync(OK, [])
     o = arma(p)
-    assert o["boton"] and o["qty"] == 49 and o["tipo"] == "stp" and o["gatillo"] == 10.0 and o["limite"] == 10.03, o
+    # stop de 3 %: manda el riesgo (US$6 / 0.30 = 20 acciones, US$200 de posición), no los US$500 de posición (49 acciones)
+    assert o["boton"] and o["qty"] == 20 and o["tipo"] == "stp" and o["gatillo"] == 10.0 and o["limite"] == 10.03, o
     assert o["trail"] == 0.3 and o["objetivo"] == 10.5, o
     kb = P.boton(o)
-    assert kb["inline_keyboard"][0][0]["callback_data"] == f"x:{o['id']}" and "49 acc" in kb["inline_keyboard"][0][0]["text"]
+    assert kb["inline_keyboard"][0][0]["callback_data"] == f"x:{o['id']}" and "20 acc" in kb["inline_keyboard"][0][0]["text"]
     c.t += 30                                                            # 30 s sin noticias del ejecutor
     assert arma(p, "XYZ") is None
     c.t = T0
@@ -54,6 +55,13 @@ def test_sin_ejecutor_no_hay_boton():
     p.sync(OK, [])
     assert p.ofrecer("arma", "BIG", 600, 590, 630, 601.8, gatillo=600) is None   # US$500 no alcanza para 1 acción
     assert p.ofrecer("arma", "BAD", 10, 10, 10.5, 10.03, gatillo=10) is None      # stop inválido
+    # el tamaño es el menor entre lo que cabe en US$500 y lo que se pierde (US$6) si salta el stop: más volatilidad = menos acciones
+    assert arma(p, "LOW", risk=0.01)["qty"] == 49                        # stop corto: manda el presupuesto (49 × 0.10 = US$4.9)
+    assert arma(p, "WID", risk=0.05)["qty"] == 12                        # stop ancho: manda el riesgo (12 × 0.50 = US$6)
+    assert p.ofrecer("arma", "FAR", 100, 90, 110, 100.3, gatillo=100) is None    # con ese stop US$6 no alcanzan ni para 1 acción
+    assert P.qty_por_riesgo(500, 10.03, 0.30) == 20 and P.qty_por_riesgo(500, 10.03, 0.30, riesgo_usd=15) == 49
+    assert P.qty_por_riesgo(500, 10.03, 0.30, riesgo_usd=0) == 49 and P.qty_por_riesgo(500, 0, 0.3) == 0   # sin tope: solo el presupuesto
+    assert P.qty_por_riesgo(600, 10.0, 0.3) == 20 and P.qty_por_riesgo(5, 10.0, 0.3) == 0                  # (6 / 0.3 = 20 exactos)
 
 
 def test_flujo_boton():
@@ -61,23 +69,24 @@ def test_flujo_boton():
     p.sync(OK, [])
     o = arma(p)
     ok, txt = p.pedir(o["id"])
-    assert ok and "ABC 49 acc" in txt, txt
+    assert ok and "ABC 20 acc" in txt, txt
     ok, txt = p.pedir(o["id"])
     assert not ok and "camino" in txt                                    # doble toque: una sola orden
     r = p.sync(OK, [])
     assert [x["id"] for x in r["ordenes"]] == [o["id"]] and r["ordenes"][0]["gatillo"] == 10.0, r
     assert r["limites"]["orden_usd"] == 500 and r["limites"]["max_abierto"] == 1000 and r["cerrar_id"] is None
+    assert r["limites"]["riesgo_usd"] == 6 and P.RIESGO_USD == 6
     assert len(p.sync(OK, [])["ordenes"]) == 1                           # se repite hasta que el ejecutor avise
     r = p.sync(OK, [{"id": o["id"], "ev": "puesta", "t": "ABC"}])
     assert r["ordenes"] == [] and p.ofertas[o["id"]]["estado"] == "puesta"
     (k, m), = p.tomar_msgs()
     assert k == f"paper:{o['id']}:puesta" and m.startswith("🟦") and "compra stop 10.00 (límite 10.03)" in m, m
-    p.sync({**OK, "comprometido": 491.5}, [{"id": o["id"], "ev": "llena", "px": 10.02, "qty": 49}])
-    p.sync(OK, [{"id": o["id"], "ev": "salida", "px": 10.45, "qty": 49, "por": "trailing", "pnl": 21.07,
+    p.sync({**OK, "comprometido": 200.4}, [{"id": o["id"], "ev": "llena", "px": 10.02, "qty": 20}])
+    p.sync(OK, [{"id": o["id"], "ev": "salida", "px": 10.45, "qty": 20, "por": "trailing", "pnl": 8.6,
                  "px_e": 10.02}])
     m = [x[1] for x in p.tomar_msgs()]
-    assert "compré 49 ABC a 10.02" in m[0], m
-    assert m[1].startswith("✅") and "stop que sube" in m[1] and "+4.3%" in m[1] and "+21.07 US$" in m[1], m
+    assert "compré 20 ABC a 10.02" in m[0], m
+    assert m[1].startswith("✅") and "stop que sube" in m[1] and "+4.3%" in m[1] and "+8.60 US$" in m[1], m
     assert p.ofertas[o["id"]]["estado"] == "cerrada"
     p.sync(OK, [{"id": o["id"], "ev": "ack", "estado": "puesta"}])       # un ack viejo no retrocede el estado
     assert p.ofertas[o["id"]]["estado"] == "cerrada"
@@ -86,18 +95,18 @@ def test_flujo_boton():
 def test_limites():
     p, c = nuevo()
     p.sync(OK, [])
-    a, b, d = arma(p, "AAA", 10.0), arma(p, "BBB", 20.0), arma(p, "DDD", 30.0)
-    assert p.pedir(a["id"])[0] and p.pedir(b["id"])[0]                  # US$491 + US$481
+    a, b, d = arma(p, "AAA", 10.0, risk=0.01), arma(p, "BBB", 20.0, risk=0.01), arma(p, "DDD", 30.0, risk=0.01)
+    assert p.pedir(a["id"])[0] and p.pedir(b["id"])[0]                  # US$491 + US$481 (stop corto: manda el presupuesto)
     ok, txt = p.pedir(d["id"])
     assert not ok and "1,000 comprometidos" in txt, txt                  # la tercera pasaría de US$1,000
     a2 = p.ofrecer("compra", "AAA", 10.1, 9.8, 10.6, 10.13)
     assert a2["estado"] == "omitida" and "ya hay una orden" in a2["nota"] and not a2.get("boton")  # una por acción
     p.sync({**OK, "comprometido": 900}, [])                              # lo que el ejecutor ya tiene puesto cuenta
     p2, c2 = nuevo()
-    p2.sync({**OK, "perdida_dia": 90}, [])
+    p2.sync({**OK, "perdida_dia": 96}, [])
     o = arma(p2, "EEE")
     ok, txt = p2.pedir(o["id"])
-    assert not ok and "pérdida máxima" in txt, txt                       # 90 perdidos + 14.7 de riesgo > 100
+    assert not ok and "pérdida máxima" in txt, txt                       # 96 perdidos + 6 de riesgo (20 × 0.30) > 100
     p2.sync({**OK, "parado": True}, [])
     ok, txt = p2.pedir(o["id"])
     assert not ok and "máximo del día" in txt, txt

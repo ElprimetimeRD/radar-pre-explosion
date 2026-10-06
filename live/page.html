@@ -76,13 +76,14 @@ const pc=x=>x==null?'—':`<span class="${x>=0?'up':'down'}">${x>=0?'+':''}${x.t
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const LBL={COMPRA:'COMPRA',ESPERA:'ESPERA',NO:'NO COMPRES'};
 const PH={pre:'Pre-market',open:'Sesión',late:'Última media hora',closed:'Cerrado'};
-function plan(p){if(!p)return'';return`<div class="plan"><div><span>${p.limit?'Límite ('+(p.valid_min||10)+' min)':'Entrada ≤'}</span><b>${f2(p.limit?p.entry:p.entry*1.003)}</b></div><div><span>Stop (−${f2(p.risk)}%)</span><b>${f2(p.stop)}</b></div><div><span>+2 %</span><b>${f2(p.t1)}</b></div><div><span>+5 %</span><b>${f2(p.t2)}</b></div></div>`}
+function pc(a,e){const v=100*(a/e-1);return Math.abs(v-Math.round(v))<.05?Math.round(v):v.toFixed(1)}
+function plan(p){if(!p)return'';return`<div class="plan"><div><span>${p.limit?'Límite ('+(p.valid_min||10)+' min)':'Entrada ≤'}</span><b>${f2(p.limit?p.entry:p.entry*1.003)}</b></div><div><span>Stop (−${f2(p.risk)}%)</span><b>${f2(p.stop)}</b></div><div><span>+${pc(p.t1,p.entry)} %</span><b>${f2(p.t1)}</b></div><div><span>+${pc(p.t2,p.entry)} %</span><b>${f2(p.t2)}</b></div></div>`}
 function meta(r){const w=r.whale||{};const b=[];
  if(r.rvol!=null)b.push(`RVOL ${r.rvol.toFixed(1)}×`);if(r.ext!=null)b.push(`VWAP ${r.ext>=0?'+':''}${r.ext.toFixed(1)}%`);
  if(r.atr!=null)b.push(`rango diario ${r.atr.toFixed(1)}%`);if(r.spread!=null)b.push(`spread ${r.spread.toFixed(2)}%`);
  if(w.buy||w.sell)b.push(`ballenas ${w.buy||0}↑ ${w.sell||0}↓`);return b.map(x=>`<span>${x}</span>`).join('')}
 function card(r){const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
- const ifb=r.decision==='ESPERA'&&r.plan?`<div class="trig">Si rompe: compra stop ${p2(r.plan.entry)} · stop ${p2(r.plan.stop)} (−${f2(r.plan.risk)}%) · +2 % ${p2(r.plan.t1)}</div>`:'';
+ const ifb=r.decision==='ESPERA'&&r.plan?`<div class="trig">Si rompe: compra stop ${p2(r.plan.entry)} · stop ${p2(r.plan.stop)} (−${f2(r.plan.risk)}%) · +${pc(r.plan.t1,r.plan.entry)} % ${p2(r.plan.t1)}</div>`:'';
  return`<div class="row"><div class="top"><span class="dec ${r.decision}">${LBL[r.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(r.t)}" target="_blank" rel="noopener">${esc(r.t)}</a><span>${f2(r.px)} ${pc(r.chg)}</span><span class="name">${esc(r.name||'')}</span>${arm(r)}<span class="sc">fuerza ${r.score}</span></div>
  <div class="reason">${esc(r.reason)}${r.why&&r.why.length?` · <small>${esc(r.why.join(' · '))}</small>`:''}</div>
  ${r.trigger?`<div class="trig">➜ ${esc(r.trigger)}</div>`:''}${ifb}${cat}${r.decision==='COMPRA'?plan(r.plan):''}<div class="meta">${meta(r)}</div></div>`}

@@ -840,6 +840,72 @@ def test_windows_bloquea_archivos():
         E.__dict__.pop("open", None)
 
 
+def test_riesgo_por_operacion():
+    """Tope de lo que se pierde si salta el stop (acciones × distancia del stop): propio US$15; el semáforo lo baja a US$6 y
+    nunca lo sube. Más volatilidad (un stop más ancho) no puede ser más dinero en riesgo."""
+    assert E.RIESGO_USD == 15 and E.Ejecutor.RIESGO_USD == 15
+    ex, ib, clock, posted, resp = nuevo()
+    resp["r"] = {"ordenes": [orden("00000001", "AAA"),                              # 49 × 0.30 = US$14.70: pasa
+                             orden("00000002", "BBB", trail=0.5)]}                  # 49 × 0.50 = US$24.50: más de US$15
+    ex.paso()
+    vuelta(ex, clock, resp)
+    rech = {e["id"]: e["motivo"] for e in evs(posted, "rechazada")}
+    assert "00000001" not in rech and "stop" in rech["00000002"] and "US$24.50" in rech["00000002"] \
+        and "US$15 por operación" in rech["00000002"], rech
+    assert {p[1].orderRef[4:12] for p in ib.placed} == {"00000001"}
+    ex2, ib2, c2, p2, r2 = nuevo()                                                   # el semáforo manda US$6
+    r2["r"] = {"limites": {"riesgo_usd": 6},
+               "ordenes": [orden("00000003", "CCC"),                                 # 49 × 0.30 = 14.70: ya no
+                           orden("00000004", "DDD", qty=20),                         # 20 × 0.30 = 6.00: justo
+                           orden("00000005", "EEE", px=50.0, trail=3.0, qty=2)]}     # 2 × 3.00 = 6.00 (un stop de 6 %)
+    ex2.paso()
+    vuelta(ex2, c2, r2)
+    rech = {e["id"]: e["motivo"] for e in evs(p2, "rechazada")}
+    assert list(rech) == ["00000003"] and "US$14.70" in rech["00000003"] and "US$6 por operación" in rech["00000003"], rech
+    assert {p[1].orderRef[4:12] for p in ib2.placed} == {"00000004", "00000005"}
+    ex3, ib3, c3, p3, r3 = nuevo()                                                   # nunca lo sube
+    r3["r"] = {"limites": {"riesgo_usd": 500}, "ordenes": [orden("00000006", "FFF", trail=0.5)]}
+    ex3.paso()
+    vuelta(ex3, c3, r3)
+    assert ib3.placed == [] and "por operación" in evs(p3, "rechazada")[0]["motivo"]
+    ex4, ib4, c4, p4, r4 = nuevo()                                                   # el stop llega redondeado a centavos: 5 % de margen
+    r4["r"] = {"ordenes": [orden("00000007", "GGG", px=5.0, qty=99, trail=0.15)]}    # 99 × 0.15 = 14.85
+    ex4.paso()
+    assert len(ib4.placed) == 3 and not evs(p4, "rechazada")
+
+
+def test_anota_limites():
+    """Los límites que manda el semáforo y los que quedan vigentes quedan en el registro (solo cuando cambian)."""
+    import logging
+    ex, ib, clock, posted, resp = nuevo()
+    lineas = []
+
+    class H(logging.Handler):
+        def emit(self, record):
+            lineas.append(record.getMessage())
+    h, nivel = H(), E.log.level
+    E.log.addHandler(h)
+    E.log.setLevel(logging.INFO)
+    try:
+        estrictos = {"orden_usd": 300, "riesgo_usd": 6, "max_abierto": 800, "perdida_max": 80, "entrada_ini_m": 570,
+                     "entrada_fin_m": 720, "cierre_m": 955}
+        resp["r"] = {"limites": estrictos}
+        ex.paso()
+        vuelta(ex, clock, resp, r={"limites": dict(estrictos)})           # lo mismo otra vez: no se repite
+        vuelta(ex, clock, resp, r={"limites": {"orden_usd": 5000, "riesgo_usd": 99, "max_abierto": 99999,
+                                               "perdida_max": 9999, "entrada_ini_m": 570, "entrada_fin_m": 930,
+                                               "cierre_m": 955}})
+        vuelta(ex, clock, resp, r={})                                     # sin límites: no inventa ninguna línea
+    finally:
+        E.log.removeHandler(h)
+        E.log.setLevel(nivel)
+    l = [x for x in lineas if x.startswith("Límites del semáforo")]
+    assert len(l) == 2, lineas
+    assert "US$300 por operación (pérdida si salta el stop US$6)" in l[0] and "compras 9:30–12:00 ET" in l[0], l[0]
+    assert "(el más estricto de los dos): US$300 (US$6) · US$800 · US$80 · compras 9:30–12:00 ET, cierre 15:55" in l[0], l[0]
+    assert "US$500 (US$15) · US$1,000 · US$100 · compras 9:30–15:30 ET" in l[1], l[1]   # más holgado: rigen los propios
+
+
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -872,5 +938,7 @@ if __name__ == "__main__":
     test_el_error_real_de_ib_async()
     test_una_sola_copia()
     test_windows_bloquea_archivos()
+    test_riesgo_por_operacion()
+    test_anota_limites()
     test_hora_et()
     print("OK · ejecutor paper")
