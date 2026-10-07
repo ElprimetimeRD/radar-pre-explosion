@@ -41,6 +41,20 @@ call :log "Ejecutores cerrados para volver a abrirlos"
 ping -n 4 127.0.0.1 >nul
 :sin_reinicio
 
+rem Primera pasada del dia (8:30 a 9:20 ET): reinicio en frio del Gateway paper, para no pasar la sesion con un Gateway que
+rem quedo pegado tras el corte nocturno de IBKR (gateway_diario.ps1 decide; si el Gateway esta cerrado no hace nada).
+if not exist "%AQUI%reiniciar_gateway.flag" powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%gateway_diario.ps1" >nul 2>&1
+if not exist "%AQUI%reiniciar_gateway.flag" if "%errorlevel%"=="1" >"%AQUI%reiniciar_gateway.flag" echo diario
+
+rem Reinicio del IB Gateway PAPER pedido a distancia (reiniciar_gateway.flag): lo cierra (solo el del puerto 4002) y borra su
+rem ficha de reinicio para que vuelva a entrar con la clave del .ini; el paso 1) lo abre de nuevo en esta misma pasada.
+rem Para cuando se queda pegado tras el corte nocturno de IBKR ("Unrecognized Username or Password" a las 00:17, 5 y 6-oct).
+if not exist "%AQUI%reiniciar_gateway.flag" goto sin_gw_reinicio
+del "%AQUI%reiniciar_gateway.flag" >nul 2>&1
+call :log "Reinicio del Gateway paper pedido (reiniciar_gateway.flag)"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%reiniciar_gateway_paper.ps1" >>"%LOG%" 2>&1
+:sin_gw_reinicio
+
 if not exist "%D%" mkdir "%D%"
 if exist "%INI%" goto ini_ok
 if defined SILENCIO (
@@ -117,11 +131,21 @@ start "%~2" /min "%PUENTE%\ejecutor.bat" %~1
 call :log "Ejecutor %~1 lanzado"
 if not defined SILENCIO echo Ejecutor %~1 abierto.
 exit /b 0
+:ej_mudo
+call :log "Ejecutor %~1: abierto pero el semaforo no lo ve hablar hace mas de 4 min (colgado): lo reinicio"
+set "REINICIAR=1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%parar_ejecutores.ps1" >>"%LOG%" 2>&1
+ping -n 4 127.0.0.1 >nul
+goto ej_abrir
 :ej_visto
 call :log "Ejecutor %~1: el detector no lo ve, pero el semaforo lo ve hablando: no abro otro"
 if not defined SILENCIO echo Ejecutor %~1 ya estaba abierto ^(lo ve el semaforo^): no abro otro.
 exit /b 0
 :ej_ya
+rem Abierto segun el detector de procesos, pero si el semaforo lo lleva mas de 4 min sin ver hablar en horario de mercado,
+rem esta colgado (ejecutor_mudo.ps1): se cierran los dos y se abre este de nuevo (el otro se abre en su turno).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%AQUI%ejecutor_mudo.ps1" -Que %~1
+if "%errorlevel%"=="1" goto ej_mudo
 call :log "Ejecutor %~1 ya estaba abierto"
 if not defined SILENCIO echo Ejecutor %~1 ya estaba abierto.
 exit /b 0
