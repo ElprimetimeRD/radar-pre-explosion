@@ -27,6 +27,7 @@ from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMI
 from .decide import ALTO, RIESGO, RVOL_NEWS
 from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
 from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
+from .ordenes_tg import OrdenesTg
 from .paper import RIESGO_USD, Paper, boton, et_ts, qty_por_riesgo
 from .positions import Positions
 from .tgbot import TgIn
@@ -377,7 +378,7 @@ class Radar:
         self.positions = Positions()  # posiciones reales que Priamo registra al ejecutar (avisos de caída y objetivo)
         self.paper = Paper()          # órdenes en la cuenta paper de IBKR (botón ✅ Ejecutar / modo automático)
         self.claude = ClaudePaper(self.paper)  # el ejecutor paralelo de Claude: misma cuenta paper, otra estrategia
-        self.tgin = TgIn(self.paper, claude=self.claude)  # toques del botón y comandos que llegan por Telegram
+        self.tgin = TgIn(self.paper, claude=self.claude, ordenes=OrdenesTg(self.paper))  # toques del botón y comandos que llegan por Telegram
         self.t_arranque = time.time()
         self.sent: set[str] = set()
         self.sent_day: str | None = None  # día al que pertenecen los avisos enviados (se vacían al cambiar de día)

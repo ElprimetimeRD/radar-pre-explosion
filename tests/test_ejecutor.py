@@ -53,6 +53,7 @@ class FakeIB:
         self.errorEvent, self.disconnectedEvent = Ev(), Ev()
         self.placed, self.cancels, self.connects = [], [], []
         self._trades, self._fills, self.next_id = {}, [], 100
+        self.portfolio_items, self.portfolio_error = [], None
 
     def connect(self, host, port, clientId, timeout):
         self.connects.append((host, port, clientId))
@@ -98,6 +99,11 @@ class FakeIB:
 
     def fills(self):
         return list(self._fills)
+
+    def portfolio(self, account=""):
+        if self.portfolio_error:
+            raise self.portfolio_error
+        return list(self.portfolio_items)
 
     def sleep(self, s):
         if self.in_handler:
@@ -1003,6 +1009,49 @@ def test_penny_trailing_porcentaje():
     assert "pérdida máxima" in evs(p7, "rechazada")[-1]["motivo"] or "máximo del día" in evs(p7, "rechazada")[-1]["motivo"]
 
 
+def test_orden_manual_stop_fijo_y_cartera():
+    """v2.0 (órdenes a mano por Telegram): compra límite + stop fijo + objetivo; el estado trae puerto, órdenes vivas y precios
+    (IB.portfolio) para «ordenes» y «posiciones»; sin precio no inventa ninguno."""
+    ex, ib, clock, posted, resp = nuevo(penny=True)
+    man = {"id": "ab12cd35", "t": "XYZ", "tipo": "lmt", "gatillo": None, "limite": 10.0, "trail": 0.5, "trail_pct": None,
+           "stop": 9.5, "setup": "manual (Telegram)", "objetivo": 12.0, "qty": 100, "hasta": T0 + 3600}
+    resp["r"] = {"ordenes": [man]}
+    ex.paso()
+    (c, e), (_, t), (_, o) = ib.placed
+    assert (e.orderType, e.lmtPrice, e.totalQuantity, e.transmit) == ("LMT", 10.0, 100, False)
+    assert (t.orderType, t.auxPrice, t.parentId, t.transmit) == ("STP", 9.5, e.orderId, False)
+    assert (o.orderType, o.lmtPrice, o.parentId, o.transmit) == ("LMT", 12.0, e.orderId, True) and not t.ocaGroup
+    vuelta(ex, clock, resp)
+    (pu,) = evs(posted, "puesta")
+    assert "stop 9.50" in pu["detalle"] and "objetivo 12.00" in pu["detalle"] and "manual (Telegram)" in pu["detalle"], pu
+    est = posted[-1]["estado"]
+    assert est["puerto"] == 4002 and est["mercado"] == {} and est["version"] == E.VERSION == "2.0", est
+    (v,) = est["ordenes_vivas"]
+    assert (v["id"], v["t"], v["qty"], v["limite"], v["stop"], v["objetivo"], v["estado"]) == \
+        ("ab12cd35", "XYZ", 100, 10.0, 9.5, 12.0, "puesta"), v
+    oids = ex.ord["ab12cd35"]["oids"]
+    ib.fill(oids["e"], 100, 10.0)
+    ib.portfolio_items = [NS(contract=NS(symbol="XYZ"), marketPrice=10.4), NS(contract=NS(symbol="OTRA"), marketPrice=3.0)]
+    vuelta(ex, clock, resp)
+    vuelta(ex, clock, resp)
+    est = posted[-1]["estado"]
+    assert est["posiciones"] == [{"t": "XYZ", "qty": 100, "px": 10.0}] and est["mercado"] == {"XYZ": 10.4}, est   # solo las suyas
+    assert est["ordenes_vivas"][0]["estado"] == "llena"
+    ib.portfolio_items = [NS(contract=NS(symbol="XYZ"), marketPrice=1.8e308)]                 # IBKR sin valor: no se inventa
+    vuelta(ex, clock, resp)
+    assert posted[-1]["estado"]["mercado"] == {}
+    ib.portfolio_error = RuntimeError("sin cuenta")                                           # y si falla, el ciclo sigue
+    vuelta(ex, clock, resp)
+    assert "mercado" not in posted[-1]["estado"] and posted[-1]["estado"]["ordenes_vivas"]
+    ib.portfolio_error = None
+    ib.fill(oids["t"], 100, 9.5)                                                              # saltó el stop
+    vuelta(ex, clock, resp)
+    vuelta(ex, clock, resp)
+    (sa,) = evs(posted, "salida")
+    assert sa["por"] == "stop" and sa["pnl"] == -50.0 and sa["px_e"] == 10.0, sa
+    assert posted[-1]["estado"]["ordenes_vivas"] == []
+
+
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -1039,5 +1088,6 @@ if __name__ == "__main__":
     test_espera_ib()
     test_anota_limites()
     test_penny_trailing_porcentaje()
+    test_orden_manual_stop_fijo_y_cartera()
     test_hora_et()
     print("OK · ejecutor paper")

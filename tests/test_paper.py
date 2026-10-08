@@ -301,7 +301,7 @@ def test_eventos_y_estado():
     o = arma(p, "QQQ")
     assert o["estado"] == "omitida"                                      # la posición que informa el ejecutor cuenta
     txt = p.estado_txt()
-    assert "Ejecutor conectado (cuenta DUR233329)" in txt and "QQQ 10 @50.10" in txt and "-3.00 US$" in txt, txt
+    assert "Ejecutor conectado · PAPER · IB Gateway puerto 4002 · cuenta DUR233329" in txt and "QQQ 10 @50.10" in txt and "-3.00 US$" in txt, txt
     assert "/cerrar" in p.ayuda() and "US$500" in p.ayuda()
     st = p.status()
     assert st["ejecutor"] and st["modo"] == "boton" and "posiciones" not in st
