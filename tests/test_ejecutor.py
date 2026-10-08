@@ -874,6 +874,13 @@ def test_riesgo_por_operacion():
     assert len(ib4.placed) == 3 and not evs(p4, "rechazada")
 
 
+def test_espera_ib():
+    """v1.8: las llamadas bloqueantes a IBKR tienen tope de espera (sin él, un Gateway que no contesta cuelga al ejecutor)."""
+    ex, ib, clock, posted, resp = nuevo()
+    ex.conectar()
+    assert ib.RequestTimeout == E.ESPERA_IB_S == 20
+
+
 def test_anota_limites():
     """Los límites que manda el semáforo y los que quedan vigentes quedan en el registro (solo cuando cambian)."""
     import logging
@@ -939,6 +946,7 @@ if __name__ == "__main__":
     test_una_sola_copia()
     test_windows_bloquea_archivos()
     test_riesgo_por_operacion()
+    test_espera_ib()
     test_anota_limites()
     test_hora_et()
     print("OK · ejecutor paper")
