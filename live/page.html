@@ -111,13 +111,16 @@ function plan(p){if(!p)return'';return`<div class="plan"><div><span>${p.limit?'L
 function meta(r){const w=r.whale||{};const b=[];
  if(r.rvol!=null)b.push(`RVOL ${r.rvol.toFixed(1)}×`);if(r.ext!=null)b.push(`VWAP ${r.ext>=0?'+':''}${r.ext.toFixed(1)}%`);
  if(r.atr!=null)b.push(`rango diario ${r.atr.toFixed(1)}%`);if(r.spread!=null)b.push(`spread ${r.spread.toFixed(2)}%`);
- if(w.buy||w.sell)b.push(`ballenas ${w.buy||0}↑ ${w.sell||0}↓`);return b.map(x=>`<span>${x}</span>`).join('')}
+ if(w.buy||w.sell)b.push(`ballenas ${w.buy||0}↑ ${w.sell||0}↓`);
+ const f=r.flow;if(f){b.push(`entradas ${usd(f.in)} · salidas ${usd(f.out)} · ${xx(f.ratio)}`);
+  const g=f.large||{};if(g.buy||g.sell)b.push(`ballenas $ ${usd(g.in)}↑ ${usd(g.out)}↓`)}
+ return b.map(x=>`<span>${x}</span>`).join('')}
 function card(r){const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
  const ifb=r.decision==='ESPERA'&&r.plan?`<div class="trig">Si rompe: compra stop ${p2(r.plan.entry)} · stop ${p2(r.plan.stop)} (−${f2(r.plan.risk)}%) · +${pcs(r.plan.t1,r.plan.entry)} % ${p2(r.plan.t1)}</div>`:'';
  return`<div class="row"><div class="top"><span class="dec ${r.decision}">${LBL[r.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(r.t)}" target="_blank" rel="noopener">${esc(r.t)}</a><span>${f2(r.px)} ${pc(r.chg)}</span><span class="name">${esc(r.name||'')}</span>${arm(r)}<span class="sc">fuerza ${r.score}</span></div>
  <div class="reason">${esc(r.reason)}${r.why&&r.why.length?` · <small>${esc(r.why.join(' · '))}</small>`:''}</div>
  ${r.trigger?`<div class="trig">➜ ${esc(r.trigger)}</div>`:''}${ifb}${cat}${r.decision==='COMPRA'?plan(r.plan):''}<div class="meta">${meta(r)}</div></div>`}
-const arm=r=>((D&&(D.armed||[]).includes(r.t))?'<span class="chip">⚡ armada</span>':'')+((r.src||[]).includes('ibkr')?'<span class="chip">IBKR</span>':'');
+const arm=r=>((D&&(D.armed||[]).includes(r.t))?'<span class="chip">⚡ armada</span>':'')+((r.src||[]).includes('ibkr')?'<span class="chip">IBKR</span>':'')+(r.bio?'<span class="chip">Biotech</span>':'');
 function render(){if(!D)return;const rows=D.rows||[];
  const age=D.ts?(Date.now()-new Date(D.ts))/1000:0,liveP=['pre','open','late'].includes(D.phase);
  $('#stale').textContent=D.status==='iniciando'?'Arrancando: el primer escaneo tarda cerca de un minuto.'
