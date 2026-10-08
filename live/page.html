@@ -22,13 +22,16 @@ h1{font-size:18px;margin:4px 0}
 .big{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:6px 0}
 .big .t{font-size:30px;font-weight:700}
 .dec{font-weight:800;padding:4px 10px;border-radius:8px;font-size:14px;letter-spacing:.03em}
-.COMPRA{background:var(--go-bg);color:var(--go)}.ESPERA{background:var(--wait-bg);color:var(--wait)}.NO{background:var(--no-bg);color:var(--no)}
+.COMPRA,.VERDE{background:var(--go-bg);color:var(--go)}.ESPERA,.AMARILLO{background:var(--wait-bg);color:var(--wait)}.NO,.ROJO{background:var(--no-bg);color:var(--no)}
 .plan{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:10px}
 .plan div{background:var(--chip);border-radius:8px;padding:6px 8px}
 .plan b{display:block;font-size:15px}.plan span{font-size:11.5px;color:var(--mute)}
-.tabs{display:flex;gap:6px;margin:14px 0 8px}
-.tabs button{flex:1;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px;border-radius:10px;font:inherit;cursor:pointer}
-.tabs button.on{border-color:var(--ink);font-weight:700}
+.tabs,.gtabs{display:flex;gap:6px;margin:14px 0 8px}
+.tabs button,.gtabs button{flex:1;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px;border-radius:10px;font:inherit;cursor:pointer}
+.tabs button.on,.gtabs button.on{border-color:var(--ink);font-weight:700}
+.views{display:flex;gap:6px;margin:10px 0 0}
+.views button{flex:1;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:10px;border-radius:10px;font:inherit;cursor:pointer}
+.views button.on{border-color:var(--ink);font-weight:700}
 .row{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:8px 0}
 .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .top .t{font-weight:700;font-size:17px}.name{color:var(--mute);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
@@ -43,6 +46,13 @@ a{color:inherit}
 h2{font-size:15px;margin:18px 0 6px}
 small,.foot{color:var(--mute);font-size:12px}
 .err{color:var(--no);font-size:12.5px}
+.fbar{display:flex;height:8px;border-radius:99px;overflow:hidden;background:var(--chip);margin:8px 0 3px}
+.fbar i{display:block;height:100%}.fbar .in{background:var(--go)}.fbar .out{background:var(--no)}
+.flow{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;color:var(--mute);font-variant-numeric:tabular-nums}
+.falta{color:var(--wait);font-size:13.5px;margin-top:4px}
+.warn{background:var(--wait-bg);color:var(--wait);border-radius:10px;padding:8px 10px;font-size:12.5px;margin:8px 0}
+details{margin:6px 0}summary{cursor:pointer;color:var(--mute);font-size:12.5px}
+[hidden]{display:none!important}
 @media (max-width:420px){.plan{grid-template-columns:repeat(2,1fr)}.big .t{font-size:26px}}
 </style>
 </head>
@@ -53,6 +63,11 @@ small,.foot{color:var(--mute);font-size:12px}
   <div><span id="phase" class="chip">…</span> <span id="reg" class="chip">…</span></div>
 </header>
 <div id="stale" class="err"></div>
+<div class="views">
+  <button data-v="sem" class="on">🚦 Semáforo</button>
+  <button data-v="flu">🔥 Flujo penny <span id="nF"></span></button>
+</div>
+<section id="vsem">
 <div id="hero" class="hero"><div class="lbl">Mejor opción ahora</div><div class="big"><span class="t">Cargando…</span></div></div>
 <div class="tabs">
   <button data-f="COMPRA" class="on">Compra <span id="nC"></span></button>
@@ -65,25 +80,40 @@ small,.foot{color:var(--mute);font-size:12px}
 <div id="trades"></div>
 <h2>Acumulado</h2>
 <div id="hist" class="foot">Cargando historial…</div>
+</section>
+<section id="vflu" hidden>
+<div id="fhead"></div>
+<div class="gtabs">
+  <button data-g="VERDE" class="on">Verde <span id="fV"></span></button>
+  <button data-g="AMARILLO">Amarillo <span id="fA"></span></button>
+  <button data-g="ROJO">Rojo <span id="fR"></span></button>
+</div>
+<div id="flist"></div>
+<h2>Avisos de hoy</h2>
+<div id="fsigs"></div>
+<h2>Días anteriores</h2>
+<div id="fprev" class="foot"></div>
+<p class="foot" id="fnote"></p>
+</section>
 <p class="foot" id="foot"></p>
 <p class="foot">Datos de Yahoo con 1–2 min de retraso (las rupturas armadas, al instante cuando el puente IBKR está conectado); confirma en tu bróker antes de entrar. Stop siempre puesto. Herramienta personal, no es asesoría financiera.</p>
 </main>
 <script>
-const $=s=>document.querySelector(s);let F='COMPRA',D=null;
+const $=s=>document.querySelector(s);let F='COMPRA',D=null,V='sem',G='VERDE',gAuto=true;
 const f2=x=>x==null?'—':(x>=100?x.toFixed(1):x.toFixed(2));
 const p2=x=>x==null?'—':x.toFixed(2);  // precios de orden: siempre 2 decimales
 const pc=x=>x==null?'—':`<span class="${x>=0?'up':'down'}">${x>=0?'+':''}${x.toFixed(1)}%</span>`;
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const LBL={COMPRA:'COMPRA',ESPERA:'ESPERA',NO:'NO COMPRES'};
 const PH={pre:'Pre-market',open:'Sesión',late:'Última media hora',closed:'Cerrado'};
-function pc(a,e){const v=100*(a/e-1);return Math.abs(v-Math.round(v))<.05?Math.round(v):v.toFixed(1)}
-function plan(p){if(!p)return'';return`<div class="plan"><div><span>${p.limit?'Límite ('+(p.valid_min||10)+' min)':'Entrada ≤'}</span><b>${f2(p.limit?p.entry:p.entry*1.003)}</b></div><div><span>Stop (−${f2(p.risk)}%)</span><b>${f2(p.stop)}</b></div><div><span>+${pc(p.t1,p.entry)} %</span><b>${f2(p.t1)}</b></div><div><span>+${pc(p.t2,p.entry)} %</span><b>${f2(p.t2)}</b></div></div>`}
+function pcs(a,e){const v=100*(a/e-1);return Math.abs(v-Math.round(v))<.05?Math.round(v):v.toFixed(1)}
+function plan(p){if(!p)return'';return`<div class="plan"><div><span>${p.limit?'Límite ('+(p.valid_min||10)+' min)':'Entrada ≤'}</span><b>${f2(p.limit?p.entry:p.entry*1.003)}</b></div><div><span>Stop (−${f2(p.risk)}%)</span><b>${f2(p.stop)}</b></div><div><span>+${pcs(p.t1,p.entry)} %</span><b>${f2(p.t1)}</b></div><div><span>+${pcs(p.t2,p.entry)} %</span><b>${f2(p.t2)}</b></div></div>`}
 function meta(r){const w=r.whale||{};const b=[];
  if(r.rvol!=null)b.push(`RVOL ${r.rvol.toFixed(1)}×`);if(r.ext!=null)b.push(`VWAP ${r.ext>=0?'+':''}${r.ext.toFixed(1)}%`);
  if(r.atr!=null)b.push(`rango diario ${r.atr.toFixed(1)}%`);if(r.spread!=null)b.push(`spread ${r.spread.toFixed(2)}%`);
  if(w.buy||w.sell)b.push(`ballenas ${w.buy||0}↑ ${w.sell||0}↓`);return b.map(x=>`<span>${x}</span>`).join('')}
 function card(r){const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
- const ifb=r.decision==='ESPERA'&&r.plan?`<div class="trig">Si rompe: compra stop ${p2(r.plan.entry)} · stop ${p2(r.plan.stop)} (−${f2(r.plan.risk)}%) · +${pc(r.plan.t1,r.plan.entry)} % ${p2(r.plan.t1)}</div>`:'';
+ const ifb=r.decision==='ESPERA'&&r.plan?`<div class="trig">Si rompe: compra stop ${p2(r.plan.entry)} · stop ${p2(r.plan.stop)} (−${f2(r.plan.risk)}%) · +${pcs(r.plan.t1,r.plan.entry)} % ${p2(r.plan.t1)}</div>`:'';
  return`<div class="row"><div class="top"><span class="dec ${r.decision}">${LBL[r.decision]}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(r.t)}" target="_blank" rel="noopener">${esc(r.t)}</a><span>${f2(r.px)} ${pc(r.chg)}</span><span class="name">${esc(r.name||'')}</span>${arm(r)}<span class="sc">fuerza ${r.score}</span></div>
  <div class="reason">${esc(r.reason)}${r.why&&r.why.length?` · <small>${esc(r.why.join(' · '))}</small>`:''}</div>
  ${r.trigger?`<div class="trig">➜ ${esc(r.trigger)}</div>`:''}${ifb}${cat}${r.decision==='COMPRA'?plan(r.plan):''}<div class="meta">${meta(r)}</div></div>`}
@@ -109,8 +139,50 @@ function render(){if(!D)return;const rows=D.rows||[];
  $('#trades').innerHTML=(D.trades||[]).map(t=>row(t,'')).join('')
   +(s.lag!=null?`<div class="trig">La COMPRA llegó ${s.lag} min después de la ruptura en promedio, ${s.slip>=0?'+':''}${(s.slip??0).toFixed(2)} % sobre el nivel.</div>`:'')
   +(A.length?`<div class="trig" style="margin-top:8px"><b>Armadas</b> (compra stop en la ruptura): ${a.filled||0} de ${a.n||0} se activaron · ${a.t1||0} tocaron +2 % · ${a.stop||0} stop · ${a.cancelled||0} canceladas</div>`+A.map(t=>row(t,'⚡ ')).join(''):'');
- $('#foot').innerHTML=`${D.universe||0} acciones en seguimiento · actualizado ${D.ts?new Date(D.ts).toLocaleTimeString():'—'}${D.mem&&D.mem.pct!=null?` · memoria ${Math.round(D.mem.pct)} %`:''}${D.bridge&&D.bridge.age_s!=null?` · IBKR ${D.bridge.on?'conectado':'desconectado'}${D.bridge.error?' ('+esc(D.bridge.error)+')':''}`:''}${(D.errors||[]).length?`<div class="err">${esc(D.errors.slice(-1)[0])}</div>`:''}`}
+ $('#foot').innerHTML=`${D.universe||0} acciones en seguimiento · actualizado ${D.ts?new Date(D.ts).toLocaleTimeString():'—'}${D.mem&&D.mem.pct!=null?` · memoria ${Math.round(D.mem.pct)} %`:''}${D.bridge&&D.bridge.age_s!=null?` · IBKR ${D.bridge.on?'conectado':'desconectado'}${D.bridge.error?' ('+esc(D.bridge.error)+')':''}`:''}${(D.errors||[]).length?`<div class="err">${esc(D.errors.slice(-1)[0])}</div>`:''}`;renderFlu()}
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{F=b.dataset.f;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));render()});
+// ---- 🔥 Flujo penny: lo que manda /api/signals en `flujo` ----
+const usd=x=>x==null?'—':x>=1e6?'US$'+(x/1e6).toFixed(x>=1e7?0:1)+' M':x>=1e3?'US$'+Math.round(x/1e3)+' k':'US$'+Math.round(x);
+const xx=x=>x==null?'—':x>=50?'>50×':x.toFixed(1)+'×';
+const sg=x=>x==null?'—':(x>=0?'+':'')+x.toFixed(1)+'%';
+function fcard(r){const lg=r.large||{},tot=(r.in||0)+(r.out||0),pin=tot>0?Math.max(0,Math.min(100,Math.round(100*r.in/tot))):50;
+ const why=r.decision!=='ROJO'&&r.why&&r.why.length?`<div class="trig">A favor: ${esc(r.why.join(' · '))}</div>`:'';
+ const razon=r.decision==='AMARILLO'?`<div class="falta">Falta: ${esc((r.falta||[]).join(' · ')||r.reason)}</div>`:`<div class="reason">${esc(r.reason)}</div>`;
+ const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
+ const m=[`cierre de ayer ${p2(r.prev)}`,`entradas÷salidas ${xx(r.ratio)} · 15 min ${xx(r.ratio15)}`,`ballenas ${lg.buy||0}↑ ${lg.sell||0}↓`,
+  r.rvol!=null?`volumen ${r.rvol.toFixed(0)}× lo normal`:null,`${usd(r.usd)} negociados`,r.ext!=null?`VWAP ${sg(r.ext).replace('%',' %')}`:null,
+  r.dd!=null?`a ${r.dd.toFixed(0)} % del máximo`:null,r.vfav?`sube ${xx(r.vfav)} más de lo que baja`:null,
+  r.spread!=null?`spread ${r.spread.toFixed(2)} %`:null,r.halted?`halt ${esc(r.halted)}`:null,r.shelf?'estante S-3/F-3':null];
+ return`<div class="row"><div class="top"><span class="dec ${esc(r.decision)}">${esc(r.decision)}</span><a class="t" href="https://www.tradingview.com/chart/?symbol=${esc(r.t)}" target="_blank" rel="noopener">${esc(r.t)}</a><span>${f2(r.px)} ${pc(r.chg)}</span><span class="name">${esc(r.name||'')}</span><span class="sc">fuerza ${r.score}</span></div>
+ ${razon}${why}${cat}
+ <div class="fbar"><i class="in" style="width:${pin}%"></i><i class="out" style="width:${100-pin}%"></i></div>
+ <div class="flow"><span>Entradas ${usd(r.in)}</span><span>Salidas ${usd(r.out)}</span></div>
+ <div class="flow"><span>Ballenas ↑ ${usd(lg.in)}</span><span>↓ ${usd(lg.out)}</span></div>
+ <div class="meta">${m.filter(Boolean).map(x=>`<span>${x}</span>`).join('')}</div></div>`}
+const srow=t=>`<div class="meta"><span>🔥 <b>${esc(t.t)}</b> ${esc(t.time)}</span><span>aviso ${f2(t.px)}</span><span>máx ${pc(t.mfe)}</span><span>mín ${pc(t.mae)}</span>${t.status==='abierta'&&t.last!=null?`<span>ahora ${pc(100*(t.last/t.px-1))}</span>`:''}<span>${esc(t.status)}${t.close_pct!=null?' '+pc(t.close_pct):''}</span></div>`;
+const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+function renderFlu(){try{
+ const fl=(D&&D.flujo)||{},c=fl.counts||{},cfg=fl.cfg||{},ok=fl.status==='ok';
+ $('#nF').textContent=ok?`(${c.VERDE||0})`:'';
+ $('#fV').textContent=`(${c.VERDE||0})`;$('#fA').textContent=`(${c.AMARILLO||0})`;$('#fR').textContent=`(${c.ROJO||0})`;
+ $('#fhead').innerHTML=fl.status==='error'?`<div class="warn">El radar de flujo falló en este ciclo (${esc(fl.error||'sin detalle')}). El semáforo sigue normal.</div>`
+  :ok?`<div class="foot">Penny stocks (cierre previo ≤ US$${cfg.prior_max??5}) que suben ≥ ${cfg.chg_min??20} % hoy · ${fl.evaluadas||0} revisadas${fl.sin_datos?` · ${fl.sin_datos} sin datos`:''} · ${esc((fl.et||'').slice(0,5))} ET</div>`
+  :`<div class="foot">El radar de flujo está apagado o aún no corre (empieza con el primer escaneo).</div>`;
+ if(ok&&gAuto){gAuto=false;if(!c.VERDE&&c.AMARILLO){G='AMARILLO';document.querySelectorAll('.gtabs button').forEach(x=>x.classList.toggle('on',x.dataset.g===G))}}
+ const L=(fl.rows||[]).filter(r=>r.decision===G);
+ $('#flist').innerHTML=L.length?L.map(fcard).join(''):`<p class="foot">${!ok?'':G==='VERDE'?'Ninguna cumple todo ahora. En Amarillo ves qué le falta a cada una.':'Nada en esta lista ahora.'}</p>`;
+ const S=fl.sigs||[];$('#fsigs').innerHTML=S.length?S.map(srow).join('')+`<div class="trig">Máx y mín son contra el precio del aviso. Con esto se calibran los umbrales.</div>`:'<p class="foot">Sin avisos hoy.</p>';
+ const H=(fl.hist||[]).slice().reverse().slice(0,5);
+ $('#fprev').innerHTML=H.length?H.map(h=>{const a=h.sigs||[],w=a.filter(x=>x.close_pct!=null&&x.close_pct>0).length;
+  return`<details><summary><b>${esc(h.day)}</b> · ${a.length} aviso(s) · máx medio ${sg(avg(a.map(x=>x.mfe)))} · mín medio ${sg(avg(a.map(x=>x.mae)))} · ${w} cerraron en verde</summary>${a.map(srow).join('')}</details>`}).join('')
+  :'Sin historial todavía (se guarda al cambiar de día; un redeploy en Render lo borra).';
+ $('#fnote').innerHTML=`${ok?`Para VERDE: entradas÷salidas ≥ ${cfg.ratio}× (últimos 15 min ≥ ${cfg.ratio15}×), ballenas compradoras (vela ≥ ${cfg.large_k}× lo normal y ≥ ${usd(cfg.large_usd)}), sobre el VWAP, a ≤ ${cfg.hod} % del máximo, volumen ≥ ${cfg.rvol}× lo normal, ≥ ${usd(cfg.usd)} negociados y sin dilución en la SEC ni titulares.<br>`:''}⚠ El flujo es <b>ESTIMADO</b> con velas de 1 min de Yahoo (1–2 min de retraso): cada vela se reparte entre entradas y salidas según hacia dónde se movió el precio. No es el Large/Medium/Small de tu app: confírmalo allá. Los umbrales son una primera versión; los avisos quedan registrados con su máx/mín para ajustarlos. Solo aviso, no hay orden. Penny de alto riesgo: tamaño chico y stop puesto.`
+}catch(e){$('#fhead').innerHTML=`<div class="warn">No pude mostrar el radar de flujo: ${esc(e.message)}</div>`}}
+function setV(v){V=v;$('#vsem').hidden=v!=='sem';$('#vflu').hidden=v!=='flu';document.querySelectorAll('.views button').forEach(x=>x.classList.toggle('on',x.dataset.v===v));
+ try{history.replaceState(null,'',v==='flu'?'#flujo':location.pathname+location.search)}catch(e){}}
+document.querySelectorAll('.views button').forEach(b=>b.onclick=()=>setV(b.dataset.v));
+document.querySelectorAll('.gtabs button').forEach(b=>b.onclick=()=>{G=b.dataset.g;document.querySelectorAll('.gtabs button').forEach(x=>x.classList.toggle('on',x===b));renderFlu()});
+if(location.hash==='#flujo')setV('flu');
 async function load(){try{const r=await fetch('/api/signals',{cache:'no-store'});D=await r.json();
  if(F==='COMPRA'&&!(D.counts||{}).COMPRA&&(D.counts||{}).ESPERA){F='ESPERA';document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.f===F))}
  render()}catch(e){if(D)render();$('#foot').textContent='Sin conexión con el servidor; reintentando…'}}
