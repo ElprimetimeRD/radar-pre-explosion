@@ -27,6 +27,7 @@ from .decide import CAT_NAME, ENTRY_END_M, LAST_ENTRY_M, LIMIT_VALID_MIN as LIMI
 from .decide import ALTO, RIESGO, RVOL_NEWS
 from .decide import RVOL_IN_PLAY as D_RVOL_IN_PLAY
 from .metrics import OPEN_M, OR_MINUTES, atr_pct, baseline_curve, session_metrics, to_et
+from . import foco
 from .paper import RIESGO_USD, Paper, boton, et_ts, qty_por_riesgo
 from .positions import Positions
 from .tgbot import TgIn
@@ -640,15 +641,23 @@ class Radar:
         watch = load_watchlist()
         cand: dict[str, set] = {}
 
+        wl = set(watch)
+        bio: set = set()  # foco biotech: símbolos de la industria (se llena antes de agregar nada)
+
         def add(sym, src):
             s = str(sym or "").upper().strip()
-            if s and re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", s):
+            if s and re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", s) and foco.permitido(s, bio, wl):
                 cand.setdefault(s, set()).add(src)
 
         Q = yahoo.yf.EquityQuery
         exch = Q("is-in", ["exchange", *yahoo.US_EXCH])
         custom = Q("and", [Q("gt", ["percentchange", 3]), exch, Q("gt", ["dayvolume", 300000]), Q("gte", ["intradayprice", 1])])
         sq: dict[str, dict] = {}  # cotizaciones que ya traen las pantallas (respaldo si v7/quote falla)
+        if foco.activo():         # las pantallas de la industria, antes que cualquier otra cosa
+            bio, bio_q = self._biotech(Q, exch)
+            sq.update(bio_q)
+            for s in bio:
+                cand.setdefault(s, set()).add("biotech")
         r = yahoo.retry(lambda: yahoo.yf.screen(custom, size=150, sortField="percentchange", sortAsc=False), tries=2, what="screen subidas")
         for q in yahoo._quotes(r):
             add(q.get("symbol"), "subidas")
@@ -675,6 +684,7 @@ class Radar:
                     add(it.get("t"), "escaneo")
             except (requests.RequestException, ValueError):
                 pass
+        sq = {s: q for s, q in sq.items() if foco.permitido(s, bio, wl)}
         quotes = self.quotes(sorted(cand))
         for s, q in sq.items():
             quotes.setdefault(s, q)
@@ -722,11 +732,34 @@ class Radar:
             ranked.append((math.log1p(rv) * 2 + max(chg, 0) / 4, s))
         ranked.sort(reverse=True)
         top = [s for _, s in ranked[:UNIVERSE_N]]
-        uni = list(dict.fromkeys(top + watch + list(halted) + (ib_top if phase == "open" else [])))
+        ok = lambda x: foco.permitido(x, bio, wl)   # el foco (biotech) también filtra los halts y los escáneres de IBKR
+        uni = list(dict.fromkeys(top + watch + [h for h in halted if ok(h)] + [x for x in (ib_top if phase == "open" else []) if ok(x)]))
         self.universe, self.base_universe = uni, list(uni)
         self.sources = {s: sorted(cand.get(s, [])) for s in uni}
         self.universe_ts = time.time()
-        log.info("universo: %d candidatos, %d cotizados → %d en seguimiento", len(cand), len(quotes), len(uni))
+        log.info("universo: %d candidatos, %d cotizados → %d en seguimiento%s", len(cand), len(quotes), len(uni),
+                 f" (foco {foco.INDUSTRIA}: {len(bio)} en la industria)" if foco.activo() else "")
+
+    def _biotech(self, Q, exch) -> tuple[set, dict]:
+        """Acciones de la industria del foco (subidas y volumen de Yahoo). Si la pantalla falla, se usa la última buena:
+        no se debe quedar el radar solo con la watchlist por un fallo pasajero."""
+        got, qs = set(), {}
+        for orden in ("percentchange", "dayvolume"):
+            r = yahoo.retry(lambda orden=orden: yahoo.yf.screen(foco.screen_query(Q, exch), size=foco.N,
+                                                                sortField=orden, sortAsc=False),
+                            tries=2, what=f"screen {foco.INDUSTRIA} {orden}")
+            for q in yahoo._quotes(r):
+                s = str(q.get("symbol") or "").upper().strip()
+                if s:
+                    got.add(s)
+                    qs[s] = q
+        if got:
+            self.bio_prev = got
+            return got, qs
+        log.warning("foco %s: la pantalla no trajo nada; uso la última lista buena (%d)", foco.INDUSTRIA,
+                    len(getattr(self, "bio_prev", ()) or ()))
+        return set(getattr(self, "bio_prev", set()) or ()), {}
+
 
     def ensure_context(self, syms: list[str], today):
         """Curva de volumen de 5 días, ATR y cierre previo de cada acción. Si Yahoo falla con alguna, se vuelve a pedir
