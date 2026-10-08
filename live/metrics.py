@@ -14,6 +14,7 @@ import pandas as pd
 from scanner.util import ET
 
 OPEN_M, CLOSE_M = 570, 960
+RVOL_PISO0 = 0.12   # fracción mínima del volumen diario que se espera al abrir (igual que el ranking del universo)
 SESSION_LEN = CLOSE_M - OPEN_M  # 390
 
 # Parámetros de ballena (vela de 1 min anómala)
@@ -155,7 +156,12 @@ def session_metrics(bars: pd.DataFrame, prev_close: float | None, baseline: list
     done = reg.iloc[:-1] if len(reg) >= 2 else reg
     elapsed = int(min(max(done["m"].iloc[-1] - OPEN_M, 0), SESSION_LEN - 1))
     if baseline and baseline[elapsed] > 0:
-        out["rvol"] = round(float(done["Volume"].sum()) / baseline[elapsed], 2)
+        # Piso (oct-2026): en los primeros minutos la curva promedio de días previos es casi cero para una acción de poco
+        # volumen, y el RVOL salía en 96× (LSTA, 9:39) con 373 K de volumen del día. Se compara contra al menos lo que
+        # rinde un día normal a esta hora, el mismo ritmo mínimo que usa el ranking del universo (12 % al abrir).
+        # baseline[-1] es el volumen total promedio de un día previo (la curva es acumulada).
+        piso = float(baseline[-1]) * (RVOL_PISO0 + (1 - RVOL_PISO0) * elapsed / (SESSION_LEN - 1))
+        out["rvol"] = round(float(done["Volume"].sum()) / max(baseline[elapsed], piso), 2)
     # RVOL de los últimos 15 min contra lo normal a esa hora: ve el volumen NUEVO de una ruptura de media mañana,
     # que el RVOL acumulado desde la apertura diluye
     if baseline and elapsed >= 15:

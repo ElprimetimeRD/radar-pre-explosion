@@ -65,7 +65,7 @@ def test_compra():
     now = DAY.replace(hour=9, minute=30) + timedelta(minutes=n - 1)
     m = metrics.session_metrics(b, 9.6, base, now)
     assert m["or_done"] and m["px"] > m["orh"] and m["px"] > m["vwap"], m
-    assert m["rvol"] and m["rvol"] > 3, m["rvol"]
+    assert m["rvol"] and m["rvol"] > 2, m["rvol"]      # con el piso de apertura (metrics.RVOL_PISO0) el RVOL ya no se dispara al abrir
     assert m["whale"]["buy"] >= 1, m["whale"]
     r = D.decide("TEST", m, ctx(cat={"type": "contract", "age": "fresh", "title": "x"}))
     assert r["decision"] == "COMPRA", (r["decision"], r["reason"], r["score"], m)
@@ -978,6 +978,20 @@ def test_or_waits_for_bars():
     assert r["level"] is None or np.isfinite(r["level"]), r
 
 
+def test_rvol_piso_de_apertura():
+    """Al abrir, la curva promedio de días previos puede estar casi en cero para una acción de poco volumen: el RVOL salía en
+    96× (LSTA, 9:39, 8-oct) aunque el día llevaba ~1.5× su volumen promedio. Ahora se compara contra al menos el 12 % de un
+    día normal a esa hora (piso). Con el piso, 9 minutos de 15 K contra un día promedio de 241 K dan ~4×, no 135 K / 10."""
+    from array import array
+    base = array("d", [10.0 if i < 10 else 241000.0 * (i + 1) / 390 for i in range(390)])
+    n = 10
+    m = metrics.session_metrics(bars(DAY, [10.0] * n, [15000] * n), 9.9, base, DAY.replace(hour=9, minute=39))
+    assert 3 < m["rvol"] < 5, m["rvol"]
+    base_normal = array("d", [241000.0 * (i + 1) / 390 for i in range(390)])   # sin hueco al abrir: el piso no cambia nada
+    m2 = metrics.session_metrics(bars(DAY, [10.0] * n, [15000] * n), 9.9, base_normal, DAY.replace(hour=9, minute=39))
+    assert 1.0 < m2["rvol"] < 2.0, m2["rvol"]
+
+
 def test_rvol_recent_and_parabolic():
     """RVOL sin la vela a medio llenar; RVOL de los últimos 15 min (solo decide con RVOL15_IN_PLAY > 0); un parabólico
     con noticia fresca y volumen fuerte queda en ESPERA (se sigue para el retroceso) en vez de NO."""
@@ -1369,6 +1383,7 @@ if __name__ == "__main__":
     test_no_data_keeps_arms()
     test_partial_bars()
     test_or_waits_for_bars()
+    test_rvol_piso_de_apertura()
     test_rvol_recent_and_parabolic()
     test_context_retry_and_quotes_backoff()
     test_background_context()
