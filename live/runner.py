@@ -691,7 +691,7 @@ class Radar:
                     if q.get("symbol"):
                         fq[str(q["symbol"]).upper()] = q
                 fq.update(quotes)  # la cotización v7 es más fresca que la de la pantalla
-                nuevas = flujo.pick(fq)
+                nuevas = flujo.pick(fq, pre=phase == "pre")
                 if r is None:  # la pantalla falló (retry devuelve None): no sueltes las de antes por un fallo pasajero
                     nuevas += [s for s in self.flujo_cand if s not in nuevas and s in self.flujo_q]
                     for s in nuevas:
@@ -1163,7 +1163,8 @@ class Radar:
         found, nodata, skipped = [], 0, 0
         for s in syms:
             q = quotes.get(s) or self.flujo_q.get(s) or {}
-            prev = fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
+            prev = (fnum(q.get("regularMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPreviousClose"))) \
+                or fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
             live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
             m = flujo.metrics(bars.get(s), prev, live, t_et)
             if m is None:

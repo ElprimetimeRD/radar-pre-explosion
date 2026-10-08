@@ -101,18 +101,21 @@ def screen_query(Q, exch):
                      Q("gte", ["intradayprice", PX_MIN]), Q("lte", ["intradayprice", PX_MAX])])
 
 
-def pick(quotes: dict[str, dict], n: int | None = None) -> list[str]:
+def pick(quotes: dict[str, dict], n: int | None = None, pre: bool = False) -> list[str]:
     """Candidatas de las cotizaciones de las pantallas de Yahoo: penny (cierre previo ≤ PRIOR_MAX) que ya suben fuerte.
     El umbral de subida se afloja al 60 % porque la cotización de una pantalla puede ir atrasada; el filtro de verdad lo
     hace decide() con las velas. Orden: más movimiento × más dinero negociado."""
     rows = []
     for s, q in quotes.items():
         s = str(s).upper()
-        px = fnum(q.get("regularMarketPrice"))
+        if pre:  # pre-market: Yahoo deja en regularMarket* lo de ayer; el cierre previo es el último precio regular
+            px, prev = fnum(q.get("preMarketPrice")), fnum(q.get("regularMarketPrice"))
+            chg, vol = (100 * (px / prev - 1) if px and prev else None), fnum(q.get("preMarketVolume"))
+        else:
+            px, chg = fnum(q.get("regularMarketPrice")), fnum(q.get("regularMarketChangePercent"))
+            prev, vol = fnum(q.get("regularMarketPreviousClose")), fnum(q.get("regularMarketVolume"))
         if not px or px < PX_MIN or not SYMBOL_RX.fullmatch(s):
             continue
-        chg = fnum(q.get("regularMarketChangePercent"))
-        prev = fnum(q.get("regularMarketPreviousClose"))
         if prev is None and chg is not None and chg > -99:
             prev = px / (1 + chg / 100)
         if not prev or prev > PRIOR_MAX:
@@ -121,7 +124,7 @@ def pick(quotes: dict[str, dict], n: int | None = None) -> list[str]:
             chg = 100 * (px / prev - 1)
         if chg < 0.6 * CHG_MIN:
             continue
-        usd = px * (fnum(q.get("regularMarketVolume")) or 0)
+        usd = px * (vol or 0)
         rows.append((math.log1p(chg) * math.log1p(usd / 1e6), s))
     rows.sort(reverse=True)
     return [s for _, s in rows[: (n or N_MAX)]]
