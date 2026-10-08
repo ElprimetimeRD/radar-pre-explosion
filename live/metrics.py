@@ -156,6 +156,13 @@ def session_metrics(bars: pd.DataFrame, prev_close: float | None, baseline: list
     elapsed = int(min(max(done["m"].iloc[-1] - OPEN_M, 0), SESSION_LEN - 1))
     if baseline and baseline[elapsed] > 0:
         out["rvol"] = round(float(done["Volume"].sum()) / baseline[elapsed], 2)
+    # Volumen de hoy contra el promedio DIARIO (sesión regular, sin pre-market): la comparación que ve cualquier app.
+    # El RVOL de arriba compara contra la curva de esta hora, que al abrir es muy pequeña para las acciones de poco
+    # volumen y lo infla (LSTA, 9:39: 96× con 1.5× su promedio diario). Se muestra junto al RVOL; no cambia la decisión.
+    if baseline and baseline[-1] > 0:
+        out["vol_dia"] = float(reg["Volume"].sum())
+        out["vol_prom"] = float(baseline[-1])
+        out["vol_x"] = round(out["vol_dia"] / out["vol_prom"], 2)
     # RVOL de los últimos 15 min contra lo normal a esa hora: ve el volumen NUEVO de una ruptura de media mañana,
     # que el RVOL acumulado desde la apertura diluye
     if baseline and elapsed >= 15:

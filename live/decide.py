@@ -74,7 +74,7 @@ def strength(m: dict, ctx: dict) -> tuple[int, list[str]]:
         avail += 25
         event += 0 if rv < 1 else 10 if rv < 2 else 10 + 10 * min(rv - 2, 3) / 3 if rv < 5 else 20 + min(rv - 5, 5)
         if rv >= 2:
-            why.append(f"RVOL {rv:.1f}×")
+            why.append(f"RVOL {rv:.1f}×" + (f" (hoy {m['vol_x']:.1f}× el promedio diario)" if m.get("vol_x") is not None else ""))
     cat = ctx.get("cat") or {}
     if ctx.get("news_ok") or cat.get("type"):
         avail += 20
