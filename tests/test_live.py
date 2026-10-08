@@ -4,6 +4,7 @@ from __future__ import annotations
 import os as _os
 _os.environ.setdefault("RIESGO", "normal")  # pruebas con los umbrales de siempre; el perfil alto tiene su prueba
 _os.environ.setdefault("PAPER_ESTILO", "normal")
+_os.environ.setdefault("FOCO", "general")  # las pruebas del radar general; el foco biotech tiene la suya (test_foco_biotech)
 
 from datetime import datetime, timedelta
 
@@ -722,6 +723,53 @@ def test_bridge_break():
         yahoo.batch_quotes = old_q
 
 
+def test_foco_biotech():
+    """Foco biotech (live/foco.py): el universo solo trae la industria Biotechnology y la watchlist; los movers generales, los
+    escáneres de IBKR y los halts de otras industrias quedan fuera. Si la pantalla de biotech falla, se conserva la última lista
+    buena (no se queda solo con la watchlist). FOCO=general vuelve al radar de siempre."""
+    from scanner.sources import yahoo
+    from live import foco
+    foco.MODO = "biotech"
+    assert foco.activo() and foco.permitido("BIOX", {"BIOX"}, set()) and not foco.permitido("TSLA", {"BIOX"}, set())
+    assert foco.permitido("WATCH", set(), {"WATCH"})                                  # la watchlist siempre entra
+    old = (yahoo.retry, yahoo.batch_quotes, runner.load_watchlist)
+    def cot(sym, chg=5.0):
+        return {"symbol": sym, "quoteType": "EQUITY", "regularMarketPrice": 3.0, "regularMarketChangePercent": chg,
+                "regularMarketVolume": 2_000_000, "averageDailyVolume10Day": 1_000_000}
+    estado = {"biotech": True}
+    def fake_retry(fn, tries=3, what=""):
+        if "biotech" in what or "Biotechnology" in what:
+            if not estado["biotech"]:
+                return None
+            return {"quotes": [cot("BIOX", 9.0), cot("BIOY", 4.0)]}
+        if "subidas" in what or "screen " in what:
+            return {"quotes": [cot("TSLA", 12.0), cot("NVDA", 8.0)]}
+        return None
+    try:
+        yahoo.retry = fake_retry
+        yahoo.batch_quotes = lambda syms: {s: cot(s) for s in syms}
+        runner.load_watchlist = lambda: ["WATCH"]
+        r = runner.Radar(notify=False)
+        r.bridge.update(scan={"HOT_BY_VOLUME": ["NVDA", "BIOY"]})
+        r.refresh_universe(DAY.replace(hour=10, minute=0), "open", {"HALTED1": {}, "BIOX": {}})
+        assert "BIOX" in r.universe and "BIOY" in r.universe and "WATCH" in r.universe, r.universe
+        assert not {"TSLA", "NVDA", "HALTED1"} & set(r.universe), r.universe           # fuera de la industria
+        assert r.sources["BIOX"] and "biotech" in r.sources["BIOX"], r.sources
+        estado["biotech"] = False                                                      # la pantalla falla: se conserva la última
+        r.refresh_universe(DAY.replace(hour=10, minute=5), "open", {})
+        assert "BIOX" in r.universe and "BIOY" in r.universe and "TSLA" not in r.universe, r.universe
+        foco.MODO = "general"                                                          # FOCO=general: todo vuelve
+        try:
+            estado["biotech"] = True
+            r2 = runner.Radar(notify=False)
+            r2.refresh_universe(DAY.replace(hour=10, minute=0), "open", {})
+            assert "TSLA" in r2.universe and "NVDA" in r2.universe, r2.universe
+        finally:
+            foco.MODO = "biotech"
+    finally:
+        yahoo.retry, yahoo.batch_quotes, runner.load_watchlist = old
+
+
 def test_bridge_universe():
     """Lo que ven los escáneres de IBKR entra al universo: en sesión directo aunque Yahoo no lo liste; en pre-market
     solo compite en el ranking. Entre refrescos del universo, el ciclo lo agrega en el acto."""
@@ -1315,6 +1363,7 @@ if __name__ == "__main__":
     test_bridge_state()
     test_bridge_break()
     test_bridge_universe()
+    test_foco_biotech()
     test_bridge_api()
     test_telegram_state()
     test_no_data_keeps_arms()
