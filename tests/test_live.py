@@ -978,6 +978,20 @@ def test_or_waits_for_bars():
     assert r["level"] is None or np.isfinite(r["level"]), r
 
 
+def test_volumen_del_dia_junto_al_rvol():
+    """El RVOL de la hora puede inflarse al abrir (LSTA: 96× con 1.5× el promedio diario). Se muestra el volumen de hoy contra
+    el promedio diario junto al RVOL; la decisión no cambia."""
+    base = metrics.baseline_curve(five_days(), DAY.date())                    # 10 K por minuto: 3.9 M al día
+    n = 20
+    m = metrics.session_metrics(bars(DAY, [10.0] * n, [40000] * n), 9.9, base, DAY.replace(hour=9, minute=49))
+    assert m["vol_prom"] == 3900000.0 and m["vol_dia"] == 20 * 40000 and m["vol_x"] == round(20 * 40000 / 3.9e6, 2), m
+    r = D.decide("X", m, ctx())
+    if m["rvol"] >= 2:
+        assert any("promedio diario" in w for w in r["why"]), r["why"]
+    sin = {k: v for k, v in m.items() if k not in ("vol_x", "vol_dia", "vol_prom")}
+    assert D.decide("X", sin, ctx())["decision"] == r["decision"]           # la decisión no depende del dato nuevo
+
+
 def test_rvol_recent_and_parabolic():
     """RVOL sin la vela a medio llenar; RVOL de los últimos 15 min (solo decide con RVOL15_IN_PLAY > 0); un parabólico
     con noticia fresca y volumen fuerte queda en ESPERA (se sigue para el retroceso) en vez de NO."""
@@ -1369,6 +1383,7 @@ if __name__ == "__main__":
     test_no_data_keeps_arms()
     test_partial_bars()
     test_or_waits_for_bars()
+    test_volumen_del_dia_junto_al_rvol()
     test_rvol_recent_and_parabolic()
     test_context_retry_and_quotes_backoff()
     test_background_context()
