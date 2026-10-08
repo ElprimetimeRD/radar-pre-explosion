@@ -57,7 +57,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.9"
+VERSION = "2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -161,7 +161,7 @@ def configurar_log(archivo: str):
                                                              encoding="utf-8"))
     except OSError:
         pass
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", handlers=handlers)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", handlers=handlers)
     logging.getLogger("ib_async").setLevel(logging.ERROR)
 
 
@@ -618,6 +618,7 @@ class Ejecutor:
             self.guardar()
             return
         self.contratos[oid] = c
+        log.info("RECIBIDA %s %s %s", oid, o["t"], self.detalle(o))
         self._colocar(o, c, con_gtd=True)
         self.evento("puesta", oid, t=o["t"], detalle=self.detalle(o))
         self.guardar()
@@ -948,7 +949,7 @@ class Ejecutor:
             res = self.resumen() if self.paper else {}
         estado = {"ib": bool(self.paper), "paper": self.paper, "cuenta": self.cuenta, "bloqueado": self.bloqueado,
                   "parado": self.parado, "pausa": self.pausa, "modo": self.modo, "version": VERSION, **res,
-                  **self.extra_estado()}
+                  **self.cartera(res), **self.extra_estado()}
         lote = self.eventos[:100]
         try:
             out = self.post(self.url, self.token, {"v": 1, "estado": estado, "eventos": lote}, timeout=5)
@@ -967,6 +968,35 @@ class Ejecutor:
             self.err_red = None
         del self.eventos[:len(lote)]
         return out if isinstance(out, dict) else None
+
+    def cartera(self, res: dict) -> dict:
+        """Para «ordenes» y «posiciones» de Telegram (v2.0): puerto, las órdenes vivas con su detalle y el último precio que da
+        IBKR de cada posición (IB.portfolio(), que ib_async llena solo al conectar; sin precio no se inventa ninguno)."""
+        out = {"puerto": PUERTO}
+        if not self.paper:
+            return out
+        vivas = []
+        for o in self.ord.values():
+            if len(vivas) >= 20:
+                break
+            comprada = abs(self.abierta(o)) > EPS
+            if o["estado"] in ("puesta", "cancelando") or comprada:
+                vivas.append({"id": o["id"], "t": o["t"], "qty": o.get("qty"), "limite": o.get("limite"),
+                              "stop": o.get("stop"), "trail_pct": o.get("trail_pct"), "trail": o.get("trail"),
+                              "objetivo": o.get("objetivo"),
+                              "estado": "llena" if comprada else ("cancelando" if o["estado"] == "cancelando" else "puesta")})
+        out["ordenes_vivas"] = vivas
+        try:
+            quiero = {p["t"] for p in res.get("posiciones") or []}
+            merc = {}
+            for it in self.ib.portfolio():
+                sym, mp = getattr(it.contract, "symbol", None), fnum(getattr(it, "marketPrice", None))
+                if sym in quiero and mp and 0 < mp < 1e6:
+                    merc[sym] = round(mp, 4)
+            out["mercado"] = merc
+        except Exception as e:  # noqa: BLE001 (sin precio no pasa nada: Telegram dice «n/d»)
+            log.debug("Sin precios de cartera: %s", e)
+        return out
 
     def extra_estado(self) -> dict:
         """Campos propios de cada ejecutor para el estado que se manda al semáforo (el de Claude añade los suyos)."""

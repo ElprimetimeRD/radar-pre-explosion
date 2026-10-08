@@ -1,5 +1,6 @@
-"""Telegram de entrada: los toques del botón «✅ Ejecutar en paper» y los comandos (/estado, /pausa, /reanuda,
-/cerrar, /auto, /boton, y /claude y /marcador del ejecutor paralelo de Claude). Lee con long polling (getUpdates): Telegram responde en cuanto llega algo, sin webhook ni
+"""Telegram de entrada: los toques del botón «✅ Ejecutar en paper», los comandos (/estado, /pausa, /reanuda,
+/cerrar, /auto, /boton, y /claude y /marcador del ejecutor paralelo de Claude) y las órdenes a mano en texto
+(«XYZ 10.00 stop 9.50 tp 12.00 riesgo 50» + OK, posiciones, ordenes, cancelar: live/ordenes_tg.py, solo paper). Lee con long polling (getUpdates): Telegram responde en cuanto llega algo, sin webhook ni
 dirección pública. Solo atiende al chat de TELEGRAM_CHAT_ID; el token nunca va al registro."""
 from __future__ import annotations
 
@@ -15,8 +16,9 @@ VIEJO_S = 120   # comandos más viejos que esto (p. ej. escritos mientras el ser
 
 class TgIn:
     def __init__(self, paper, token: str | None = None, chat_id: str | None = None, http=None, clock=time.time,
-                 user_id: str | None = None, claude=None):
+                 user_id: str | None = None, claude=None, ordenes=None):
         self.paper = paper
+        self.ordenes = ordenes  # live/ordenes_tg.py: órdenes a mano por texto (None = no existen)
         self.claude = claude    # live/claude_paper.py: /claude y /marcador (None = no existen)
         self.token = token or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
         self.chat = str(chat_id or os.environ.get("TELEGRAM_CHAT_ID") or "")
@@ -138,6 +140,14 @@ class TgIn:
         if self.clock() - float(m.get("date") or 0) > VIEJO_S:
             return
         text = (m.get("text") or "").strip()
+        if text and not text.startswith("/") and text.split()[0].lower() == "estado":
+            text = "/" + text           # «estado» a secas vale lo mismo que /estado
+        if self.ordenes and text:
+            respuestas, atendido = self.ordenes.manejar(text)
+            for r in respuestas:
+                self.send(r)
+            if atendido:
+                return
         if not text.startswith("/"):
             return
         cmd = text.split()[0].split("@")[0]

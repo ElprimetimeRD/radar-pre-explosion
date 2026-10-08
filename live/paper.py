@@ -54,6 +54,7 @@ ENTRADA_FIN_M = int(os.environ.get("ENTRY_END_M", str(12 * 60)))  # el mismo cor
 CIERRE_M = 15 * 60 + 55
 EXEC_TTL = 20          # s sin noticias del ejecutor = desconectado (sin botón en los avisos)
 CERRAR_TTL = 300       # s que vale un /cerrar confirmado para un ejecutor que se conecta tarde
+CANCEL_EXT_TTL = 300    # s que se sigue pidiendo cancelar una orden que el semáforo no tiene en su memoria
 CONFIRMA_TTL = 120     # s que vale el botón «Sí, cerrar todo» después de escribir /cerrar
 OFERTA_TTL = {"compra": 120, "ruptura": 90}   # s para tocar el botón de una COMPRA a mercado o de una ruptura
 VIVAS = ("cola", "enviada", "puesta", "llena")
@@ -61,7 +62,7 @@ ORDEN_ESTADOS = {"oferta": 0, "cola": 1, "enviada": 2, "puesta": 3, "llena": 4,
                  "cerrada": 5, "cancelada": 5, "rechazada": 5}   # un aviso viejo nunca hace retroceder el estado
 CANCEL_ESPERA = 120    # s: una orden marcada para cancelar de la que el ejecutor no dice nada se da por cancelada
 ID = re.compile(r"[0-9a-f]{8}")
-POR = {"trailing": "el stop que sube", "objetivo": "el objetivo", "cierre": "el cierre"}
+POR = {"trailing": "el stop que sube", "objetivo": "el objetivo", "cierre": "el cierre", "stop": "el stop"}
 
 
 def _num(v) -> float | None:
@@ -132,6 +133,7 @@ class Paper:
         self.ex: dict = {}
         self.clock = clock
         self.msgs: list[tuple[str, str]] = []   # (clave única, texto) para Telegram; los manda el semáforo
+        self.cancel_ext: dict[str, float] = {}  # órdenes que solo conoce el ejecutor (tras un reinicio del semáforo) y se pidió cancelar
 
     # ---------------- estado ----------------
     def disponible(self, now: float | None = None) -> bool:
@@ -253,6 +255,71 @@ class Paper:
             o["estado"], o["pedida"] = "cola", now
             return True, f"Enviando a IBKR paper: {o['t']} {o['qty']} acc."
 
+    # ---------------- órdenes a mano (Telegram: «XYZ 10.00 stop 9.50 tp 12.00 riesgo 50») ----------------
+    def _manual_dict(self, t, entrada, stop, tp, qty, now) -> dict:
+        return {"id": secrets.token_hex(4), "kind": "manual", "t": t, "tipo": "lmt", "gatillo": None, "limite": entrada,
+                "trail": round(entrada - stop, 2), "trail_pct": None, "stop": stop, "objetivo": tp, "qty": int(qty),
+                "setup": "manual (Telegram)", "hasta": et_ts(now, ENTRADA_FIN_M), "creada": now, "estado": "oferta"}
+
+    def validar_manual(self, t: str, entrada: float, stop: float, tp: float, qty: int, now: float | None = None) -> str | None:
+        """Por qué NO se puede enviar ahora una orden a mano (None = se puede). Mismas reglas que las del semáforo."""
+        now = now or self.clock()
+        with self.lock:
+            if not self.disponible(now):
+                return ("el ejecutor de tu PC no está conectado a IBKR paper (abre ARRANCAR_PAPER.bat; "
+                        "/estado dice qué le pasa)")
+            return self._motivo(self._manual_dict(t, entrada, stop, tp, qty, now), now)
+
+    def enviar_manual(self, t: str, entrada: float, stop: float, tp: float, qty: int,
+                      now: float | None = None) -> tuple[str | None, str]:
+        """Pone en la cola la orden a mano que Priamo confirmó con OK. (id o None, texto)."""
+        now = now or self.clock()
+        with self.lock:
+            motivo = self.validar_manual(t, entrada, stop, tp, qty, now)
+            if motivo:
+                return None, f"No la envié: {motivo}."
+            self._purgar(now)
+            o = self._manual_dict(t, entrada, stop, tp, qty, now)
+            o["estado"], o["pedida"] = "cola", now
+            self.ofertas[o["id"]] = o
+            return o["id"], f"Enviada a IBKR paper (id {o['id']}): {t} {int(qty)} acc."
+
+    def ordenes_listado(self) -> list[dict]:
+        """Las órdenes de paper vivas: las de esta sesión y las que solo conoce el ejecutor (tras un reinicio del semáforo)."""
+        with self.lock:
+            out: dict[str, dict] = {}
+            for x in self.ex.get("ordenes_vivas") or []:
+                out[x["id"]] = dict(x)
+            for o in self.ofertas.values():
+                if o["estado"] not in VIVAS:
+                    continue
+                d = out.get(o["id"])
+                if d and o["estado"] in ("puesta", "llena"):
+                    continue                      # lo que dice el ejecutor es lo más fresco
+                out[o["id"]] = {"id": o["id"], "t": o["t"], "qty": o["qty"], "limite": o["limite"], "stop": o.get("stop"),
+                                "trail_pct": o.get("trail_pct"), "trail": o.get("trail"), "objetivo": o.get("objetivo"),
+                                "estado": "cancelando" if o.get("cancelar") else o["estado"]}
+            return list(out.values())
+
+    def cancelar_ids(self, ids: list[str], now: float | None = None) -> int:
+        """Cancela compras SIN llenar por id (las ya compradas siguen protegidas por su stop; salir de ellas es /cerrar)."""
+        now = now or self.clock()
+        n = 0
+        with self.lock:
+            for oid in ids:
+                o = self.ofertas.get(oid)
+                if o is None:
+                    if any(x["id"] == oid and x["estado"] == "puesta" for x in self.ex.get("ordenes_vivas") or []):
+                        self.cancel_ext[oid] = now
+                        n += 1
+                elif o["estado"] == "cola":
+                    o["estado"] = "cancelada"
+                    n += 1
+                elif o["estado"] in ("enviada", "puesta") and not o.get("cancelar"):
+                    o["cancelar"], o["cancelar_ts"] = "cancelada por ti desde Telegram", now
+                    n += 1
+        return n
+
     def cancelar_ticker(self, t: str, motivo: str):
         """El aviso se dañó o venció: la oferta deja de valer y lo que esté en camino o puesto sin llenar se cancela.
         Lo ya comprado sigue protegido por su stop que sube."""
@@ -295,8 +362,11 @@ class Paper:
                 if o["estado"] in ("cola", "enviada") and not o.get("cancelar"):
                     o["estado"] = "enviada"
                     ordenes.append({k: o[k] for k in ("id", "t", "tipo", "gatillo", "limite", "trail", "objetivo",
-                                                      "qty", "hasta")} | {"trail_pct": o.get("trail_pct")})
+                                                      "qty", "hasta")} | {"trail_pct": o.get("trail_pct")}
+                                   | ({"stop": o["stop"], "setup": o.get("setup") or ""} if o.get("stop") else {}))
             cancelar = [o["id"] for o in self.ofertas.values() if o.get("cancelar") and o["estado"] in ("enviada", "puesta")]
+            self.cancel_ext = {k: ts for k, ts in self.cancel_ext.items() if now - ts <= CANCEL_EXT_TTL}
+            cancelar += [k for k in self.cancel_ext if k not in cancelar]
             return {"ordenes": ordenes, "cancelar": cancelar, "pausa": self.pausa, "modo": self.modo,
                     "cerrar_id": self.cerrar_id,
                     "cerrar_hace_s": round(now - self.cerrar_ts, 1) if self.cerrar_id else None,
@@ -329,6 +399,17 @@ class Paper:
             if isinstance(p, dict) and p.get("t"):
                 pos.append({"t": str(p["t"])[:6], "qty": _num(p.get("qty")), "px": _num(p.get("px"))})
         out["posiciones"] = pos
+        out["puerto"] = int(_num(e.get("puerto")) or 0) or None
+        vivas = []
+        for x in list(e.get("ordenes_vivas") or [])[:20]:     # detalle de lo vivo, para «ordenes» y «cancelar» tras un reinicio
+            if isinstance(x, dict) and ID.fullmatch(str(x.get("id") or "")) and x.get("t"):
+                vivas.append({"id": x["id"], "t": str(x["t"])[:6], "qty": _num(x.get("qty")), "limite": _num(x.get("limite")),
+                              "stop": _num(x.get("stop")), "trail_pct": _num(x.get("trail_pct")), "trail": _num(x.get("trail")),
+                              "objetivo": _num(x.get("objetivo")),
+                              "estado": x.get("estado") if x.get("estado") in ("puesta", "cancelando", "llena") else "puesta"})
+        out["ordenes_vivas"] = vivas
+        merc = e.get("mercado") if isinstance(e.get("mercado"), dict) else {}
+        out["mercado"] = {str(k)[:6]: _num(v) for k, v in list(merc.items())[:20] if _num(v)}      # último precio que da IBKR
         out["vivas_t"] = [str(x)[:6] for x in list(e.get("vivas_t") or [])[:20]]
         return out
 
@@ -362,7 +443,9 @@ class Paper:
                 o["estado"], o["px_e"], o["qty_e"] = "llena", px, qty
             self._msg(f"paper:{oid}:llena", f"📥 Paper: compré {qty or 0:g} {t} a {px or 0:.2f}. "
                                              + ("Lo cuida el Trailing de " + f"{o['trail_pct']:g} %" + " que sube con el precio."
-                                                if o and o.get("trail_pct") else "Lo cuida el stop que sube y el objetivo."))
+                                                if o and o.get("trail_pct") else
+                                                f"Lo cuidan el stop {o['stop']:.2f} y el objetivo {o['objetivo']:.2f}."
+                                                if o and o.get("stop") else "Lo cuida el stop que sube y el objetivo."))
         elif ev == "salida":
             pnl, pe = _num(e.get("pnl")), _num(e.get("px_e")) or (o or {}).get("px_e")
             if o:
@@ -395,6 +478,8 @@ class Paper:
                   else f"compra límite {o['limite']:.2f}")
         if o.get("trail_pct"):
             return f"· {o['qty']} acc · {compra} · Trailing {o['trail_pct']:g} % (sin objetivo)"
+        if o.get("stop"):
+            return f"· {o['qty']} acc · {compra} · stop {o['stop']:.2f} · objetivo {o['objetivo']:.2f}"
         return f"· {o['qty']} acc · {compra} · Trailing {o['trail']:.2f} · objetivo {o['objetivo']:.2f}"
 
     # ---------------- comandos de Telegram ----------------
@@ -453,6 +538,8 @@ class Paper:
                 "/estado · cómo va (posiciones, P/L, límites)\n/pausa · no pongo órdenes nuevas\n/reanuda · sigo\n"
                 "/auto · pongo cada ARMA y COMPRA sin preguntarte\n/boton · solo las que toques\n"
                 "/cerrar · cancelo y vendo todo ya (también lo de Claude)\n"
+                f"A mano (solo paper): {'XYZ 10.00 stop 9.50 tp 12.00 riesgo 50'} · te armo el plan y la envío con OK\n"
+                "posiciones · ordenes · cancelar ID|TICKER (compras sin llenar) · estado\n"
                 "/claude · cómo va el ejecutor de Claude\n/marcador · el día: tú contra Claude\n"
                 + (f"Estilo penny: solo acciones de US${PENNY_PX_MIN:g} a US${PENNY_PX_MAX:g}, US${PENNY_USD:,.0f} por operación con "
                    f"Trailing de {PENNY_STOP_PCT:g} % que sube con el precio (sin objetivo) · "
@@ -469,7 +556,8 @@ class Paper:
             modo = "automático" if self.modo == "auto" else "botón"
             lines = [f"📊 Paper · modo {modo}{' · EN PAUSA' if self.pausa else ''}"]
             if self.disponible(now):
-                lines.append(f"Ejecutor conectado (cuenta {ex.get('cuenta') or '?'})")
+                lines.append(f"Ejecutor conectado · {'PAPER' if ex.get('paper') else '⚠ NO ES PAPER'} · IB Gateway puerto "
+                             f"{ex.get('puerto') or 4002} · cuenta {ex.get('cuenta') or '?'}")
             elif ex.get("bloqueado"):
                 lines.append(f"Ejecutor bloqueado: {ex['bloqueado']}")
             elif self.ex_seen:
