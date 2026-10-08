@@ -210,6 +210,12 @@ def test_pick_and_query():
     assert got[0] == "SXTC" and set(got) == {"SXTC", "NOPRV", "MID", "NOCHG"}, got  # NOCHG sube 20 %: pasa el filtro flojo
     assert flujo.pick(quotes, n=2) == got[:2]
     assert flujo.pick({}) == []
+    # pre-market: manda el precio pre-market contra el último precio regular (lo de ayer no cuenta)
+    pq = {"GAP": {"preMarketPrice": 2.4, "regularMarketPrice": 1.5, "regularMarketChangePercent": 3.0,
+                  "regularMarketPreviousClose": 1.45, "preMarketVolume": 3e6},
+          "AYER": {"preMarketPrice": None, "regularMarketPrice": 1.5, "regularMarketChangePercent": 80.0,
+                   "regularMarketPreviousClose": 0.8, "regularMarketVolume": 9e6}}
+    assert flujo.pick(pq, pre=True) == ["GAP"] and flujo.pick(pq) == ["AYER"], (flujo.pick(pq, pre=True), flujo.pick(pq))
     d = flujo.screen_query(yf.EquityQuery, yf.EquityQuery("is-in", ["exchange", "NMS", "NCM"])).to_dict()
     ops = {(o["operator"], o["operands"][0]) for o in d["operands"] if o["operator"] != "OR"}
     assert ("GT", "percentchange") in ops and ("GT", "dayvolume") in ops and ("GTE", "intradayprice") in ops, ops
