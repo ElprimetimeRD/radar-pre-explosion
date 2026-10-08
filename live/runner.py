@@ -18,6 +18,7 @@ from scanner.features import RULES, options_features
 from scanner.sources import other, yahoo
 from scanner.util import DATA, ET, fnum, log, read_json, write_json
 
+from . import flujo
 from . import halts as halts_src
 from . import memory
 from .bridge import Bridge
@@ -410,6 +411,10 @@ class Radar:
         self.wake_ts = 0.0
         self.cycle_s: float | None = None  # duración del último ciclo (s): el retraso de la señal es esto + el de Yahoo
         self.replay_ts = 0.0              # cuándo terminó el último replay
+        # Radar de flujo en penny stocks (live/flujo.py): solo avisa; sus señales van aparte de las del semáforo
+        self.flujo = flujo.Book(os.path.join(STATE_DIR, "flujo.json"))
+        self.flujo_cand: list[str] = []      # candidatas de la pantalla de Yahoo (cada refresco del universo)
+        self.flujo_q: dict[str, dict] = {}   # su cotización de pantalla: respaldo si v7/quote falla
         self._load()
 
     # ---------------- persistencia (sobrevive reinicios dentro del día) ----------------
@@ -677,6 +682,25 @@ class Radar:
             nm = q.get("shortName") or q.get("longName")
             if nm:
                 self.names[s] = nm
+        if flujo.ON:  # radar de flujo: su propia pantalla de penny stocks; si falla, el universo del semáforo sigue igual
+            try:
+                fq = dict(sq)
+                r = yahoo.retry(lambda: yahoo.yf.screen(flujo.screen_query(Q, exch), size=100, sortField="percentchange",
+                                                        sortAsc=False), tries=2, what="screen penny")
+                for q in yahoo._quotes(r):
+                    if q.get("symbol"):
+                        fq[str(q["symbol"]).upper()] = q
+                fq.update(quotes)  # la cotización v7 es más fresca que la de la pantalla
+                nuevas = flujo.pick(fq)
+                if r is None:  # la pantalla falló (retry devuelve None): no sueltes las de antes por un fallo pasajero
+                    nuevas += [s for s in self.flujo_cand if s not in nuevas and s in self.flujo_q]
+                    for s in nuevas:
+                        fq.setdefault(s, self.flujo_q.get(s) or {})
+                    nuevas = nuevas[: flujo.N_MAX]
+                self.flujo_cand = nuevas
+                self.flujo_q = {s: fq[s] for s in nuevas if s in fq}
+            except Exception as e:  # noqa: BLE001
+                log.warning("flujo (pantalla): %s", e)
         t = now.astimezone(ET)
         elapsed = max(0, min(390, t.hour * 60 + t.minute - OPEN_M))
         frac = 0.12 + 0.88 * elapsed / 390 if phase != "pre" else 0.05
@@ -867,6 +891,10 @@ class Radar:
                 self.sent_day = iso
         if phase == "closed":
             self._eod(t_et)
+            try:
+                self._flujo_eod(t_et)
+            except Exception as e:  # noqa: BLE001
+                log.warning("flujo (cierre): %s", e)
             self.armed = {}
             self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat(),
                              "trades": list(self.trades.values()), "stats": self.stats(), "armed": [], "watching": [],
@@ -905,9 +933,11 @@ class Radar:
                   if x.get("status") in ("pendiente", "abierta", "t1")]
         syms = list(dict.fromkeys(self.universe + active + ["SPY", "QQQ"]))
         self.ensure_context(syms, today)
-        bars = yahoo.history(syms, period="1d", interval="1m", prepost=True)
-        quotes = self.quotes(syms)
-        self.last_bars = bars
+        fl_syms = self._flujo_syms(halted, phase)
+        extra = [s for s in fl_syms if s not in syms]  # las del radar de flujo que el semáforo no sigue: solo velas y cotización
+        bars = yahoo.history(syms + extra, period="1d", interval="1m", prepost=True)
+        quotes = self.quotes(syms + extra)
+        self.last_bars = {s: b for s, b in bars.items() if s not in extra}  # el replay solo usa las del semáforo
 
         def mets(s):
             q = quotes.get(s, {})
@@ -975,6 +1005,11 @@ class Radar:
         self._arm(rows, reg, phase, t_et.hour * 60 + t_et.minute)
         if phase == "pre":
             self._pre_list(rows, t_et)
+        try:  # el radar de flujo nunca frena ni rompe el semáforo
+            self._flujo_step(fl_syms, bars, quotes, halted, phase, now, t_et, today)
+        except Exception as e:  # noqa: BLE001
+            log.warning("flujo: %s\n%s", e, traceback.format_exc())
+            self.flujo.snap = {**self.flujo.snap, "status": "error", "error": f"{type(e).__name__}: {e}"[:160]}
         esp = [r for r in rows if r["decision"] == "ESPERA"]
         watching = [r["t"] for r in esp if r.get("level")] + [r["t"] for r in esp if not r.get("level")]
         self.snapshot = {
@@ -985,7 +1020,7 @@ class Radar:
             "trades": list(self.trades.values()), "stats": self.stats(), "universe": len(self.universe),
             "armadas": list(self.arms.values()), "armStats": self.arm_stats(),
             "halts": {s: h for s, h in halted.items()}, "errors": self.errors[-5:], "bridge": self.bridge.status(),
-            "cycle_s": self.cycle_s,
+            "cycle_s": self.cycle_s, "flujo": self.flujo.snap,
         }
         self._save()
 
@@ -1101,6 +1136,85 @@ class Radar:
             lines.append(f"{r['t']} {(r.get('chg') or 0):+.1f}%{pmh}" + (f" · {CAT_NAME.get(cat, cat)}" if cat else ""))
         self.tg(f"pre:{t_et.date().isoformat()}", "📋 Lista de apertura\n" + "\n".join(lines) +
                 f"\nGatillo: ruptura del rango de los primeros {OR_MINUTES} min con volumen; te aviso cuando se arme cada una.")
+
+    # ---------------- radar de flujo en penny stocks (live/flujo.py) ----------------
+    def _flujo_syms(self, halted: dict, phase: str) -> list[str]:
+        """Acciones del radar de flujo: las candidatas de las pantallas de Yahoo (las mejores primero), los halts de hoy y,
+        en sesión, lo que ven los escáneres de IBKR. Como máximo N_MAX + 10. Lista vacía si está apagado o algo falla."""
+        if not flujo.ON:
+            return []
+        try:
+            more = list(halted) + (self.bridge.scan_symbols(IBKR_TOP) if phase != "pre" else [])
+            # los avisos de hoy siguen midiéndose hasta el cierre aunque la acción ya no salga en las pantallas
+            abiertas = [t for t, sg in self.flujo.sigs.items() if sg.get("status") == "abierta"]
+            return list(dict.fromkeys(abiertas + list(self.flujo_cand) + more))[: flujo.N_MAX + 10]
+        except Exception as e:  # noqa: BLE001
+            log.warning("flujo (lista): %s", e)
+            return []
+
+    def _flujo_step(self, syms, bars, quotes, halted, phase, now, t_et, today):
+        """Mide cada candidata con las velas que el ciclo ya bajó, revisa dilución (SEC y noticias) de las mejores, la
+        clasifica VERDE / AMARILLO / ROJO y avisa por Telegram una vez por ticker y día cuando se pone VERDE. Solo avisa:
+        no arma órdenes ni toca los ejecutores."""
+        if not flujo.ON:
+            return
+        now_m, now_ts = t_et.hour * 60 + t_et.minute, now.timestamp()
+        self.flujo.roll(today.isoformat())
+        found, nodata, skipped = [], 0, 0
+        for s in syms:
+            q = quotes.get(s) or self.flujo_q.get(s) or {}
+            prev = fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
+            live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
+            m = flujo.metrics(bars.get(s), prev, live, t_et)
+            if m is None:
+                nodata += 1
+                continue
+            h = halted.get(s)
+            ctx = {"phase": phase, "name": q.get("shortName") or q.get("longName") or self.names.get(s),
+                   "halted": h if h and not h["resumed"] else None,
+                   "spread": sane_spread(fnum(q.get("bid")), fnum(q.get("ask")), m["px"], m.get("rng1m")),
+                   "avg_vol": fnum(q.get("averageDailyVolume10Day")) or fnum(q.get("averageDailyVolume3Month")),
+                   "mcap": fnum(q.get("marketCap")), "enrich_ok": False}
+            r = flujo.decide(s, m, ctx)
+            if r is None:
+                skipped += 1
+                continue
+            found.append((r, m, ctx))
+        found.sort(key=lambda x: -x[0]["score"])
+        rows, budget = [], flujo.ENRICH_N
+        for r, m, ctx in found:
+            if r["decision"] != "ROJO" and budget > 0:  # a las ROJO no se les gasta una consulta de SEC ni de noticias
+                budget -= 1
+                s, ok = r["t"], False
+                try:
+                    hot = r["decision"] == "VERDE" or r["pend"]
+                    ok = self._enrich(s, {"px": m["px"]}, ctx, now_ts, today, False, hot)
+                    if not ok and r["pend"]:  # sería VERDE: sin saber si hay dilución no se avisa, así que se pide en el acto
+                        ok = self._enrich(s, {"px": m["px"]}, ctx, now_ts, today, False, True, inline=True)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("flujo enriquecer %s: %s", s, e)
+                ctx["enrich_ok"] = ok
+                r = flujo.decide(s, m, ctx)
+            rows.append(r)
+        order = {"VERDE": 0, "AMARILLO": 1, "ROJO": 2}
+        rows.sort(key=lambda r: (order[r["decision"]], -r["score"]))
+        for sg in self.flujo.sign(rows, now_m):
+            r = next(x for x in rows if x["t"] == sg["t"])
+            self.tg(f"flujo:{sg['t']}", flujo.alert_text(r, phase))
+        self.flujo.follow(bars, today)
+        self.flujo.snap = {"status": "ok", "ts": now.isoformat(), "et": t_et.strftime("%H:%M:%S"), "phase": phase,
+                           "counts": {k: sum(1 for r in rows if r["decision"] == k) for k in order},
+                           "evaluadas": len(syms), "sin_datos": nodata, "descartadas": skipped, "rows": rows[:30],
+                           "sigs": self.flujo.listing(), "hist": self.flujo.hist_listing(), "cfg": flujo.cfg()}
+
+    def _flujo_eod(self, t_et):
+        """Después del cierre: lo abierto se cierra al último precio y llega el resumen de los avisos 🔥 del día."""
+        if not flujo.ON or t_et.weekday() >= 5 or t_et.hour < 16:
+            return
+        day = t_et.date().isoformat()
+        txt = self.flujo.finish(day)
+        if txt:
+            self.tg(f"flujo-eod:{day}", txt)
 
     # ---------------- vigía rápido: precio de las rupturas armadas (IBKR al instante o Yahoo cada FAST_S s) -------
     def _check_breaks(self, prices: dict, src: str, now: datetime) -> list[str]:

@@ -14,7 +14,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from . import keepalive, memory
+from . import flujo, keepalive, memory
 from .runner import Radar, perfil
 
 memory.limit_arenas(int(os.environ.get("MALLOC_ARENAS", "2")))  # antes de crear hilos
@@ -194,6 +194,8 @@ def health():
     return clean({"ok": True, "status": radar.snapshot.get("status"), "last_cycle": ts, "fast": radar.fast_state,
             "armed": sorted(radar.armed), "uptime_min": round((time.time() - STARTED) / 60, 1),
             "perfil": perfil(),
+            "flujo": {"on": flujo.ON, "status": radar.flujo.snap.get("status"), "error": radar.flujo.snap.get("error"),
+                      "counts": radar.flujo.snap.get("counts"), "sigs": len(radar.flujo.sigs)},
             "cycle_s": radar.cycle_s, "context": {"on": radar.bg, "queue": len(radar.enrich_q),
                                                   "halts_age_s": round(time.time() - radar.halts_ts) if radar.halts_ts else None},
             "mem": {"rss_mb": rss, "pct": memory.pct(rss), "limit_mb": memory.LIMIT_MB}, "bridge": radar.bridge.status(),
