@@ -658,6 +658,7 @@ class Radar:
             sq.update(bio_q)
             for s in bio:
                 cand.setdefault(s, set()).add("biotech")
+        self.bio_set = set(bio)  # para la lista: las de Biotech salen primero
         r = yahoo.retry(lambda: yahoo.yf.screen(custom, size=150, sortField="percentchange", sortAsc=False), tries=2, what="screen subidas")
         for q in yahoo._quotes(r):
             add(q.get("symbol"), "subidas")
@@ -739,6 +740,19 @@ class Radar:
         self.universe_ts = time.time()
         log.info("universo: %d candidatos, %d cotizados → %d en seguimiento%s", len(cand), len(quotes), len(uni),
                  f" (foco {foco.INDUSTRIA}: {len(bio)} en la industria)" if foco.activo() else "")
+
+    def _flow(self, s: str, q: dict, bars_s, now: datetime, phase: str) -> dict | None:
+        """Entradas/salidas y ballenas estimadas de hoy, con el mismo cálculo del radar de flujo. Solo informa."""
+        if bars_s is None:
+            return None
+        try:
+            prev = fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
+            live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
+            fm = flujo.metrics(bars_s, prev, live, now)
+            return fm["flow"] if fm else None
+        except Exception as e:  # noqa: BLE001
+            log.debug("flujo estimado %s: %s", s, e)
+            return None
 
     def _biotech(self, Q, exch) -> tuple[set, dict]:
         """Acciones de la industria del foco (subidas y volumen de Yahoo). Si la pantalla falla, se usa la última buena:
@@ -962,7 +976,7 @@ class Radar:
                 self.sources.setdefault(s, ["ibkr"])
         # Las señales y órdenes armadas abiertas se siguen aunque su acción salga del universo (antes, SITC dejó de
         # seguirse a los 6 minutos de su COMPRA del 1-oct: sin avisos de stop ni de objetivo).
-        active = [s for s, x in list(self.trades.items()) + list(self.arms.items())
+        active =[s for s, x in list(self.trades.items()) + list(self.arms.items())
                   if x.get("status") in ("pendiente", "abierta", "t1")]
         syms = list(dict.fromkeys(self.universe + active + ["SPY", "QQQ"]))
         self.ensure_context(syms, today)
@@ -982,13 +996,16 @@ class Radar:
         reg, reg_txt = regime(spy, qqq) if phase != "pre" else ("verde", "pre-market")
         watch = set(load_watchlist())
         base = {}
+        bio_set = getattr(self, "bio_set", set())  # foco biotech: la lista pone primero a las de la industria
         for s in self.universe:
             q = quotes.get(s, {})
             m = mets(s)
+            if m.get("px"):  # flujo estimado (entradas/salidas y ballenas) para mostrar; no entra en la decisión
+                m["flow_est"] = self._flow(s, q, bars.get(s), now, phase)
             spread = sane_spread(fnum(q.get("bid")), fnum(q.get("ask")), m.get("px"), m.get("rng1m"))
             h = halted.get(s)
             ctx = {"phase": phase, "regime": reg, "spy_chg": spy.get("chg"), "spread": spread, "atr": self.atr.get(s),
-                   "halted": h if h and not h["resumed"] else None,
+                   "halted": h if h and not h["resumed"] else None, "bio": s in bio_set,
                    "name": q.get("shortName") or q.get("longName") or self.names.get(s), "watch": s in watch}
             if h and h["code"] == "T1":
                 ctx["cat"] = {"type": "halt_news", "age": "fresh", "title": f"halt T1 {h['time']}"}
@@ -1030,7 +1047,8 @@ class Radar:
         for r in rows:
             r["src"] = self.sources.get(r["t"], [])
         rank = {"COMPRA": 0, "ESPERA": 1, "NO": 2}
-        rows.sort(key=lambda r: (rank[r["decision"]], -((r["chg"] or 0) if phase == "pre" else r["score"])))
+        rows.sort(key=lambda r: (rank[r["decision"]], not r.get("bio"),
+                                 -((r["chg"] or 0) if phase == "pre" else r["score"])))
         self._track(rows, bars, t_et, reg_txt)
         # "Mejor opción" solo existe si hay COMPRA: un ESPERA con plan arriba se leía como orden de compra (ACN, 1-oct)
         best = next((r for r in rows if r["decision"] == "COMPRA"), None)

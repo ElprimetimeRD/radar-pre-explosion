@@ -163,7 +163,8 @@ def decide(t: str, m: dict, ctx: dict) -> dict:
     out = {"t": t, "name": ctx.get("name"), "px": px, "chg": m.get("chg"), "score": score, "why": why,
            "rvol": m.get("rvol"), "ext": m.get("ext"), "vwap": m.get("vwap"), "orh": m.get("orh"),
            "hod": m.get("hod"), "pmh": m.get("pm_high"), "atr": ctx.get("atr"), "spread": ctx.get("spread"),
-           "whale": m.get("whale"), "cat": ctx.get("cat"), "watch": bool(ctx.get("watch")), "plan": None,
+           "whale": m.get("whale"), "flow": m.get("flow_est"), "bio": bool(ctx.get("bio")),
+           "cat": ctx.get("cat"), "watch": bool(ctx.get("watch")), "plan": None,
            "trigger": None, "level": None}
 
     out["rvol15"] = m.get("rvol15")
