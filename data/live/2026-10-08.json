@@ -53,7 +53,7 @@
    "t": "ODTX",
    "day": "2026-10-08",
    "time": "10:29",
-   "m": 903,
+   "m": 957,
    "entry": 17.943,
    "stop": 17.3219,
    "t1": 18.3719,
@@ -64,15 +64,16 @@
    "valid_m": null,
    "perfil": "volatil",
    "atr": 10.49,
-   "status": "t1",
+   "status": "cierre",
    "hit1": true,
    "mfe": 2.44,
    "mae": -1.41,
-   "last": 18.059999465942383,
+   "last": 18.100000381469727,
    "level": 17.885,
    "slip": 0.32,
    "lag_min": 5,
-   "t1_m": 737
+   "t1_m": 737,
+   "close_pct": 0.87
   },
   {
    "t": "ABVX",
@@ -225,7 +226,7 @@
    "t": "ARGX",
    "day": "2026-10-08",
    "time": "12:29",
-   "m": 906,
+   "m": 928,
    "kind": "armada",
    "order": "stop",
    "level": 832.24,
@@ -239,11 +240,12 @@
    "limit": false,
    "valid_m": 930,
    "perfil": "volatil",
-   "status": "pendiente",
+   "status": "cancelada",
    "hit1": false,
    "mfe": 0.0,
    "mae": 0.0,
-   "last": 822.594970703125
+   "last": 823.469970703125,
+   "cancel": "después de 15:30: sin tiempo para +2 %"
   }
  ]
 }

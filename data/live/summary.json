@@ -13,7 +13,7 @@
   "t1": 6,
   "t2": 1,
   "stop": 7,
-  "cancelled": 31
+  "cancelled": 32
  },
  "byDay": [
   {
@@ -117,7 +117,7 @@
     "t1": 0,
     "t2": 0,
     "stop": 0,
-    "cancelled": 3
+    "cancelled": 4
    }
   }
  ],
