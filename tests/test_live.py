@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os as _os
 _os.environ.setdefault("RIESGO", "normal")  # pruebas con los umbrales de siempre; el perfil alto tiene su prueba
+_os.environ.setdefault("PAPER_ESTILO", "normal")
 
 from datetime import datetime, timedelta
 

@@ -3,6 +3,7 @@ comandos), live/tgbot.py (botón y comandos de Telegram) y su conexión con los 
 Uso: NO_LOOP=1 NO_NOTIFY=1 PYTHONPATH=. python tests/test_paper.py"""
 import os as _os
 _os.environ.setdefault("RIESGO", "normal")
+_os.environ.setdefault("PAPER_ESTILO", "normal")  # las pruebas de siempre usan el estilo normal; el penny tiene las suyas
 _os.environ.setdefault("NO_LOOP", "1")
 _os.environ.setdefault("NO_NOTIFY", "1")
 
@@ -62,6 +63,56 @@ def test_sin_ejecutor_no_hay_boton():
     assert P.qty_por_riesgo(500, 10.03, 0.30) == 20 and P.qty_por_riesgo(500, 10.03, 0.30, riesgo_usd=15) == 49
     assert P.qty_por_riesgo(500, 10.03, 0.30, riesgo_usd=0) == 49 and P.qty_por_riesgo(500, 0, 0.3) == 0   # sin tope: solo el presupuesto
     assert P.qty_por_riesgo(600, 10.0, 0.3) == 20 and P.qty_por_riesgo(5, 10.0, 0.3) == 0                  # (6 / 0.3 = 20 exactos)
+
+
+def test_estilo_penny():
+    """Estilo penny (8-oct): solo acciones de US$1 a US$5, compra de US$1,000, Trailing de 10 % en % (sube con el precio), sin
+    objetivo; topes 1,000 / 3 abiertas (US$3,000) / pérdida US$300 al día. Con PAPER_ESTILO=normal todo vuelve a como era."""
+    from unittest import mock
+    assert not P.es_penny() and P.topes() == {"orden_usd": 500.0, "riesgo_usd": 6.0, "max_abierto": 1000.0, "perdida_max": 100.0}
+    with mock.patch.object(P, "ESTILO", "penny"):
+        assert P.es_penny() and P.topes() == {"orden_usd": 1000.0, "riesgo_usd": 100.0, "max_abierto": 3000.0, "perdida_max": 300.0}
+        p, c = nuevo()
+        p.sync(OK, [])
+        o = arma(p, "PNY", 2.0)
+        assert o["boton"] and o["qty"] == 497 and o["limite"] == 2.01 and o["gatillo"] == 2.0, o      # US$998.97
+        assert o["trail"] == 0.2 and o["trail_pct"] == 10.0 and o["objetivo"] is None, o            # 10 %: lo manda la oferta, no el plan
+        assert arma(p, "SUB", 0.8) is None and arma(p, "ALT", 6.0) is None and arma(p, "BIG", 50.0) is None   # fuera de US$1–5
+        assert arma(p, "LOW", 1.0)["qty"] == 1000 and arma(p, "TOP", 5.0)["qty"] == 199               # los bordes entran
+        ok, txt = p.pedir(o["id"])
+        assert ok and "PNY 497 acc" in txt, txt
+        r = p.sync(OK, [])
+        (x,) = r["ordenes"]
+        assert x["trail_pct"] == 10.0 and x["objetivo"] is None and x["qty"] == 497 and x["trail"] == 0.2, x
+        assert r["limites"]["orden_usd"] == 1000 and r["limites"]["riesgo_usd"] == 100 and r["limites"]["max_abierto"] == 3000
+        assert r["limites"]["perdida_max"] == 300 and r["limites"]["cierre_m"] == P.CIERRE_M, r["limites"]
+        p.sync(OK, [{"id": o["id"], "ev": "puesta", "t": "PNY", "detalle": "· 497 acc · compra stop 2.00 (límite 2.01) · Trailing 10 %"}])
+        p.sync({**OK, "comprometido": 997.0}, [{"id": o["id"], "ev": "llena", "px": 2.0, "qty": 497}])
+        m = [x[1] for x in p.tomar_msgs()]
+        assert "compré 497 PNY a 2.00" in m[1] and "Trailing de 10 %" in m[1] and "objetivo" not in m[1], m
+        # hasta 3 abiertas (US$3,000): la cuarta ya no cabe; y la pérdida del día (US$300) también se cuida
+        p2, c2 = nuevo()
+        p2.sync(OK, [])
+        ofs = [arma(p2, t, 3.37) for t in ("AAA", "BBB", "CCC", "DDD")]      # 295 acc: el monto del Trailing va redondeado (0.34)
+        assert ofs[0]["qty"] == 295 and ofs[0]["trail"] == 0.34
+        assert all(p2.pedir(x["id"])[0] for x in ofs[:3])                     # pero la pérdida se cuenta con el 10 % exacto
+        ok, txt = p2.pedir(ofs[3]["id"])
+        assert not ok and "3,000 comprometidos" in txt, txt
+        p3, c3 = nuevo()
+        p3.sync({**OK, "perdida_dia": 250.0}, [])
+        ok, txt = p3.pedir(arma(p3, "AAA", 2.0)["id"])
+        assert not ok and "pérdida máxima del día (US$300)" in txt, txt
+        assert "Estilo penny" in p.ayuda() and "US$3,000 comprometidos" in p.ayuda() and "Trailing de 10 %" in p.ayuda()
+        # automático: la orden sale sola y la nota lo dice
+        p4, c4 = nuevo("auto")
+        p4.sync(OK, [])
+        oa = arma(p4, "AUT", 3.0)
+        assert oa["estado"] == "cola" and "penny" in oa["nota"] and "Trailing 10 %" in oa["nota"], oa
+        assert _detalle_ok(oa)
+
+
+def _detalle_ok(o):
+    return "Trailing 10 % (sin objetivo)" in P.Paper._detalle(o)
 
 
 def test_flujo_boton():
@@ -381,6 +432,7 @@ def test_endpoint_sync():
 
 if __name__ == "__main__":
     test_sin_ejecutor_no_hay_boton()
+    test_estilo_penny()
     test_flujo_boton()
     test_limites()
     test_modo_automatico()

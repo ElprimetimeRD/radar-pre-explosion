@@ -57,7 +57,7 @@ except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.7"
+VERSION = "1.9"
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "ejecutor.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
@@ -65,10 +65,14 @@ STATE_FILE = os.path.join(HERE, "ejecutor_paper.json")
 # ---- Candado y límites: fijos aquí, a propósito ----
 PUERTO = 4002            # IB Gateway en modo PAPER (la cuenta real usa 4001: este programa nunca se conecta ahí)
 CLIENT_ID = 41           # distinto del puente de datos (17) y de las pruebas (31, 32)
-ORDEN_USD = 500.0
-RIESGO_USD = 15.0        # v1.7: lo máximo que se pierde por operación si salta el stop (acciones × distancia del stop)
-MAX_ABIERTO = 1000.0
-PERDIDA_MAX = 100.0
+# v1.9 (8-oct, pedido de Priamo: penny stocks con compras de US$1,000 y Trailing de 10 %): US$1,000 por operación, ~US$100 de
+# pérdida posible por operación, hasta 3 abiertas y US$300 de pérdida al día. El ejecutor de Claude NO cambia: redefine los
+# suyos (500 / 15 / 1,000 / 100) en ejecutor_claude.py. Con el estilo normal del semáforo manda el límite más estricto (tope()).
+ORDEN_USD = 1000.0
+ESPERA_IB_S = 20          # v1.8: tope de espera de las llamadas bloqueantes a IBKR (0 = infinito, como antes)
+RIESGO_USD = 105.0       # lo máximo que se pierde por operación si salta el stop (acciones × distancia): 10 % de US$1,000 + 5 %
+MAX_ABIERTO = 3000.0
+PERDIDA_MAX = 300.0
 ENTRADA_INI_M = 9 * 60 + 30
 ENTRADA_FIN_M = 15 * 60 + 30   # tope propio = la última COMPRA que emite el semáforo; la hora real la manda el semáforo
                                # (ENTRY_END_M en Render) y el ejecutor toma siempre la más estricta de las dos
@@ -163,6 +167,16 @@ def configurar_log(archivo: str):
 
 DIARIO_COLS = ["fecha", "hora", "ejecutor", "evento", "simbolo", "qty", "px_entrada", "px_salida", "pnl_usd",
                "comision_usd", "riesgo_usd", "R", "por", "setup", "motivo"]
+
+
+
+def riesgo_u(o: dict) -> float:
+    """Lo que se pierde por acción si salta el stop. Con Trailing en % es el % exacto de la compra (el monto en centavos
+    de o["trail"] solo sirve de referencia y redondea hacia arriba: con 3 abiertas sumaría de más)."""
+    pct, lim = o.get("trail_pct"), o.get("limite")
+    if pct and lim:
+        return float(lim) * float(pct) / 100
+    return float(o.get("trail") or 0.0)
 
 
 class Ejecutor:
@@ -267,6 +281,7 @@ class Ejecutor:
             self.ib.errorEvent += self.on_error
             self.ib.disconnectedEvent += self.on_disconnect
             self._hooked = True
+        self.ib.RequestTimeout = 0   # conectar y reconciliar usan sus propios tiempos (con tope aquí, la conexión falla)
         try:
             self.ib.connect("127.0.0.1", PUERTO, clientId=self.CLIENT_ID, timeout=15)
         except Exception as e:  # noqa: BLE001 (rechazada, tiempo agotado, errores de la API)
@@ -285,6 +300,9 @@ class Ejecutor:
             return False
         self.bloqueado, self.paper, self.cuenta, self.err_ib = None, True, cuentas[0], None
         self.reconciliar()
+        # Sin tope, una llamada a IBKR que el Gateway no contesta (p. ej. validar un símbolo) espera para siempre y el
+        # ejecutor queda mudo con la ventana abierta (6-oct: 9:37 y 11:20). Con tope, falla a los ESPERA_IB_S y sigue.
+        self.ib.RequestTimeout = ESPERA_IB_S
         log.info("Conectado a IB Gateway PAPER (cuenta %s).", self.cuenta)
         return True
 
@@ -321,12 +339,19 @@ class Ejecutor:
                 o["qty"], o["limite"] = int(order.totalQuantity or 0), fnum(order.lmtPrice) or 0.0
                 if o.get("stop") and o["limite"]:
                     o["trail"] = round(max(0.0, o["limite"] - o["stop"]), 2)
+                elif o.get("trail_pct") and o["limite"]:    # la hija Trailing en % pudo llegar antes que la compra
+                    o["trail"] = round(o["limite"] * o["trail_pct"] / 100, 2)
             elif rol == "t":
                 if getattr(order, "orderType", "") == "STP":     # stop fijo: auxPrice es el precio, no la distancia
                     o["stop"] = fnum(order.auxPrice) or 0.0
                     o["trail"] = round(max(0.0, (o.get("limite") or 0.0) - o["stop"]), 2) if o.get("limite") else 0.0
                 else:
-                    o["trail"] = fnum(order.auxPrice) or 0.0
+                    pct = fnum(getattr(order, "trailingPercent", None))
+                    if pct is not None and 0 < pct < 1e6:      # Trailing en %: auxPrice viene sin valor (1.8e308)
+                        o["trail_pct"] = pct
+                        o["trail"] = round(o["limite"] * pct / 100, 2) if o.get("limite") else 0.0
+                    else:
+                        o["trail"] = fnum(order.auxPrice) or 0.0
 
     # ---------------- cuentas: lo que IBKR ejecutó es la verdad ----------------
     def ejecs(self, oid: str, roles: str) -> list:
@@ -360,10 +385,10 @@ class Ejecutor:
             if pendiente:
                 falta = max(0.0, (o.get("qty") or 0) - qe)
                 comp += falta * (o.get("limite") or 0)
-                riesgo += falta * (o.get("trail") or 0)
+                riesgo += falta * riesgo_u(o)
             if ab > EPS and pb:
                 comp += ab * pb
-                riesgo += ab * (o.get("trail") or 0)
+                riesgo += ab * riesgo_u(o)
                 pos.append({"t": o["t"], "qty": ab, "px": round(pb, 4)})
             if qs > 0 and pb and ps:
                 pnl += qs * (ps - pb)
@@ -419,8 +444,12 @@ class Ejecutor:
         if not SYM.fullmatch(o["t"] or ""):
             return "símbolo inválido"
         lim, trail, obj, qty, gat = o["limite"], o["trail"], o["objetivo"], o["qty"], o["gatillo"]
-        if not (lim and lim > 0 and trail and trail > 0 and obj and obj > lim and qty >= 1):
+        pct = o.get("trail_pct")     # Trailing en % (estilo penny): sin objetivo, el stop sube con el precio
+        obj_ok = obj is None if pct is not None else bool(obj and lim and obj > lim)
+        if not (lim and lim > 0 and trail and trail > 0 and obj_ok and qty >= 1):
             return "orden incompleta o inválida"
+        if pct is not None and not (0 < pct <= 25 and abs(trail - lim * pct / 100) < 0.011):
+            return "Trailing en % inválido"
         if o.get("stop") is not None and not (0 < o["stop"] < lim and abs(lim - o["stop"] - trail) < 0.011):
             return "stop fijo inválido"
         if o["tipo"] not in ("stp", "lmt") or (o["tipo"] == "stp" and not (gat and 0 < gat <= lim)):
@@ -431,8 +460,9 @@ class Ejecutor:
         if costo > self.tope("orden_usd", self.ORDEN_USD) + 0.01:
             return f"US${costo:,.0f} pasa del máximo de US${self.tope('orden_usd', self.ORDEN_USD):,.0f} por operación"
         rmax = self.tope("riesgo_usd", self.RIESGO_USD)
-        if qty * trail > rmax * 1.05 + 0.01:   # 5 %: el stop llega redondeado a centavos
-            return f"perdería US${qty * trail:,.2f} si salta el stop, más del máximo de US${rmax:,.0f} por operación"
+        rqty = qty * riesgo_u(o)
+        if rqty > rmax * 1.05 + 0.01:   # 5 %: el stop llega redondeado a centavos
+            return f"perdería US${rqty:,.2f} si salta el stop, más del máximo de US${rmax:,.0f} por operación"
         res = self.resumen()
         if o["t"] in res["vivas_t"]:
             return f"ya hay una orden o posición en {o['t']}"
@@ -440,7 +470,7 @@ class Ejecutor:
         if res["comprometido"] + costo > tope + 0.01:
             return f"pasaría de US${tope:,.0f} comprometidos (ya hay US${res['comprometido']:,.0f})"
         pmax = self.tope("perdida_max", self.PERDIDA_MAX)
-        if res["perdida_dia"] + res["riesgo_abierto"] + qty * trail > pmax + 0.01:
+        if res["perdida_dia"] + res["riesgo_abierto"] + rqty > pmax + 0.01:
             return f"podría pasar la pérdida máxima del día (US${pmax:,.0f})"
         if sum(1 for x in self.ord.values() if x.get("oids", {}).get("e")) >= self.MAX_ORDENES_DIA:
             return f"ya puse {self.MAX_ORDENES_DIA} órdenes hoy"
@@ -460,7 +490,7 @@ class Ejecutor:
         try:
             t = et(self.reloj())
             qty = fnum(kw.get("qty")) or 0.0
-            riesgo = qty * (o.get("trail") or 0.0)
+            riesgo = qty * riesgo_u(o)
             pnl = fnum(kw.get("pnl"))
             com = sum(float(getattr(getattr(f, "commissionReport", None), "commission", 0) or 0)
                       for f in self.ib.fills() if self.ref_re.fullmatch(getattr(f.execution, "orderRef", "") or "")
@@ -507,6 +537,8 @@ class Ejecutor:
         if o.get("stop"):
             return (f"· {o['qty']} acc · {compra} · stop {o['stop']:.2f} · objetivo {o['objetivo']:.2f}"
                     + (f" · {o['setup']}" if o.get("setup") else ""))
+        if o.get("trail_pct"):
+            return f"· {o['qty']} acc · {compra} · Trailing {o['trail_pct']:g} % (sin objetivo)"
         return f"· {o['qty']} acc · {compra} · Trailing {o['trail']:.2f} · objetivo {o['objetivo']:.2f}"
 
     def _trade(self, order_id):
@@ -563,7 +595,8 @@ class Ejecutor:
         hasta = fnum(raw.get("hasta")) or 0
         o = {"id": oid, "t": str(raw.get("t") or "").upper().strip(), "tipo": raw.get("tipo"),
              "gatillo": fnum(raw.get("gatillo")), "limite": fnum(raw.get("limite")), "trail": fnum(raw.get("trail")),
-             "objetivo": fnum(raw.get("objetivo")), "qty": int(fnum(raw.get("qty")) or 0),
+             "objetivo": fnum(raw.get("objetivo")), "trail_pct": fnum(raw.get("trail_pct")),
+             "qty": int(fnum(raw.get("qty")) or 0),
              "hasta": min(hasta, et_ts(now, fin)) if hasta else 0, "estado": "nueva", "oids": {}, "recibida": now}
         if raw.get("stop") is not None:
             o["stop"] = fnum(raw.get("stop"))      # stop fijo en vez de Trailing (ejecutor de Claude)
@@ -606,16 +639,22 @@ class Ejecutor:
         if o.get("stop"):   # stop fijo (nativo de IBKR): sale al mercado si el precio toca el nivel
             t = Order(action="SELL", totalQuantity=o["qty"], orderType="STP", auxPrice=o["stop"], parentId=e.orderId,
                       tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-t", transmit=False)
+        elif o.get("trail_pct"):   # Trailing en %: sube con el precio, sin objetivo; es la última hija y la que transmite
+            t = Order(action="SELL", totalQuantity=o["qty"], orderType="TRAIL", trailingPercent=o["trail_pct"],
+                      parentId=e.orderId, tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-t", transmit=o.get("objetivo") is None)
         else:
             t = Order(action="SELL", totalQuantity=o["qty"], orderType="TRAIL", auxPrice=o["trail"], parentId=e.orderId,
                       tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-t", transmit=False)
         self.ib.placeOrder(c, t)
-        ob = Order(action="SELL", totalQuantity=o["qty"], orderType="LMT", lmtPrice=o["objetivo"], parentId=e.orderId,
-                   tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-o", transmit=True)
-        self.ib.placeOrder(c, ob)
+        ob = None
+        if o.get("objetivo") is not None:
+            ob = Order(action="SELL", totalQuantity=o["qty"], orderType="LMT", lmtPrice=o["objetivo"], parentId=e.orderId,
+                       tif="DAY", orderRef=f"{self.PREFIJO}-{oid}-o", transmit=True)
+            self.ib.placeOrder(c, ob)
         o["oids"] = {}
         for rol, x in (("e", e), ("t", t), ("o", ob)):
-            self._rol(o, rol, x.orderId)
+            if x is not None:
+                self._rol(o, rol, x.orderId)
         o["estado"], o["puesta"], o["gtd"] = "puesta", self.reloj(), con_gtd
 
     # ---------------- cancelar, ajustar, vender ----------------

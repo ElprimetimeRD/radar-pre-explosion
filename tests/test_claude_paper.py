@@ -4,6 +4,7 @@ lo que comparte con el ejecutor de Priamo, marcador y vigilancia de caídas), su
 Uso: NO_LOOP=1 NO_NOTIFY=1 PYTHONPATH=. python tests/test_claude_paper.py"""
 import os as _os
 _os.environ.setdefault("RIESGO", "normal")
+_os.environ.setdefault("PAPER_ESTILO", "normal")  # las pruebas de siempre usan el estilo normal; el penny tiene las suyas
 _os.environ.setdefault("NO_LOOP", "1")
 _os.environ.setdefault("NO_NOTIFY", "1")
 
@@ -36,6 +37,16 @@ def nuevo():
     c = Clock(T0)
     p = P.Paper(modo="boton", clock=c)
     return p, C.ClaudePaper(p, clock=c), c
+
+
+def test_penny_no_toca_a_claude():
+    """El estilo penny de Priamo (US$1,000, 3 abiertas, US$300) es solo de su ejecutor: los topes de Claude siguen en 500/1,000/100."""
+    from unittest import mock
+    with mock.patch.object(P, "ESTILO", "penny"):
+        p, cp, c = nuevo()
+        res = cp.sync(OKC, [], dia=DIA)
+        assert res["limites"] == {"orden_usd": 500.0, "max_abierto": 1000.0, "perdida_max": 100.0}, res
+        assert "US$1,000" in cp.estado_txt() and "US$3,000" not in cp.estado_txt() and "US$300" not in cp.estado_txt()
 
 
 def test_sync_y_mensajes():
@@ -305,6 +316,7 @@ def test_endpoint_claude():
 
 
 if __name__ == "__main__":
+    test_penny_no_toca_a_claude()
     test_sync_y_mensajes()
     test_limpiar_estado()
     test_comparte_pausa_y_cierre()

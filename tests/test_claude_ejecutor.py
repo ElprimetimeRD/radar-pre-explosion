@@ -336,6 +336,13 @@ def test_cierre_1555_y_reinicio():
     assert C.cargar_lista(p) == ["NVDA", "AMD"] and "NVDA" in C.cargar_lista("no_existe.txt")
 
 
+def test_topes_de_claude_no_cambian():
+    """v1.5: los topes del ejecutor de Priamo subieron (penny: 1,000 / 105 / 3,000 / 300); los de Claude siguen en 500 / 15 / 1,000 / 100."""
+    assert (C.EjecutorClaude.ORDEN_USD, C.EjecutorClaude.RIESGO_USD) == (500.0, 15.0)
+    assert (C.EjecutorClaude.MAX_ABIERTO, C.EjecutorClaude.PERDIDA_MAX) == (1000.0, 100.0)
+    assert (E.Ejecutor.ORDEN_USD, E.Ejecutor.RIESGO_USD, E.Ejecutor.MAX_ABIERTO, E.Ejecutor.PERDIDA_MAX) == (1000.0, 105.0, 3000.0, 300.0)
+
+
 def test_datos_viejos_segun_el_ritmo_del_lector():
     """Si Yahoo limita y el lector va más despacio, la última vela es más vieja a propósito: se tolera en la misma medida."""
     ex, ib, clock, posted, resp, feed = nuevo()
@@ -348,6 +355,7 @@ def test_datos_viejos_segun_el_ritmo_del_lector():
 
 
 if __name__ == "__main__":
+    test_topes_de_claude_no_cambian()
     test_orden_con_stop_fijo()
     test_no_toca_lo_ajeno()
     test_no_se_mezcla_con_sem()
