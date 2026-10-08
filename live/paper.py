@@ -14,6 +14,13 @@
   nunca compra después de las 15:30 ET), una sola orden viva por acción, y a las 15:55 ET el ejecutor cancela lo suyo y
   vende lo que compró.
 
+Estilo `penny` (PAPER_ESTILO, por defecto desde el 8-oct-2026; `normal` vuelve al de antes): solo las órdenes de TU ejecutor
+(no cambia el de Claude ni lo que dicen los avisos de dinero real). Solo penny stocks (US$1 a US$5), compras de US$1,000
+(PENNY_USD) con límite en la entrada y un Trailing de 10 % (PENNY_STOP_PCT) que sube con el precio y SIN objetivo fijo: el
+stop se mueve hacia arriba hasta que el precio retrocede el 10 % desde su máximo (o se vende a las 15:55 ET). Pérdida si salta
+el stop del primer momento: ~US$100 por operación; topes: US$3,000 comprometidos (PENNY_MAX_ABIERTO) y US$300 de pérdida al día
+(PENNY_PERDIDA_MAX).
+
 Lógica pura (sin red): la prueban tests/test_paper.py.
 """
 from __future__ import annotations
@@ -34,6 +41,14 @@ ORDEN_USD = float(os.environ.get("ORDEN_USD", "500"))
 RIESGO_USD = float(os.environ.get("RIESGO_USD", "6"))
 MAX_ABIERTO = float(os.environ.get("PAPER_MAX_ABIERTO", "1000"))
 PERDIDA_MAX = float(os.environ.get("PAPER_PERDIDA_MAX", "100"))
+# Estilo penny (solo tu ejecutor paper; el de Claude sigue con los topes de arriba)
+ESTILO = os.environ.get("PAPER_ESTILO", "penny").strip().lower()
+PENNY_USD = float(os.environ.get("PENNY_USD", "1000"))                 # dinero por orden
+PENNY_STOP_PCT = float(os.environ.get("PENNY_STOP_PCT", "10"))         # Trailing en %: el stop sube con el precio
+PENNY_PX_MIN = float(os.environ.get("PENNY_PX_MIN", "1"))              # precio de entrada mínimo (debajo de US$1 el spread y el paper engañan)
+PENNY_PX_MAX = float(os.environ.get("PENNY_PX_MAX", "5"))              # y máximo: penny stock = menos de US$5
+PENNY_MAX_ABIERTO = float(os.environ.get("PENNY_MAX_ABIERTO", "3000"))
+PENNY_PERDIDA_MAX = float(os.environ.get("PENNY_PERDIDA_MAX", "300"))
 ENTRADA_INI_M = 9 * 60 + 30
 ENTRADA_FIN_M = int(os.environ.get("ENTRY_END_M", str(12 * 60)))  # el mismo corte que las COMPRA del semáforo
 CIERRE_M = 15 * 60 + 55
@@ -67,6 +82,25 @@ def qty_por_riesgo(usd: float, limite: float, trail: float, riesgo_usd: float | 
     if tope and tope > 0 and trail and trail > 0:
         qty = min(qty, int(tope / trail + 1e-9))
     return max(qty, 0)
+
+
+def riesgo_u(o: dict) -> float:
+    """Pérdida por acción si salta el stop: con Trailing en % es el % exacto de la compra (o["trail"] va redondeado a centavos)."""
+    if o.get("trail_pct") and o.get("limite"):
+        return o["limite"] * o["trail_pct"] / 100
+    return o["trail"]
+
+
+def es_penny() -> bool:
+    return ESTILO == "penny"
+
+
+def topes() -> dict:
+    """Los topes de dinero de ESTE ejecutor (el tuyo): con el estilo penny, los de las compras de US$1,000 con stop de 10 %."""
+    if es_penny():
+        return {"orden_usd": PENNY_USD, "riesgo_usd": round(PENNY_USD * PENNY_STOP_PCT / 100, 2),
+                "max_abierto": PENNY_MAX_ABIERTO, "perdida_max": PENNY_PERDIDA_MAX}
+    return {"orden_usd": ORDEN_USD, "riesgo_usd": RIESGO_USD, "max_abierto": MAX_ABIERTO, "perdida_max": PERDIDA_MAX}
 
 
 def et_min(ts: float) -> int:
@@ -132,19 +166,20 @@ class Paper:
             return f"fuera del horario de compras ({hhmm(ENTRADA_INI_M)}–{hhmm(ENTRADA_FIN_M)} ET)"
         if o.get("hasta") and now > o["hasta"]:
             return "la orden ya venció"
+        T = topes()
         if self.ex.get("parado"):
-            return f"ya se perdió el máximo del día (US${PERDIDA_MAX:,.0f})"
+            return f"ya se perdió el máximo del día (US${T['perdida_max']:,.0f})"
         if self.viva(o["t"], excluir=o["id"]):
             return f"ya hay una orden o posición en {o['t']}"
         cola = [x for x in self._en_cola() if x["id"] != o["id"]]
         comp = (_num(self.ex.get("comprometido")) or 0) + sum(x["qty"] * x["limite"] for x in cola)
         costo = o["qty"] * o["limite"]
-        if comp + costo > MAX_ABIERTO + 0.01:
-            return f"pasaría de US${MAX_ABIERTO:,.0f} comprometidos (ya hay US${comp:,.0f})"
+        if comp + costo > T["max_abierto"] + 0.01:
+            return f"pasaría de US${T['max_abierto']:,.0f} comprometidos (ya hay US${comp:,.0f})"
         riesgo = ((_num(self.ex.get("perdida_dia")) or 0) + (_num(self.ex.get("riesgo_abierto")) or 0)
-                  + sum(x["qty"] * x["trail"] for x in cola) + o["qty"] * o["trail"])
-        if riesgo > PERDIDA_MAX + 0.01:
-            return f"podría pasar la pérdida máxima del día (US${PERDIDA_MAX:,.0f})"
+                  + sum(x["qty"] * riesgo_u(x) for x in cola) + o["qty"] * riesgo_u(o))
+        if riesgo > T["perdida_max"] + 0.01:
+            return f"podría pasar la pérdida máxima del día (US${T['perdida_max']:,.0f})"
         return None
 
     # ---------------- ofertas (una por aviso) ----------------
@@ -157,13 +192,25 @@ class Paper:
         if not self.disponible(now) or not entry or not stop or stop >= entry or not limite or limite <= 0:
             return None
         limite = round(limite, 2)
-        trail = max(0.01, round(entry - stop, 2))
-        qty = qty_por_riesgo(ORDEN_USD, limite, trail)
+        pct = None
+        if es_penny():
+            # Penny stocks: compra de PENNY_USD y Trailing de PENNY_STOP_PCT %, sin objetivo (el stop sube con el precio).
+            # El stop y el objetivo del plan del semáforo no se usan: aquí manda el 10 %. Fuera de US$1–5 no hay orden.
+            if not PENNY_PX_MIN <= entry <= PENNY_PX_MAX:
+                return None
+            pct = PENNY_STOP_PCT
+            trail = max(0.01, round(limite * pct / 100, 2))
+            qty = int(PENNY_USD // limite)
+            objetivo = None
+        else:
+            trail = max(0.01, round(entry - stop, 2))
+            qty = qty_por_riesgo(ORDEN_USD, limite, trail)
+            objetivo = round(t2 or entry * 1.05, 2)
         if qty < 1:
             return None
         o = {"id": secrets.token_hex(4), "kind": kind, "t": t, "tipo": "stp" if gatillo else "lmt",
-             "gatillo": round(gatillo, 2) if gatillo else None, "limite": limite, "trail": trail,
-             "objetivo": round(t2 or entry * 1.05, 2), "qty": qty, "hasta": hasta or now + OFERTA_TTL.get(kind, 120),
+             "gatillo": round(gatillo, 2) if gatillo else None, "limite": limite, "trail": trail, "trail_pct": pct,
+             "objetivo": objetivo, "qty": qty, "hasta": hasta or now + OFERTA_TTL.get(kind, 120),
              "creada": now, "estado": "oferta"}
         with self.lock:
             self._purgar(now)
@@ -176,7 +223,9 @@ class Paper:
                     o["estado"], o["nota"] = "omitida", f"🤖 Paper: no la puse, {motivo}."
                 else:
                     o["estado"], o["pedida"] = "cola", now
-                    o["nota"] = "🤖 Paper: orden enviada a IBKR (modo automático)."
+                    o["nota"] = ("🤖 Paper: orden enviada a IBKR (modo automático)." if not pct else
+                                 f"🤖 Paper: orden penny enviada a IBKR: {qty} acc (~US${qty * limite:,.0f}) con Trailing "
+                                 f"{pct:g} % que sube con el precio.")
             else:
                 o["boton"] = True
             return dict(o)
@@ -246,13 +295,12 @@ class Paper:
                 if o["estado"] in ("cola", "enviada") and not o.get("cancelar"):
                     o["estado"] = "enviada"
                     ordenes.append({k: o[k] for k in ("id", "t", "tipo", "gatillo", "limite", "trail", "objetivo",
-                                                      "qty", "hasta")})
+                                                      "qty", "hasta")} | {"trail_pct": o.get("trail_pct")})
             cancelar = [o["id"] for o in self.ofertas.values() if o.get("cancelar") and o["estado"] in ("enviada", "puesta")]
             return {"ordenes": ordenes, "cancelar": cancelar, "pausa": self.pausa, "modo": self.modo,
                     "cerrar_id": self.cerrar_id,
                     "cerrar_hace_s": round(now - self.cerrar_ts, 1) if self.cerrar_id else None,
-                    "limites": {"orden_usd": ORDEN_USD, "riesgo_usd": RIESGO_USD, "max_abierto": MAX_ABIERTO,
-                                "perdida_max": PERDIDA_MAX, "entrada_ini_m": ENTRADA_INI_M, "entrada_fin_m": ENTRADA_FIN_M,
+                    "limites": {**topes(), "entrada_ini_m": ENTRADA_INI_M, "entrada_fin_m": ENTRADA_FIN_M,
                                 "cierre_m": CIERRE_M}}
 
     def adoptar_pausa(self, estado: dict | None):
@@ -313,7 +361,8 @@ class Paper:
             if o:
                 o["estado"], o["px_e"], o["qty_e"] = "llena", px, qty
             self._msg(f"paper:{oid}:llena", f"📥 Paper: compré {qty or 0:g} {t} a {px or 0:.2f}. "
-                                             f"Lo cuida el stop que sube y el objetivo.")
+                                             + ("Lo cuida el Trailing de " + f"{o['trail_pct']:g} %" + " que sube con el precio."
+                                                if o and o.get("trail_pct") else "Lo cuida el stop que sube y el objetivo."))
         elif ev == "salida":
             pnl, pe = _num(e.get("pnl")), _num(e.get("px_e")) or (o or {}).get("px_e")
             if o:
@@ -333,7 +382,7 @@ class Paper:
             self._msg(f"paper:{oid}:cancelada", f"⌛ Paper: cancelé la compra de {t} ({motivo or 'sin activarse'}).")
         elif ev == "parada":
             self._msg(f"paper:parada:{e.get('dia') or ''}", f"⛔ Paper: se llegó a la pérdida máxima del día "
-                                                            f"(US${PERDIDA_MAX:,.0f}). No pongo más órdenes hoy.")
+                                                            f"(US${topes()['perdida_max']:,.0f}). No pongo más órdenes hoy.")
         elif ev == "cierre":
             self._msg(f"paper:cierre:{e.get('dia') or ''}:{e.get('motivo') or ''}",
                       f"⏰ Paper: cerré todo ({motivo or 'fin del día'}).")
@@ -344,6 +393,8 @@ class Paper:
     def _detalle(o: dict) -> str:
         compra = (f"compra stop {o['gatillo']:.2f} (límite {o['limite']:.2f})" if o.get("gatillo")
                   else f"compra límite {o['limite']:.2f}")
+        if o.get("trail_pct"):
+            return f"· {o['qty']} acc · {compra} · Trailing {o['trail_pct']:g} % (sin objetivo)"
         return f"· {o['qty']} acc · {compra} · Trailing {o['trail']:.2f} · objetivo {o['objetivo']:.2f}"
 
     # ---------------- comandos de Telegram ----------------
@@ -403,9 +454,12 @@ class Paper:
                 "/auto · pongo cada ARMA y COMPRA sin preguntarte\n/boton · solo las que toques\n"
                 "/cerrar · cancelo y vendo todo ya (también lo de Claude)\n"
                 "/claude · cómo va el ejecutor de Claude\n/marcador · el día: tú contra Claude\n"
-                f"Límites: US${ORDEN_USD:,.0f} por operación (y no más de US${RIESGO_USD:,.0f} de pérdida si salta el stop) · "
-                f"US${MAX_ABIERTO:,.0f} comprometidos · pérdida máx "
-                f"US${PERDIDA_MAX:,.0f} al día · compras {hhmm(ENTRADA_INI_M)}–{hhmm(ENTRADA_FIN_M)} ET · "
+                + (f"Estilo penny: solo acciones de US${PENNY_PX_MIN:g} a US${PENNY_PX_MAX:g}, US${PENNY_USD:,.0f} por operación con "
+                   f"Trailing de {PENNY_STOP_PCT:g} % que sube con el precio (sin objetivo) · "
+                   if es_penny() else
+                   f"Límites: US${ORDEN_USD:,.0f} por operación (y no más de US${RIESGO_USD:,.0f} de pérdida si salta el stop) · ")
+                + f"US${topes()['max_abierto']:,.0f} comprometidos · pérdida máx "
+                f"US${topes()['perdida_max']:,.0f} al día · compras {hhmm(ENTRADA_INI_M)}–{hhmm(ENTRADA_FIN_M)} ET · "
                 f"cierro todo a las {hhmm(CIERRE_M)} ET.")
 
     def estado_txt(self, now: float | None = None) -> str:
@@ -424,8 +478,8 @@ class Paper:
                 lines.append("Ejecutor sin conexión: abre ARRANCAR_PAPER.bat en tu PC (abre IB Gateway paper y los dos ejecutores)")
             pnl = ex.get("pnl_dia")
             ops = f" · {ex['ops']} ops ({ex.get('gan') or 0} ganadas)" if ex.get("ops") else ""
-            lines.append(f"Comprometido US${ex.get('comprometido') or 0:,.0f} de US${MAX_ABIERTO:,.0f} · "
-                         f"P/L hoy {pnl or 0:+.2f} US${ops} · pérdida máx US${PERDIDA_MAX:,.0f}"
+            lines.append(f"Comprometido US${ex.get('comprometido') or 0:,.0f} de US${topes()['max_abierto']:,.0f} · "
+                         f"P/L hoy {pnl or 0:+.2f} US${ops} · pérdida máx US${topes()['perdida_max']:,.0f}"
                          + (" · ⛔ parado por pérdida" if ex.get("parado") else ""))
             pos = ex.get("posiciones") or []
             lines.append("Posiciones: " + (", ".join(f"{p['t']} {p['qty'] or 0:g} @{p['px'] or 0:.2f}" for p in pos)

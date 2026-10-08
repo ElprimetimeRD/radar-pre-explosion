@@ -37,7 +37,7 @@ import estrategia_claude as S  # noqa: E402
 from datos_yahoo import Feed  # noqa: E402
 from puente_ibkr import http_post, no_quickedit, read_env  # noqa: E402
 
-VERSION = "1.4"
+VERSION = "1.5"
 LOG_FILE = os.path.join(HERE, "ejecutor_claude.log")
 STATE_FILE = os.path.join(HERE, "ejecutor_claude.json")
 LISTA_FILE = os.path.join(HERE, "lista_claude.txt")
@@ -72,6 +72,8 @@ class EjecutorClaude(E.Ejecutor):
     RUTA = "/api/claude/sync"
     NOMBRE = "claude"
     DIARIO = "diario_cla.csv"
+    # Los topes de dinero de Claude no cambian con el estilo penny de Priamo (el motor trae los de su ejecutor desde la 1.9)
+    ORDEN_USD, RIESGO_USD, MAX_ABIERTO, PERDIDA_MAX = 500.0, 15.0, 1000.0, 100.0
     ENTRADA_INI_M = S.CFG.ini_m         # 9:50
     ENTRADA_FIN_M = S.CFG.fin_m         # 15:15 (los límites de dinero y el cierre de las 15:55 son los del motor)
 

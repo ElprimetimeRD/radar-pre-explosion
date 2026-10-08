@@ -142,7 +142,16 @@ def orden(oid="a1b2c3d4", t="ABC", px=10.0, tipo="stp", qty=None, hasta=None, **
     return o
 
 
-def nuevo(cuentas=("DUR233329",), now=T0, path=None):
+def orden_penny(oid="ab12cd34", t="PNY", px=2.0, pct=10.0, **kw):
+    """Oferta del estilo penny: US$1,000, Trailing en % que sube, sin objetivo."""
+    lim = round(px * 1.003, 2)
+    o = {"id": oid, "t": t, "tipo": "stp", "gatillo": px, "limite": lim, "trail": max(0.01, round(lim * pct / 100, 2)),
+         "trail_pct": pct, "objetivo": None, "qty": int(1000 // lim), "hasta": T0 + 3600}
+    o.update(kw)
+    return o
+
+
+def nuevo(cuentas=("DUR233329",), now=T0, path=None, penny=False):
     ib, clock, posted = FakeIB(cuentas), Clock(now), []
     resp = {"r": {}}
 
@@ -155,6 +164,8 @@ def nuevo(cuentas=("DUR233329",), now=T0, path=None):
     path = path or tempfile.mktemp(suffix=".json")
     ex = E.Ejecutor({"SEMAFORO_URL": "https://sem.test/", "BRIDGE_TOKEN": "clave"}, ib, post=post, reloj=clock,
                     estado_path=path)
+    if not penny:   # las pruebas de siempre corren con los topes de antes (500 / 15 / 1,000 / 100); el estilo penny trae los suyos
+        ex.ORDEN_USD, ex.RIESGO_USD, ex.MAX_ABIERTO, ex.PERDIDA_MAX = 500.0, 15.0, 1000.0, 100.0
     return ex, ib, clock, posted, resp
 
 
@@ -843,7 +854,8 @@ def test_windows_bloquea_archivos():
 def test_riesgo_por_operacion():
     """Tope de lo que se pierde si salta el stop (acciones × distancia del stop): propio US$15; el semáforo lo baja a US$6 y
     nunca lo sube. Más volatilidad (un stop más ancho) no puede ser más dinero en riesgo."""
-    assert E.RIESGO_USD == 15 and E.Ejecutor.RIESGO_USD == 15
+    assert E.RIESGO_USD == 105 and E.Ejecutor.RIESGO_USD == 105          # v1.9: los de Priamo (penny); el de Claude queda en 15
+    assert (E.ORDEN_USD, E.MAX_ABIERTO, E.PERDIDA_MAX) == (1000.0, 3000.0, 300.0)
     ex, ib, clock, posted, resp = nuevo()
     resp["r"] = {"ordenes": [orden("00000001", "AAA"),                              # 49 × 0.30 = US$14.70: pasa
                              orden("00000002", "BBB", trail=0.5)]}                  # 49 × 0.50 = US$24.50: más de US$15
@@ -913,6 +925,84 @@ def test_anota_limites():
     assert "US$500 (US$15) · US$1,000 · US$100 · compras 9:30–15:30 ET" in l[1], l[1]   # más holgado: rigen los propios
 
 
+def test_penny_trailing_porcentaje():
+    """v1.9 (estilo penny de Priamo): compra de ~US$1,000 con Trailing en % nativo de IBKR (el stop sube con el precio),
+    sin orden de objetivo; se reconstruye tras un reinicio; los topes propios son 1,000 / 105 / 3,000 / 300."""
+    ex, ib, clock, posted, resp = nuevo(penny=True)
+    resp["r"] = {"ordenes": [orden_penny()]}
+    ex.paso()
+    assert len(ib.placed) == 2, ib.placed                                   # compra + Trailing; no hay hija de objetivo
+    (c, e), (_, t) = ib.placed
+    assert (e.action, e.orderType, e.totalQuantity, e.auxPrice, e.lmtPrice, e.transmit) == ("BUY", "STP LMT", 497, 2.0, 2.01, False)
+    assert (t.action, t.orderType, t.totalQuantity, t.trailingPercent, t.parentId) == ("SELL", "TRAIL", 497, 10.0, e.orderId)
+    assert t.transmit is True and t.tif == "DAY" and not (0 < (t.auxPrice or 0) < 1e300)   # transmite al final; IBKR calcula el monto
+    oids = ex.ord["ab12cd34"]["oids"]
+    assert set(oids) == {"e", "t"} and e.orderRef == "sem-ab12cd34-e" and t.orderRef == "sem-ab12cd34-t"
+    vuelta(ex, clock, resp)
+    (pu,) = evs(posted, "puesta")
+    assert "Trailing 10 %" in pu["detalle"] and "sin objetivo" in pu["detalle"], pu
+    assert posted[-1]["estado"]["comprometido"] == round(497 * 2.01, 2)
+    ib.fill(oids["e"], 497, 2.00)
+    vuelta(ex, clock, resp)
+    vuelta(ex, clock, resp)
+    assert len(ib.placed) == 2 and not ib.cancels                           # con su Trailing vivo no toca nada
+    ib.fill(oids["t"], 497, 2.40)                                           # el Trailing subió con el precio y vendió
+    vuelta(ex, clock, resp)
+    vuelta(ex, clock, resp)
+    (sa,) = evs(posted, "salida")
+    assert sa["por"] == "trailing" and sa["px"] == 2.40 and sa["pnl"] == 198.8 and sa["px_e"] == 2.0, sa
+    # reinicio sin archivo de estado: reconoce la orden por su referencia y se queda con el Trailing en %
+    ex2, ib2, c2, p2, r2 = nuevo(penny=True)
+    r2["r"] = {"ordenes": [orden_penny()]}
+    ex2.paso()
+    ib2.fill(ex2.ord["ab12cd34"]["oids"]["e"], 497, 2.0)
+    ex3 = E.Ejecutor({"SEMAFORO_URL": "https://sem.test", "BRIDGE_TOKEN": "clave"}, ib2, post=lambda *a, **k: {},
+                     reloj=c2, estado_path=tempfile.mktemp(suffix=".json"))
+    ib2.conn = False
+    ex3.paso()
+    r = ex3.ord["ab12cd34"]
+    assert r["t"] == "PNY" and r["estado"] == "llena" and r["qty"] == 497 and r["trail_pct"] == 10.0 and r["trail"] == 0.2, r
+    # validaciones del ejecutor (por si el semáforo mandara algo raro)
+    ex4, ib4, c4, p4, r4 = nuevo(penny=True)
+    r4["r"] = {"ordenes": [orden_penny("00000001", "AAA"),
+                           orden_penny("00000002", "BBB", pct=30.0),                # más del 25 %
+                           orden_penny("00000003", "CCC", trail=0.50),               # el monto no concuerda con el %
+                           orden_penny("00000004", "DDD", objetivo=2.5),             # con % no hay objetivo
+                           orden_penny("00000005", "EEE", qty=600)]}                 # US$1,206 > 1,000
+    ex4.paso()
+    vuelta(ex4, c4, r4)
+    rech = {x["id"]: x["motivo"] for x in evs(p4, "rechazada")}
+    assert "Trailing en % inválido" in rech["00000002"] and "Trailing en % inválido" in rech["00000003"], rech
+    assert "incompleta" in rech["00000004"] and "1,000 por operación" in rech["00000005"] and "00000001" not in rech, rech
+    ex5, ib5, c5, p5, r5 = nuevo()                                                   # con los topes de antes (US$500) no pasa
+    r5["r"] = {"ordenes": [orden_penny()]}
+    ex5.paso()
+    vuelta(ex5, c5, r5)
+    assert ib5.placed == [] and "500 por operación" in evs(p5, "rechazada")[0]["motivo"]
+    # hasta 3 abiertas (US$3,000 comprometidos) y no más
+    ex6, ib6, c6, p6, r6 = nuevo(penny=True)
+    r6["r"] = {"ordenes": [orden_penny(f"0000000{i}", t) for i, t in enumerate(("AAA", "BBB", "CCC", "DDD"), 1)]}
+    ex6.paso()
+    vuelta(ex6, c6, r6)
+    assert len(ib6.placed) == 6 and "3,000 comprometidos" in evs(p6, "rechazada")[0]["motivo"]
+    # el monto del Trailing va redondeado a centavos, pero el riesgo se cuenta con el 10 % exacto: tres de 295 acc a 3.38 caben
+    ex8, ib8, c8, p8, r8 = nuevo(penny=True)
+    r8["r"] = {"ordenes": [orden_penny(f"0000000{i}", t, px=3.37) for i, t in enumerate(("AAA", "BBB", "CCC"), 1)]}
+    ex8.paso()
+    assert len(ib8.placed) == 6 and not evs(p8, "rechazada", ex8), [x.get("motivo") for x in ex8.eventos]
+    # 3 salidas a pérdida completa (~US$99 cada una) y la cuarta orden se rechaza por la pérdida del día (US$300)
+    ex7, ib7, c7, p7, r7 = nuevo(penny=True)
+    r7["r"] = {"ordenes": [orden_penny(f"0000000{i}", t) for i, t in enumerate(("AAA", "BBB", "CCC"), 1)]}
+    ex7.paso()
+    for i in (1, 2, 3):
+        o7 = ex7.ord[f"0000000{i}"]["oids"]
+        ib7.fill(o7["e"], 497, 2.0)
+        ib7.fill(o7["t"], 497, 1.80)
+    vuelta(ex7, c7, r7, r={"ordenes": [orden_penny("00000009", "ZZZ", px=1.0)]})
+    vuelta(ex7, c7, r7)
+    assert "pérdida máxima" in evs(p7, "rechazada")[-1]["motivo"] or "máximo del día" in evs(p7, "rechazada")[-1]["motivo"]
+
+
 def test_hora_et():
     import datetime as dt
     u = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)          # después del cambio de hora
@@ -948,5 +1038,6 @@ if __name__ == "__main__":
     test_riesgo_por_operacion()
     test_espera_ib()
     test_anota_limites()
+    test_penny_trailing_porcentaje()
     test_hora_et()
     print("OK · ejecutor paper")
