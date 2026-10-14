@@ -205,6 +205,19 @@ def metrics(bars: pd.DataFrame | None, prev: float | None, live_px: float | None
     return m
 
 
+def with_real(est: dict | None, real: dict | None) -> dict | None:
+    """El flujo REAL de IBKR (live/bridge.py flow_stats: operaciones clasificadas compra/venta, órdenes grandes de verdad)
+    en lugar del estimado con velas, con las mismas claves para que decide() no cambie. De la vela se conserva lo que el
+    flujo real no da (vfav, sigma, bars) y la razón estimada (ratio_est) para comparar las dos y calibrar. Sin real, el
+    estimado tal cual."""
+    if not real:
+        return est
+    out = dict(real)
+    est = est or {}
+    out.update(vfav=est.get("vfav"), sigma=est.get("sigma"), bars=est.get("bars"), ratio_est=est.get("ratio"))
+    return out
+
+
 # ---------------- decisión ----------------
 def _score(m: dict, rv: float | None, ctx: dict) -> int:
     fl, lg = m["flow"], m["flow"]["large"]
@@ -255,7 +268,9 @@ def decide(t: str, m: dict, ctx: dict) -> dict | None:
            "vol": round(m["vol"]), "rvol": rv, "ratio": ratio, "ratio15": r15, "net": fl["net"], "in": fl["in"],
            "out": fl["out"], "in15": fl["in15"], "out15": fl["out15"], "vfav": fl["vfav"], "large": lg, "spread": sp,
            "age_min": m["age_min"], "halted": h.get("code") if h else None, "cat": ctx.get("cat"), "mcap": ctx.get("mcap"),
-           "shelf": bool(ctx.get("shelf")), "pre": pre, "score": _score(m, rv, ctx), "pend": False}
+           "shelf": bool(ctx.get("shelf")), "pre": pre, "score": _score(m, rv, ctx), "pend": False,
+           "flow_src": fl.get("src") or "velas", "desde": fl.get("desde"), "ratio_est": fl.get("ratio_est"),
+           "large_usd": fl.get("large_usd")}
 
     def res(decision: str, reason: str):
         out.update(decision=decision, reason=reason, falta=falta, why=why)
@@ -329,8 +344,13 @@ def alert_text(r: dict, phase: str = "open") -> str:
     if cat:
         lines.append(f"📰 {cat}")
     lines.append("Sin oferta de acciones en la SEC (30 días) ni titular de oferta." + (" Hay estante S-3/F-3: puede diluir." if r.get("shelf") else ""))
-    lines.append("⚠ Flujo ESTIMADO con velas de 1 min (Yahoo, 1–2 min tarde): confirma Large/Medium/Small en tu app. Penny de alto "
-                 "riesgo: tamaño chico y stop puesto; puede devolver todo en minutos. Solo aviso, no hay orden.")
+    if r.get("flow_src") == "ibkr":
+        lines.append(f"Flujo REAL de IBKR desde las {r.get('desde') or '—'}: cada operación clasificada compra/venta contra el "
+                     f"bid/ask; ballena = operación ≥ {usd_txt(r.get('large_usd') or 25000)}. Penny de alto riesgo: tamaño "
+                     "chico y stop puesto; puede devolver todo en minutos. Solo aviso, no hay orden.")
+    else:
+        lines.append("⚠ Flujo ESTIMADO con velas de 1 min (Yahoo, 1–2 min tarde): confirma Large/Medium/Small en tu app. Penny de alto "
+                     "riesgo: tamaño chico y stop puesto; puede devolver todo en minutos. Solo aviso, no hay orden.")
     return "\n".join(lines)
 
 
@@ -375,7 +395,7 @@ class Book:
             sg = {"t": r["t"], "day": self.day, "time": f"{now_m // 60:02d}:{now_m % 60:02d}", "m": now_m, "px": r["px"],
                   "prev": r["prev"], "chg": r["chg"], "score": r["score"], "ratio": r["ratio"], "ratio15": r["ratio15"],
                   "rvol": r["rvol"], "lbuy": lg["buy"], "lsell": lg["sell"], "mfe": 0.0, "mae": 0.0, "last": r["px"],
-                  "close_pct": None, "status": "abierta"}
+                  "close_pct": None, "status": "abierta", "src": r.get("flow_src"), "ratio_est": r.get("ratio_est")}
             self.sigs[r["t"]] = sg
             new.append(sg)
         if new:

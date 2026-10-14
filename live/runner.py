@@ -42,6 +42,8 @@ ARM_MIN = int(os.environ.get("ARM_MIN", "50" if ALTO else "55"))    # fuerza mí
 ARM_NEAR = float(os.environ.get("ARM_NEAR", "2.5" if ALTO else "1.0"))  # % máximo debajo del gatillo para armarla
 ARM_MAX = int(os.environ.get("ARM_MAX", "12" if ALTO else "8"))     # avisos de "arma" por día (no saturar Telegram)
 IBKR_TOP = int(os.environ.get("IBKR_TOP", "12"))     # tickers de los escáneres de IBKR (puente) que entran al universo
+FOLLOW_N = int(os.environ.get("IB_FOLLOW_N", "60"))  # acciones cuyo flujo real sigue el puente IBKR (líneas de datos)
+IB_FLOW_MIN = int(os.environ.get("IB_FLOW_MIN", "10"))  # minutos de flujo real de IBKR para usarlo en vez del estimado
 ENRICH_N = 20
 CTX_RETRY_S = 300     # s antes de volver a pedir la curva de volumen o el cierre previo de una acción que falló
 PARTIAL_BARS = 2      # las últimas velas de Yahoo pueden estar a medio llenar: se vuelven a revisar en el ciclo siguiente
@@ -394,6 +396,7 @@ class Radar:
         self.mem: dict = {}               # memoria del proceso tras el último ciclo (RSS y % de MEM_LIMIT_MB)
         self.wake = threading.Event()     # el vigía rápido despierta el ciclo completo cuando algo rompe
         self.bridge = Bridge()            # puente IBKR (programa en la PC de Priamo): escáneres y precios al instante
+        self.ib_follow: list[str] = []    # lo que el puente sigue (flujo real), en orden de prioridad; lo arma el ciclo
         self.breaks: dict[str, dict] = {}  # hora y fuente de cada ruptura avisada (el ciclo la pasa a la armada)
         self.brk_lock = threading.Lock()   # el puente (petición web) y el vigía rápido revisan rupturas a la vez
         self.base_universe: list[str] | None = None  # universo del último refresco, sin los agregados de IBKR
@@ -742,17 +745,38 @@ class Radar:
                  f" (foco {foco.INDUSTRIA}: {len(bio)} en la industria)" if foco.activo() else "")
 
     def _flow(self, s: str, q: dict, bars_s, now: datetime, phase: str) -> dict | None:
-        """Entradas/salidas y ballenas estimadas de hoy, con el mismo cálculo del radar de flujo. Solo informa."""
-        if bars_s is None:
-            return None
+        """Entradas/salidas y ballenas de hoy. Reales (operaciones de IBKR clasificadas compra/venta) si el puente sigue
+        esta acción hace al menos IB_FLOW_MIN minutos; si no, estimadas con las velas, con el cálculo del radar de flujo.
+        Solo informa."""
+        est = None
+        if bars_s is not None:
+            try:
+                prev = fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
+                live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
+                fm = flujo.metrics(bars_s, prev, live, now)
+                est = fm["flow"] if fm else None
+            except Exception as e:  # noqa: BLE001
+                log.debug("flujo estimado %s: %s", s, e)
+        return flujo.with_real(est, self._ib_flow(s, now))
+
+    def _ib_flow(self, s: str, now: datetime) -> dict | None:
+        """Flujo real del puente IBKR si ya cubre IB_FLOW_MIN minutos (con menos, el ratio de la sesión no dice nada)."""
         try:
-            prev = fnum(q.get("regularMarketPreviousClose")) or self.prev.get(s)
-            live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
-            fm = flujo.metrics(bars_s, prev, live, now)
-            return fm["flow"] if fm else None
+            f = self.bridge.flow_stats(s, now.timestamp())
         except Exception as e:  # noqa: BLE001
-            log.debug("flujo estimado %s: %s", s, e)
+            log.warning("flujo IBKR %s: %s", s, e)
             return None
+        return f if f and f["covered"] >= IB_FLOW_MIN else None
+
+    def _spread(self, s: str, q: dict, m: dict, now: datetime) -> float | None:
+        """Spread %: con el bid/ask de IBKR al instante si el puente sigue la acción (el de Yahoo llega viejo o falso
+        en pre-market); si no, el de Yahoo validado contra lo que de verdad opera en 1 min."""
+        ib = self.bridge.quote(s, now.timestamp())
+        if ib and ib.get("bid") and ib.get("ask"):
+            sp = sane_spread(ib["bid"], ib["ask"], ib["last"])
+            if sp is not None:
+                return sp
+        return sane_spread(fnum(q.get("bid")), fnum(q.get("ask")), m.get("px"), m.get("rng1m"))
 
     def _biotech(self, Q, exch) -> tuple[set, dict]:
         """Acciones de la industria del foco (subidas y volumen de Yahoo). Si la pantalla falla, se usa la última buena:
@@ -943,6 +967,7 @@ class Radar:
             except Exception as e:  # noqa: BLE001
                 log.warning("flujo (cierre): %s", e)
             self.armed = {}
+            self.ib_follow = []
             self.snapshot = {**self.snapshot, "phase": phase, "status": "mercado cerrado", "ts": now.isoformat(),
                              "trades": list(self.trades.values()), "stats": self.stats(), "armed": [], "watching": [],
                              "armadas": list(self.arms.values()), "armStats": self.arm_stats(),
@@ -992,6 +1017,11 @@ class Radar:
             live = fnum(q.get("preMarketPrice")) if phase == "pre" else fnum(q.get("regularMarketPrice"))
             return session_metrics(bars.get(s), prev, self.baseline.get(s), now, live)
 
+        if phase == "open" and t_et.hour * 60 + t_et.minute >= 10 * 60:  # con 30 min de sesión el volumen ya compara bien
+            try:
+                self.bridge.calibrate({s: q.get("regularMarketVolume") for s, q in quotes.items()}, now.timestamp())
+            except Exception as e:  # noqa: BLE001
+                log.warning("puente (unidad): %s", e)
         spy, qqq = mets("SPY"), mets("QQQ")
         reg, reg_txt = regime(spy, qqq) if phase != "pre" else ("verde", "pre-market")
         watch = set(load_watchlist())
@@ -1000,9 +1030,9 @@ class Radar:
         for s in self.universe:
             q = quotes.get(s, {})
             m = mets(s)
-            if m.get("px"):  # flujo estimado (entradas/salidas y ballenas) para mostrar; no entra en la decisión
-                m["flow_est"] = self._flow(s, q, bars.get(s), now, phase)
-            spread = sane_spread(fnum(q.get("bid")), fnum(q.get("ask")), m.get("px"), m.get("rng1m"))
+            if m.get("px"):  # flujo (entradas/salidas y ballenas) para mostrar; no entra en la decisión. Real de IBKR
+                m["flow_est"] = self._flow(s, q, bars.get(s), now, phase)  # si el puente la sigue; si no, estimado
+            spread = self._spread(s, q, m, now)
             h = halted.get(s)
             ctx = {"phase": phase, "regime": reg, "spy_chg": spy.get("chg"), "spread": spread, "atr": self.atr.get(s),
                    "halted": h if h and not h["resumed"] else None, "bio": s in bio_set,
@@ -1061,6 +1091,10 @@ class Radar:
         except Exception as e:  # noqa: BLE001
             log.warning("flujo: %s\n%s", e, traceback.format_exc())
             self.flujo.snap = {**self.flujo.snap, "status": "error", "error": f"{type(e).__name__}: {e}"[:160]}
+        try:
+            self.ib_follow = self._follow_list(rows, active)
+        except Exception as e:  # noqa: BLE001
+            log.warning("puente (lista): %s", e)
         esp = [r for r in rows if r["decision"] == "ESPERA"]
         watching = [r["t"] for r in esp if r.get("level")] + [r["t"] for r in esp if not r.get("level")]
         self.snapshot = {
@@ -1221,10 +1255,11 @@ class Radar:
             if m is None:
                 nodata += 1
                 continue
+            m["flow"] = flujo.with_real(m["flow"], self._ib_flow(s, now))  # real de IBKR si el puente la sigue
             h = halted.get(s)
             ctx = {"phase": phase, "name": q.get("shortName") or q.get("longName") or self.names.get(s),
                    "halted": h if h and not h["resumed"] else None,
-                   "spread": sane_spread(fnum(q.get("bid")), fnum(q.get("ask")), m["px"], m.get("rng1m")),
+                   "spread": self._spread(s, q, m, now),
                    "avg_vol": fnum(q.get("averageDailyVolume10Day")) or fnum(q.get("averageDailyVolume3Month")),
                    "mcap": fnum(q.get("marketCap")), "enrich_ok": False}
             r = flujo.decide(s, m, ctx)
@@ -1329,19 +1364,32 @@ class Radar:
         self.fast_state = {"ts": now.isoformat(), "armed": len(armed), "fired": fired, "ibkr": len(ib)}
         return fired
 
+    def _follow_list(self, rows: list[dict], active: list[str]) -> list[str]:
+        """Qué acciones sigue el puente IBKR (flujo real y bid/ask), en orden de prioridad y con tope FOLLOW_N (líneas
+        de datos): armadas; señales y órdenes abiertas; avisos 🔥 y candidatas del radar de flujo (las mejores primero);
+        el semáforo como lo ordena la lista (COMPRA, ESPERA, Biotech primero); y la lista de seguimiento."""
+        fl = (self.flujo.snap or {}).get("rows") or []
+        fl_open = [t for t, sg in self.flujo.sigs.items() if sg.get("status") == "abierta"]
+        fl_rows = [r["t"] for r in fl if r.get("decision") != "ROJO"] + [r["t"] for r in fl if r.get("decision") == "ROJO"][:5]
+        order = (list(self.armed) + list(active) + fl_open + fl_rows + list(self.flujo_cand)[:10]
+                 + [r["t"] for r in rows if r["t"] not in ("SPY", "QQQ")] + load_watchlist())
+        return list(dict.fromkeys(order))[:FOLLOW_N]
+
     def on_bridge(self, scan: dict | None = None, quotes: dict | None = None, info: dict | None = None,
-                  now: datetime | None = None) -> dict:
-        """Datos del puente IBKR: guarda escáneres y precios y, si una acción armada cruzó su gatillo, avisa en el
-        acto. Responde qué vigilar: las acciones armadas con su gatillo (el puente se suscribe a su precio)."""
+                  now: datetime | None = None, flow: dict | None = None) -> dict:
+        """Datos del puente IBKR: guarda escáneres, precios y flujo y, si una acción armada cruzó su gatillo, avisa en
+        el acto. Responde qué vigilar (las armadas con su gatillo), qué seguir (flujo real: ib_follow) y la unidad de
+        tamaño confirmada con Yahoo."""
         now = now or datetime.now(timezone.utc)
-        fresh = self.bridge.update(scan, quotes, info)
+        fresh = self.bridge.update(scan, quotes, info, flow=flow)
         phase = phase_of(now)
         armed = dict(self.armed)
         fired = []
         if phase == "open":
             fired = self._check_breaks({s: self.bridge.price(s) for s in fresh if s in armed}, "ibkr", now)
         return {"ok": True, "phase": phase, "fired": fired,
-                "armed": {s: {"level": a["level"], "entry": a["entry"]} for s, a in armed.items()}}
+                "armed": {s: {"level": a["level"], "entry": a["entry"]} for s, a in armed.items()},
+                "follow": list(self.ib_follow) if phase != "closed" else [], "unit": self.bridge.unit}
 
     def fast_forever(self):
         while True:

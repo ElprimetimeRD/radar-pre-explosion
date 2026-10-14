@@ -3,7 +3,12 @@
 - cada 30 s le pasa al semáforo lo que ven los escáneres de IBKR (los que más suben, volumen inusual y ritmo de
   operaciones), que detectan una acción que arranca antes que las listas de Yahoo;
 - se suscribe al precio al instante de las acciones armadas (las que el semáforo le dice) y, si una cruza su
-  gatillo, se lo manda en el acto para que llegue el aviso ⚡ por Telegram.
+  gatillo, se lo manda en el acto para que llegue el aviso ⚡ por Telegram;
+- (1.2) sigue además las acciones que el semáforo le pide (radar de flujo, Biotech, la lista de seguimiento): recibe
+  cada operación (RT Volume), la clasifica como compra o venta contra el bid/ask de ese momento (Lee-Ready: en el ask o
+  arriba del medio = compra; en el bid o abajo = venta; en el medio, según si subió o bajó) y le manda al semáforo, por
+  minuto, el dinero comprador y vendedor, las órdenes grandes (≥ LARGE_USD por operación) y el bid/ask. Es el flujo
+  REAL que el semáforo antes estimaba con las velas de Yahoo.
 
 No manda órdenes: se conecta como solo lectura y no tiene código para operar.
 
@@ -35,7 +40,7 @@ try:
 except ImportError:  # las pruebas corren sin IBKR; main() avisa cómo instalarlo
     IB = ScannerSubscription = Stock = StartupFetch = None
 
-VERSION = "1.1"
+VERSION = "1.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, "puente.env")
 LOG_FILE = os.path.join(HERE, "puente.log")
@@ -50,7 +55,10 @@ DEFAULTS = {
     "MIN_VOLUME": "100000",
     "SCAN_EVERY": "30",          # s entre escaneos (pre-market y sesión)
     "SCAN_TIMEOUT": "20",        # s máximos de espera por cada escáner
-    "MAX_LINES": "40",           # tope de precios al instante a la vez (IBKR da 100 líneas)
+    "MAX_LINES": "60",           # tope de acciones seguidas a la vez (IBKR da 100 líneas por usuario)
+    "FLOW": "1",                 # 0 = solo precios de las armadas, sin flujo de operaciones
+    "LARGE_USD": "25000",        # una operación de este monto o más cuenta como orden grande
+    "SIZE_UNIT": "auto",         # acciones por unidad de tamaño de IBKR: auto (lo confirma el semáforo), 1 o 100
 }
 # Errores y avisos de IBKR: (texto corto para el semáforo, qué hacer)
 HINTS = {
@@ -65,6 +73,8 @@ HINTS = {
     10197: ("sesión en otra plataforma (10197)", "Sin datos: tu usuario está abierto en otra plataforma (celular, web o "
             "TWS) y esa sesión se quedó con los datos. Ciérrala o usa un segundo usuario para el puente."),
     326: ("número de cliente en uso (326)", "Otro programa usa el mismo IB_CLIENT_ID: cambia IB_CLIENT_ID en puente.env."),
+    101: ("tope de líneas de datos (101)", "IBKR no da más líneas de datos a la vez: el puente sigue menos acciones. Si "
+          "tienes IBKR abierto en otra plataforma con muchas cotizaciones, esas también cuentan."),
     1100: ("IBKR sin conexión (1100)", "IBKR perdió la conexión con sus servidores; el puente espera a que vuelva."),
     2110: ("IBKR sin conexión (2110)", "TWS/IB Gateway perdió la conexión con los servidores de IBKR."),
     2103: ("precios de IBKR caídos (2103)", "TWS/IB Gateway perdió el servidor de precios de IBKR; suele volver solo."),
@@ -74,6 +84,45 @@ CLEARS = {1101: (1100, 2110), 1102: (1100, 2110), 2104: (2103,), 2106: (2105,)} 
 DATA_ERRORS = {354, 10089, 10090, 10167, 10168, 10197, 2103}  # se limpian solos cuando vuelven a llegar precios
 
 log = logging.getLogger("puente")
+
+TRADE_TICKS = (48, 77)       # RT Volume / RT Trade Volume: cada operación con su precio y tamaño
+BID_TICKS, ASK_TICKS = (1, 66), (2, 67)
+GENERIC = "233"              # pide RT Volume (las operaciones una por una, como el Time & Sales)
+FLOW_KEEP_MIN = 1200         # minutos de flujo que se guardan (20 h: pre-market, sesión y after-hours de hoy)
+FLOW_MAX_SEND = 800          # registros de flujo por envío (uno atrasado no pasa el tope de tamaño del semáforo)
+PUSH_S = 3                   # s mínimos entre envíos por precios o flujo nuevos (un cruce o una armada salen ya)
+QUOTE_RESEND_S = 8           # s: el precio de una acción quieta se vuelve a mandar para que el semáforo lo vea fresco
+CONTRACT_BAD_S = 600         # s sin volver a pedir una acción que IBKR rechazó (sin suscripción para su bolsa)
+PER_CONTRACT = (354, 10089, 10168)  # errores de datos que llegan con el contrato: solo esa acción queda fuera un rato
+# Columnas de cada registro de flujo (un minuto de una acción). El semáforo (live/bridge.py) las lee en este orden.
+#   m: minuto (segundos de época ÷ 60) · o h l c: precios de las operaciones · v: tamaño sumado (en unidades de IBKR)
+#   n: operaciones · buy sell mid: precio × tamaño de las compras, ventas y las que no se pudieron clasificar
+#   bbuy bsell nbb nbs: lo mismo y cuántas, solo de las órdenes grandes · top tside: la operación más grande y su lado
+#   u: acciones por unidad de tamaño con que se decidió qué es "grande" en ese minuto
+FLOW_COLS = ("m", "o", "h", "l", "c", "v", "n", "buy", "sell", "mid", "bbuy", "bsell", "nbb", "nbs", "top", "tside", "u")
+SYM_RX = re.compile(r"[A-Z]{1,5}(\.[A-Z])?")
+
+
+def side_of(px: float, bid, ask, prev_px, prev_side: int) -> int:
+    """Lado de una operación (Lee-Ready): +1 compra, −1 venta, 0 sin saber. Contra el bid/ask de ese momento: en el
+    ask o arriba del medio, compra; en el bid o abajo del medio, venta. Justo en el medio (o sin bid/ask válido), según
+    si el precio subió o bajó respecto de la operación anterior; si tampoco cambió, el lado de la anterior."""
+    if bid and ask and ask >= bid:
+        if px >= ask:
+            return 1
+        if px <= bid:
+            return -1
+        mid = (bid + ask) / 2
+        if px > mid:
+            return 1
+        if px < mid:
+            return -1
+    if prev_px:
+        if px > prev_px:
+            return 1
+        if px < prev_px:
+            return -1
+    return prev_side or 0
 
 
 def num(v) -> float | None:
@@ -153,8 +202,20 @@ class Puente:
         self.bad: dict[str, float] = {}        # tickers que IBKR no reconoce -> cuándo reintentar
         self.tickers: dict = {}                # ticker -> Ticker con precio al instante
         self.armed: dict[str, dict] = {}       # lo que el semáforo dice vigilar: {ticker: {level, entry}}
+        self.follow: list[str] = []            # lo que el semáforo pide seguir (flujo), en orden de prioridad
         self.phase: str | None = None
-        self.sent_px: dict[str, float] = {}
+        self.sent_px: dict[str, tuple] = {}    # último (precio, bid, ask) mandado de cada acción
+        self.sent_at: dict[str, float] = {}
+        self.flow_on = str(cfg.get("FLOW", "1")).strip() != "0"
+        self.large = float(cfg.get("LARGE_USD") or 25000)
+        su = str(cfg.get("SIZE_UNIT") or "auto").strip().lower()
+        self.unit = 100.0 if su == "100" else 1.0  # IBKR manda los tamaños en acciones salvo que la API esté en lotes
+        self.unit_auto = su not in ("1", "100")    # en auto, el semáforo lo confirma comparando con el volumen de Yahoo
+        self.max_lines = max(1, int(cfg.get("MAX_LINES") or 60))
+        self.qs: dict[str, dict] = {}          # ticker -> bid/ask/último precio y lado (para clasificar operaciones)
+        self.flow: dict[str, dict[int, list]] = {}   # ticker -> minuto -> registro (FLOW_COLS sin "m")
+        self.flow_ver: dict[tuple, int] = {}   # (ticker, minuto) cambiados que el semáforo aún no recibió
+        self.pruned_at = 0
         self.crossed: set[str] = set()
         self.error: str | None = None
         self.error_code: int | None = None
@@ -183,6 +244,27 @@ class Puente:
                 self.drop_lines()
                 self.wake.set()
             return
+        if code == 101:  # tope de líneas: se siguen menos acciones (las de más prioridad) y se vuelven a pedir
+            short, hint = HINTS[code]
+            self.max_lines = max(5, min(self.max_lines, len(self.tickers)) - 5)
+            log.warning("IBKR 101: %s Sigo como máximo %d.", hint, self.max_lines)
+            self.set_error(code, short)
+            self.drop_lines()
+            self.wake.set()
+            return
+        sym = getattr(contract, "symbol", None) if contract is not None else None
+        if code in PER_CONTRACT and sym:
+            if time.monotonic() >= self.bad.get(sym, 0):
+                log.warning("IBKR %s con %s: %s La dejo fuera %d min.", code, sym, HINTS[code][1], CONTRACT_BAD_S // 60)
+            self.bad[sym] = time.monotonic() + CONTRACT_BAD_S
+            t = self.tickers.pop(sym, None)
+            if t is not None:
+                try:
+                    self.ib.cancelMktData(t.contract)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.set_error(code, HINTS[code][0])
+            return
         if code in HINTS:
             short, hint = HINTS[code]
             if self.error != short:
@@ -194,7 +276,8 @@ class Puente:
             log.info("IBKR %s: %s", code, msg)
 
     def on_tickers(self, tickers):
-        """Cada actualización de precio: si una armada cruza su gatillo, despierta el envío inmediato."""
+        """Cada actualización de precio: si una armada cruza su gatillo, despierta el envío inmediato; las operaciones
+        nuevas se clasifican y se suman al flujo del minuto."""
         for t in tickers:
             s = getattr(getattr(t, "contract", None), "symbol", None)
             a, p = self.armed.get(s), last_price(t)
@@ -205,9 +288,89 @@ class Puente:
                 self.crossed.add(s)
                 log.info("%s cruzó %.2f (gatillo %.2f): aviso al semáforo ya.", s, p, a["level"])
                 self.wake.set()
+            if self.flow_on and s:
+                try:
+                    self.ingest(s, t)
+                except Exception:  # noqa: BLE001 (un dato raro de una acción no frena las demás)
+                    log.exception("No pude sumar el flujo de %s.", s)
+
+    def ingest(self, s: str, t):
+        """Recorre los ticks de esta tanda en orden: bid y ask actualizan la cotización; cada operación (RT Volume)
+        se clasifica contra la cotización de ESE momento y se suma a su minuto."""
+        st = self.qs.get(s)
+        if st is None:
+            st = self.qs[s] = {"bid": num(getattr(t, "bid", None)), "ask": num(getattr(t, "ask", None)),
+                               "px": None, "side": 0}
+        for tk in getattr(t, "ticks", None) or ():
+            tt = getattr(tk, "tickType", None)
+            if tt in BID_TICKS:
+                st["bid"] = num(getattr(tk, "price", None))
+            elif tt in ASK_TICKS:
+                st["ask"] = num(getattr(tk, "price", None))
+            elif tt in TRADE_TICKS:
+                px, sz = num(getattr(tk, "price", None)), num(getattr(tk, "size", None))
+                if not px or not sz:
+                    continue
+                side = side_of(px, st["bid"], st["ask"], st["px"], st["side"])
+                st["px"] = px
+                if side:
+                    st["side"] = side
+                try:
+                    minute = int(tk.time.timestamp() // 60)
+                except (AttributeError, TypeError, ValueError, OSError):
+                    minute = int(time.time() // 60)
+                self.add_trade(s, minute, px, sz, side)
+
+    def add_trade(self, s: str, minute: int, px: float, size: float, side: int):
+        rec = self.flow.setdefault(s, {}).get(minute)
+        if rec is None:
+            rec = self.flow[s][minute] = [px, px, px, px, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0.0, 0, self.unit]
+        rec[1], rec[2], rec[3] = max(rec[1], px), min(rec[2], px), px
+        rec[4] += size
+        rec[5] += 1
+        val = px * size
+        rec[6 if side > 0 else 7 if side < 0 else 8] += val
+        if side and val * rec[15] >= self.large:
+            rec[9 if side > 0 else 10] += val
+            rec[11 if side > 0 else 12] += 1
+        if val > rec[13]:
+            rec[13], rec[14] = val, side
+        k = (s, minute)
+        self.flow_ver[k] = self.flow_ver.get(k, 0) + 1
+
+    def prune(self, now_min: int | None = None):
+        """Suelta el flujo de hace más de FLOW_KEEP_MIN minutos (una vez por minuto)."""
+        now_min = now_min or int(time.time() // 60)
+        if now_min == self.pruned_at:
+            return
+        self.pruned_at = now_min
+        cut = now_min - FLOW_KEEP_MIN
+        for s in list(self.flow):
+            recs = self.flow[s]
+            for m in [m for m in recs if m < cut]:
+                del recs[m]
+                self.flow_ver.pop((s, m), None)
+            if not recs:
+                del self.flow[s]
+
+    def flow_payload(self) -> tuple[dict, dict]:
+        """Los minutos cambiados desde el último envío bueno (los más viejos primero, con tope) y sus versiones."""
+        keys = sorted(self.flow_ver, key=lambda k: k[1])[:FLOW_MAX_SEND]
+        out: dict[str, list] = {}
+        sent = {}
+        for s, m in keys:
+            rec = self.flow.get(s, {}).get(m)
+            if rec is None:
+                continue
+            o, h, lo, c, v, n, b, se, mi, bb, bs, nbb, nbs, top, ts, u = rec
+            out.setdefault(s, []).append([m, round(o, 4), round(h, 4), round(lo, 4), round(c, 4), round(v, 4), n,
+                                          round(b, 2), round(se, 2), round(mi, 2), round(bb, 2), round(bs, 2), nbb,
+                                          nbs, round(top, 2), ts, u])
+            sent[(s, m)] = self.flow_ver[(s, m)]
+        return out, sent
 
     def on_disconnect(self):
-        self.state, self.tickers, self.sent_px = "desconectado", {}, {}
+        self.state, self.tickers, self.sent_px, self.qs = "desconectado", {}, {}, {}
         if not self.stopping:
             log.warning("Se cortó la conexión con TWS/IB Gateway; reintento en unos segundos.")
 
@@ -217,7 +380,7 @@ class Puente:
                 self.ib.cancelMktData(t.contract)
             except Exception:  # noqa: BLE001 (desconectado o ya cancelada)
                 pass
-        self.tickers, self.sent_px = {}, {}
+        self.tickers, self.sent_px, self.qs = {}, {}, {}
 
     async def connect(self) -> bool:
         if not self._hooked:
@@ -333,14 +496,24 @@ class Puente:
         c.exchange = "SMART"  # precio consolidado (el escáner puede traer la bolsa principal)
         return c
 
+    def wanted(self) -> list[str]:
+        """Qué seguir, en orden de prioridad y con tope de líneas: primero las armadas (su ruptura es lo más urgente),
+        después lo que pide el semáforo para el flujo."""
+        want = list(self.armed) + (self.follow if self.flow_on else [])
+        now = time.monotonic()
+        want = [s for s in dict.fromkeys(want) if now >= self.bad.get(s, 0)]  # las rechazadas no gastan línea
+        return want[: self.max_lines]
+
     async def sync_lines(self):
-        """Precio al instante solo para lo que el semáforo tiene armado (y nada más: líneas de datos limitadas)."""
+        """Precio al instante (con las operaciones, RT Volume) solo de lo que el semáforo pide: las líneas de datos son
+        limitadas."""
         if not self.ib.isConnected():
             return
-        want = list(self.armed)[: int(self.cfg["MAX_LINES"])]
+        want = self.wanted()
         for s in [s for s in self.tickers if s not in want]:
             t = self.tickers.pop(s)
             self.sent_px.pop(s, None)
+            self.qs.pop(s, None)
             try:
                 self.ib.cancelMktData(t.contract)
             except Exception:  # noqa: BLE001
@@ -356,30 +529,41 @@ class Puente:
             if not self.ib.isConnected():
                 return
             try:
-                self.tickers[s] = self.ib.reqMktData(c, "", False, False)
+                self.tickers[s] = self.ib.reqMktData(c, GENERIC if self.flow_on else "", False, False)
             except Exception as e:  # noqa: BLE001 (se cortó la conexión en medio)
                 log.warning("No pude pedir el precio de %s (%s).", s, type(e).__name__)
                 return
         self.crossed &= set(self.armed)
 
     # ---------------- semáforo ----------------
-    def quotes(self) -> dict:
+    def quotes(self, now: float | None = None) -> dict:
+        """Precio, bid y ask de lo que cambió (o de lo que lleva QUOTE_RESEND_S sin mandarse: así el semáforo sabe que
+        sigue fresco), con el volumen del día en unidades de IBKR (con él el semáforo confirma la unidad)."""
+        now = now or time.monotonic()
         out = {}
         for s, t in list(self.tickers.items()):
             p = last_price(t)
-            if p and self.sent_px.get(s) != p:
-                out[s] = {"last": p, "high": num(getattr(t, "high", None)), "bid": num(getattr(t, "bid", None)),
-                          "ask": num(getattr(t, "ask", None))}
+            if not p:
+                continue
+            bid, ask = num(getattr(t, "bid", None)), num(getattr(t, "ask", None))
+            if self.sent_px.get(s) != (p, bid, ask) or now - self.sent_at.get(s, -1e9) >= QUOTE_RESEND_S:
+                out[s] = {"last": p, "high": num(getattr(t, "high", None)), "bid": bid, "ask": ask,
+                          "vol": num(getattr(t, "rtVolume", None)) or num(getattr(t, "volume", None))}
         return out
 
     async def push(self, scan: bool = False) -> str:
-        """Manda precios nuevos (y el último escaneo) y recibe qué vigilar. Devuelve 'ok', 'auth' o 'net'."""
+        """Manda precios nuevos, el flujo de los minutos que cambiaron (y el último escaneo) y recibe qué vigilar y qué
+        seguir. Devuelve 'ok', 'auth' o 'net'."""
         q = self.quotes()
         sent_scan = self.scan if scan else None
+        flow, flow_sent = self.flow_payload() if self.flow_on else ({}, {})
         payload = {"v": 1, "quotes": q, "info": {"ib": self.state, "error": self.error, "lines": len(self.tickers),
-                                                 "ver": VERSION}}
+                                                 "max_lines": self.max_lines, "ver": VERSION, "unit": self.unit,
+                                                 "large_usd": self.large, "flow": self.flow_on}}
         if scan:
             payload["scan"] = sent_scan
+        if flow:
+            payload["flow"] = flow
         try:
             resp = await asyncio.to_thread(self.post, self.url, self.cfg["BRIDGE_TOKEN"], payload)
         except PermissionError as e:
@@ -391,7 +575,11 @@ class Puente:
         self.last_push = time.monotonic()
         if scan and self.scan is sent_scan:
             self.scan_new = False
-        self.sent_px.update({s: v["last"] for s, v in q.items()})
+        self.sent_px.update({s: (v["last"], v["bid"], v["ask"]) for s, v in q.items()})
+        self.sent_at.update({s: self.last_push for s in q})
+        for k, ver in flow_sent.items():  # lo que cambió mientras se mandaba queda para el próximo envío
+            if self.flow_ver.get(k) == ver:
+                del self.flow_ver[k]
         phase = resp.get("phase")
         armed = {str(s): a for s, a in (resp.get("armed") or {}).items() if isinstance(a, dict) and num(a.get("level"))}
         if phase != self.phase:
@@ -402,6 +590,16 @@ class Puente:
                      or "nada armado")
         for s in resp.get("fired") or []:
             log.info("El semáforo avisó la ruptura de %s por Telegram.", s)
+        if "follow" in resp:  # un semáforo viejo no lo manda: entonces solo las armadas, como antes
+            follow = [x for x in (str(v).upper() for v in (resp.get("follow") or [])[:200]) if SYM_RX.fullmatch(x)]
+            if len(follow) != len(self.follow) and (not self.follow or not follow or abs(len(follow) - len(self.follow)) >= 5):
+                log.info("Sigo el flujo de %d acciones (tope %d líneas).", len(follow), self.max_lines)
+            self.follow = follow
+        u = resp.get("unit")
+        if self.unit_auto and u in (1, 100) and float(u) != self.unit:
+            log.info("El semáforo confirmó que IBKR manda los tamaños %s: ajusto la cuenta.",
+                     "en acciones" if u == 1 else "en lotes de 100")
+            self.unit = float(u)
         self.phase, self.armed = phase, armed
         return "ok"
 
@@ -420,17 +618,21 @@ class Puente:
             self.scan_at = time.monotonic()
             self.scan_task = asyncio.create_task(self.run_scans())
         await self.sync_lines()
-        live = self.phase in ("pre", "open")
-        if self.scan_new or woke or self.quotes() or time.monotonic() - self.last_push >= (5 if live else 30):
+        self.prune()
+        live = self.phase in ("pre", "open", "late")  # en la última media hora sigue el flujo (no hay escaneos)
+        q = self.quotes()
+        since = time.monotonic() - self.last_push
+        urgent = self.scan_new or woke or any(s in self.armed for s in q)  # una armada que se mueve sale ya
+        if urgent or (since >= PUSH_S and (q or self.flow_ver)) or since >= (5 if live else 30):
             res = await self.push(self.scan_new)
             if res == "auth":
                 return 30
             if res == "net":
                 return 3 if live else 15
             await self.sync_lines()  # lo recién armado se suscribe ya, sin esperar otra vuelta
-        if self.phase == "open" and self.armed:
+        if live and (self.armed or self.tickers):
             return 1
-        return 5 if self.phase in ("pre", "open") else 30
+        return 5 if live else 30
 
     async def run(self):
         while not self.stopping:

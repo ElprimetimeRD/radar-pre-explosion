@@ -45,6 +45,7 @@ class FakeIB:
         self.scans, self.lines, self.calls = scans or {}, {}, []
         self.silent, self.scan_delay = set(), 0.0
         self.active_scans, self.cancelled, self._rid = set(), [], 0
+        self.generic = {}
 
     def isConnected(self):
         return self.connected
@@ -89,7 +90,8 @@ class FakeIB:
         if not self.connected:
             raise ConnectionError("Not connected")
         assert not snapshot  # streaming (las consultas sueltas cuestan US$0.01 cada una)
-        t = NS(contract=c, last=math.nan, bid=math.nan, ask=math.nan, high=math.nan)
+        self.generic[c.symbol] = generic
+        t = NS(contract=c, last=math.nan, bid=math.nan, ask=math.nan, high=math.nan, ticks=[], rtVolume=math.nan)
         self.lines[c.symbol] = t
         return t
 
@@ -217,7 +219,8 @@ async def _scenario():
     ib.pendingTickersEvent.emit([t])
     assert not p.wake.is_set()
     await p.step()
-    assert srv.got[-1]["quotes"] == {"AAA": {"last": 9.99, "high": None, "bid": 9.98, "ask": None}}, srv.got[-1]
+    assert srv.got[-1]["quotes"] == {"AAA": {"last": 9.99, "high": None, "bid": 9.98, "ask": None, "vol": None}}, srv.got[-1]
+    assert ib.generic["AAA"] == "233"                           # con RT Volume: las operaciones una por una
     n = len(srv.got)
     await p.step()
     assert len(srv.got) == n                                    # nada nuevo: no molesta al servidor
@@ -312,6 +315,108 @@ def test_scenario():
     asyncio.run(_scenario())
 
 
+def test_side_of():
+    """Lee-Ready: contra el bid/ask de ese momento; en el medio (o sin cotización), por el tick; si no cambió, el lado de
+    la operación anterior."""
+    f = P.side_of
+    assert f(10.05, 10.00, 10.05, None, 0) == 1 and f(10.06, 10.00, 10.05, None, 0) == 1      # en el ask o arriba
+    assert f(10.00, 10.00, 10.05, None, 0) == -1 and f(9.99, 10.00, 10.05, None, 0) == -1     # en el bid o abajo
+    assert f(10.04, 10.00, 10.05, None, 0) == 1 and f(10.01, 10.00, 10.05, None, 0) == -1    # arriba/abajo del medio
+    assert f(10.025, 10.00, 10.05, 10.02, -1) == 1 and f(10.025, 10.00, 10.05, 10.03, 1) == -1  # medio: el tick
+    assert f(10.025, 10.00, 10.05, 10.025, -1) == -1                                          # sin cambio: el anterior
+    assert f(5.0, None, None, 4.9, 0) == 1 and f(5.0, 5.1, 5.0, None, 0) == 0                  # sin bid/ask válido
+
+
+def _tick(tt, price, size=0.0, minute=29_000_000):
+    from datetime import datetime, timezone
+    return NS(tickType=tt, price=price, size=size, time=datetime.fromtimestamp(minute * 60 + 7, timezone.utc))
+
+
+async def _flow():
+    """Flujo real: lo que pide el semáforo se sigue con RT Volume; cada operación se clasifica contra el bid/ask de ese
+    momento y se suma a su minuto; se manda lo que cambió y se suelta al confirmarse; la unidad la ajusta el semáforo."""
+    M = 29_000_000
+    cfg = dict(P.DEFAULTS, BRIDGE_TOKEN="t", SCANS="", MAX_LINES="3", LARGE_USD="25000")
+    ib = FakeIB()
+    srv = Server()
+    srv.resp = {"ok": True, "phase": "open", "armed": {"ARM": {"level": 5.0, "entry": 5.01}}, "fired": [],
+                "follow": ["BIO", "PEN", "ARM", "XTRA", "ba d"]}
+    p = P.Puente(cfg, ib, srv)
+    await p.step()                                   # conecta y aprende qué seguir
+    await p.step()
+    assert list(p.tickers) == ["ARM", "BIO", "PEN"] and p.follow == ["BIO", "PEN", "ARM", "XTRA"], (p.tickers, p.follow)
+    assert all(g == "233" for g in ib.generic.values())             # tope de líneas: la armada primero, luego el orden
+    t = ib.lines["BIO"]
+    t.last, t.bid, t.ask, t.rtVolume = 2.00, 1.99, 2.01, 1_000_000
+    t.ticks = [_tick(1, 1.99), _tick(2, 2.01, minute=M),
+               _tick(48, 2.01, 100, M),                  # en el ask: compra
+               _tick(48, 1.99, 300, M),                  # en el bid: venta
+               _tick(48, 2.00, 50, M),                   # justo en el medio, subió desde 1.99: compra
+               _tick(1, 2.00), _tick(2, 2.02),
+               _tick(48, 2.02, 20000, M),                # en el ask y US$40 k: compra grande
+               _tick(48, 2.01, 10, M + 1)]               # minuto siguiente, medio, bajó: venta
+    ib.pendingTickersEvent.emit([t])
+    r0, r1 = p.flow["BIO"][M], p.flow["BIO"][M + 1]
+    assert r0[4] == 20450 and r0[5] == 4 and abs(r0[6] - (201 + 100 + 40400)) < 1e-6 and abs(r0[7] - 597) < 1e-6, r0
+    assert r0[9] == 40400 and r0[11] == 1 and r0[12] == 0 and r0[13] == 40400 and r0[14] == 1 and r0[15] == 1.0, r0
+    assert (r0[0], r0[1], r0[2], r0[3]) == (2.01, 2.02, 1.99, 2.02) and abs(r1[7] - 20.1) < 1e-9 and r1[5] == 1, (r0, r1)
+    p.last_push = -1e9
+    await p.step()
+    sent = srv.got[-1]
+    rows = sent["flow"]["BIO"]
+    assert [r[0] for r in rows] == [M, M + 1] and len(rows[0]) == len(P.FLOW_COLS), rows
+    assert rows[0][P.FLOW_COLS.index("bbuy")] == 40400 and rows[0][P.FLOW_COLS.index("u")] == 1.0, rows[0]
+    assert sent["quotes"]["BIO"]["vol"] == 1_000_000 and sent["info"]["large_usd"] == 25000, sent
+    assert p.flow_ver == {} and "flow" not in (await _push_again(p, srv))        # confirmado: no se repite
+    # Llega otra operación al minuto M+1 mientras tanto: solo ese minuto viaja otra vez (completo)
+    t.ticks = [_tick(48, 2.03, 100, M + 1)]
+    ib.pendingTickersEvent.emit([t])
+    p.last_push = -1e9
+    await p.step()
+    assert [r[0] for r in srv.got[-1]["flow"]["BIO"]] == [M + 1] and srv.got[-1]["flow"]["BIO"][0][6] == 2, srv.got[-1]
+    # El semáforo confirma que IBKR manda lotes de 100: lo nuevo se decide con esa unidad
+    srv.resp["unit"] = 100
+    p.last_push = -1e9
+    await p.step()
+    assert p.unit == 100.0
+    t.ticks = [_tick(48, 2.05, 200, M + 2)]          # 200 lotes = 20 000 acciones = US$41 k: grande
+    ib.pendingTickersEvent.emit([t])
+    assert p.flow["BIO"][M + 2][15] == 100.0 and p.flow["BIO"][M + 2][11] == 1, p.flow["BIO"][M + 2]
+    # Una acción que IBKR rechaza (sin suscripción para su bolsa) queda fuera 10 min y libera la línea
+    ib.errorEvent.emit(7, 10089, "Requested market data requires additional subscription", P.Stock("PEN", "SMART", "USD"))
+    assert "PEN" not in p.tickers and "PEN" in p.bad and p.error == "falta suscripción para la API (10089)", p.error
+    await p.step()
+    assert "PEN" not in p.tickers and "XTRA" in p.tickers, p.tickers  # la línea libre la toma la siguiente
+    # Tope de líneas de IBKR (101): sigue menos y vuelve a pedir en orden
+    p.max_lines = 10
+    ib.errorEvent.emit(9, 101, "Max number of tickers has been reached", None)
+    assert p.max_lines == 5 and p.tickers == {} and p.wake.is_set()
+    # Minutos viejos se sueltan (20 h)
+    p.prune(M + 2 + P.FLOW_KEEP_MIN + 1)
+    assert "BIO" not in p.flow and all(k[0] != "BIO" for k in p.flow_ver)
+    # Un semáforo viejo (sin "follow") no cambia la lista; FLOW=0 vuelve a solo las armadas
+    srv.resp.pop("follow")
+    p.last_push = -1e9
+    await p.step()
+    assert p.follow == ["BIO", "PEN", "ARM", "XTRA"]
+    q = P.Puente(dict(cfg, FLOW="0"), FakeIB(), srv)
+    srv.resp["follow"] = ["BIO"]
+    await q.step()
+    await q.step()
+    assert list(q.tickers) == ["ARM"] and q.ib.generic["ARM"] == "", q.tickers
+
+
+async def _push_again(p, srv):
+    n = len(srv.got)
+    p.last_push = -1e9
+    await p.step()
+    return srv.got[-1] if len(srv.got) > n else {}
+
+
+def test_flow():
+    asyncio.run(_flow())
+
+
 async def _end_to_end():
     """El puente contra el servidor de verdad (FastAPI en memoria): escáner al universo, ⚡ al cruzar y sin publicar
     el precio de IBKR."""
@@ -359,12 +464,32 @@ async def _end_to_end():
             assert "10.0317" not in cl.get(path).text, path        # el precio de IBKR no se publica
         h = cl.get("/health").json()["bridge"]
         assert h["on"] and h["ib"] == "conectado" and h["scan"] == {"TOP_PERC_GAIN": 0, "HOT_BY_VOLUME": 2}, h
+        # Flujo real: el semáforo pide seguir BIO; sus operaciones llegan clasificadas y el semáforo las suma
+        import time as _time
+        r.ib_follow = ["BIO"]
+        p.last_push = -1e9
+        await p.step()                       # recibe la lista
+        await p.step()                       # se suscribe
+        assert "BIO" in ib.lines and ib.generic["BIO"] == "233", ib.lines
+        mnow = int(_time.time() // 60)
+        b = ib.lines["BIO"]
+        b.last, b.bid, b.ask, b.rtVolume = 4.0, 3.99, 4.01, 500
+        b.ticks = [_tick(1, 3.99, minute=mnow), _tick(2, 4.01, minute=mnow), _tick(48, 4.01, 10000, mnow),
+                   _tick(48, 3.99, 2000, mnow)]
+        ib.pendingTickersEvent.emit([b])
+        p.last_push = -1e9
+        await p.step()
+        f = r.bridge.flow_stats("BIO")
+        assert f and f["in"] == 40100 and f["out"] == 7980 and f["large"]["buy"] == 1 and f["src"] == "ibkr", f
+        assert r.bridge.quote("BIO")["bid"] == 3.99 and cl.get("/health").json()["bridge"]["flow"] == 1
+        for path in ("/api/signals", "/health", "/api/trades"):
+            assert "3.99" not in cl.get(path).text and "4.01" not in cl.get(path).text, path
         p.cfg["BRIDGE_TOKEN"] = "otra"
         p.last_push = -1e9
         assert await p.step() == 30          # clave equivocada: avisa y espera
     finally:
         runner.phase_of = old_phase
-        A.radar.armed, A.radar.arms = {}, {}
+        A.radar.armed, A.radar.arms, A.radar.ib_follow = {}, {}, []
         os.environ.pop("BRIDGE_TOKEN", None)
 
 
@@ -376,5 +501,7 @@ if __name__ == "__main__":
     test_config()
     test_http_errors()
     test_scenario()
+    test_side_of()
+    test_flow()
     test_end_to_end()
     print("OK · puente IBKR")

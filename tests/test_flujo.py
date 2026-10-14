@@ -182,6 +182,42 @@ def test_decide_green_and_gates():
     assert flujo.decide("X", weak, ctx())["score"] < r["score"] - 10
 
 
+def _real(ratio_in=900_000, out=300_000, in15=200_000, out15=80_000, lbuy=3, lsell=1, lin=180_000, lout=40_000, desde="09:31"):
+    """Flujo real como lo da live/bridge.py flow_stats."""
+    tot = ratio_in + out
+    return {"in": ratio_in, "out": out, "ratio": round(ratio_in / out, 2), "net": round(100 * (ratio_in - out) / tot, 1),
+            "in15": in15, "out15": out15, "ratio15": round(in15 / out15, 2),
+            "large": {"n": lbuy + lsell, "buy": lbuy, "sell": lsell, "in": lin, "out": lout,
+                      "ratio": round(lin / lout, 2) if lout else 99.0, "share": round(100 * (lin + lout) / tot, 1),
+                      "rec_buy": 1, "last": {"t": "10:05", "side": "buy", "usd": 60000, "x": 2.4}},
+            "trades": 1200, "vol": 400000, "usd": tot, "desde": desde, "covered": 38, "src": "ibkr", "large_usd": 25000}
+
+
+def test_real_flow():
+    """Con el puente IBKR, el flujo REAL reemplaza al estimado con las mismas claves: decide() no cambia, pero ahora
+    decide con compras y ventas de verdad; el aviso dice de dónde sale el flujo."""
+    m = green()
+    est = m["flow"]
+    assert flujo.with_real(est, None) is est
+    real = _real()
+    fl = flujo.with_real(est, real)
+    assert fl["src"] == "ibkr" and fl["ratio"] == 3.0 and fl["vfav"] == est["vfav"] and fl["ratio_est"] == est["ratio"], fl
+    r = flujo.decide("RUN", {**m, "flow": fl}, ctx())
+    assert r["decision"] == "VERDE" and r["flow_src"] == "ibkr" and r["desde"] == "09:31" and r["ratio"] == 3.0, r
+    txt = flujo.alert_text(r)
+    assert "Flujo REAL de IBKR desde las 09:31" in txt and "US$25 k" in txt and "ESTIMADO" not in txt, txt
+    assert "ESTIMADO" in flujo.alert_text(flujo.decide("RUN", m, ctx()))
+    # Las velas decían VERDE, pero de verdad dominan las ventas: ROJO
+    bad = flujo.with_real(est, _real(ratio_in=300_000, out=500_000))
+    assert flujo.decide("RUN", {**m, "flow": bad}, ctx())["decision"] == "ROJO"
+    # Sin órdenes grandes compradoras de verdad: AMARILLO y dice qué falta
+    no_big = flujo.with_real(est, _real(lbuy=0, lin=0))
+    x = flujo.decide("RUN", {**m, "flow": no_big}, ctx())
+    assert x["decision"] == "AMARILLO" and "sin ballenas compradoras" in x["falta"], x["falta"]
+    # Un flujo real sin estimado (no hubo velas suficientes) también sirve
+    assert flujo.with_real(None, real)["vfav"] is None
+
+
 def test_sxtc_panel_numbers():
     """Con las cifras del panel de la app del 7-oct (cierre 1.25 → 7.79, vol. 108.53 M, entradas 29.4 M contra salidas 18.29 M,
     ballenas 0.14 M contra 0.00) las reglas dan VERDE. Vienen de la captura: px, prev, chg, vol, in/out y large. Supuestos
@@ -368,6 +404,40 @@ def test_cycle_flujo():
                 setattr(mod, name, fn)
 
 
+def test_cycle_flujo_real():
+    """Ciclo completo con el puente IBKR siguiendo a PENNY: su flujo real (ventas dominando) manda sobre el estimado de
+    las velas (que daba VERDE): no hay aviso; el spread sale del bid/ask de IBKR; el puente queda con la lista de qué
+    seguir y nada de sus precios se publica."""
+    n = 40
+    now = at(n - 1).astimezone(ET)
+    today, quotes, path = _world(n)
+    with tempfile.TemporaryDirectory() as tmp:
+        hist, qc = [], []
+        old = _sources(today, quotes, now, hist, qc)
+        try:
+            r, msgs = _radar(tmp, now)
+            m0 = int(now.timestamp() // 60)
+            px = float(path[-1])
+            rows = [[m0 - k, px, px, px, px, 1000.0, 5, 1000.0, 4000.0, 0.0, 0.0, 30000.0, 0, 1, 30000.0, -1, 1.0]
+                    for k in range(15, -1, -1)]
+            r.bridge.update(quotes={"PENNY": {"last": 3.4567, "bid": 3.4512, "ask": 3.4623, "vol": 9e5}},
+                            info={"ib": "conectado", "unit": 1, "large_usd": 25000}, now=now.timestamp(),
+                            flow={"PENNY": rows})
+            r.cycle(now)
+            row = r.snapshot["flujo"]["rows"][0]
+            assert row["t"] == "PENNY" and row["flow_src"] == "ibkr" and row["decision"] == "ROJO", row
+            assert row["ratio"] == 0.25 and row["ratio_est"] >= flujo.RATIO_GO and row["spread"] == 0.32, row
+            assert not [k for k, _ in msgs if k.startswith("flujo")], msgs
+            assert r.ib_follow[:2] == ["PENNY", "RUN"] and "PENNY" in r.on_bridge(now=now)["follow"], r.ib_follow
+            import json
+            from live.app import clean
+            txt = json.dumps(clean(r.snapshot), allow_nan=False)
+            assert "3.4567" not in txt and "3.4512" not in txt and "3.4623" not in txt   # precios de IBKR: no se publican
+        finally:
+            for (mod, name), fn in old.items():
+                setattr(mod, name, fn)
+
+
 def test_cycle_flujo_dilution_and_isolation():
     n = 40
     now = at(n - 1).astimezone(ET)
@@ -478,10 +548,12 @@ if __name__ == "__main__":
     test_large_bars()
     test_metrics_edges()
     test_decide_green_and_gates()
+    test_real_flow()
     test_sxtc_panel_numbers()
     test_pick_and_query()
     test_book()
     test_cycle_flujo()
+    test_cycle_flujo_real()
     test_cycle_flujo_dilution_and_isolation()
     test_universe_hook()
     test_api_health_and_page()

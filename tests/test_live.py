@@ -680,6 +680,115 @@ def test_bridge_state():
     assert len(b.quotes) <= 300, len(b.quotes)                              # memoria acotada
 
 
+def _frow(m, buy=0.0, sell=0.0, mid=0.0, bbuy=0.0, bsell=0.0, nbb=0, nbs=0, top=0.0, tside=0, u=1.0, v=1000.0, n=10, px=2.0):
+    """Un registro de flujo como lo manda el puente (FLOW_COLS de bridge/puente_ibkr.py)."""
+    return [m, px, px * 1.01, px * 0.99, px, v, n, buy, sell, mid, bbuy, bsell, nbb, nbs, top, tside, u]
+
+
+def test_bridge_flow():
+    """Flujo real del puente: se valida registro por registro, se suma por día (pre-market incluido) con los mismos
+    campos que el estimado; los 15 min recientes piden 3 minutos con operaciones; las ballenas solo cuentan con la
+    unidad correcta; sin flujo ni precio frescos no vale (cae al estimado)."""
+    from live.bridge import Bridge
+    now = DAY.replace(hour=10, minute=30)
+    t0 = now.timestamp()
+    m0 = int(t0 // 60)
+    b = Bridge()
+    pre = int(DAY.replace(hour=8, minute=0).timestamp() // 60)
+    yday = int((DAY - timedelta(days=1)).replace(hour=15).timestamp() // 60)
+    flow = {"BIO": [_frow(pre, buy=1000, sell=500),                                   # pre-market: cuenta
+                    _frow(m0 - 20, buy=4000, sell=1000, mid=1000, bbuy=30000, nbb=1, top=30000, tside=1),
+                    _frow(m0 - 2, buy=3000, sell=1000),
+                    _frow(m0 - 1, buy=2000, sell=2000, bsell=26000, nbs=1, top=26000, tside=-1),
+                    _frow(m0, buy=500, sell=100),
+                    _frow(yday, buy=99999),                                          # ayer: no
+                    _frow(m0 + 30, buy=99999),                                       # del futuro: no
+                    _frow(m0 - 3, buy=float("nan")), [m0, "x"], "no es lista",       # basura: no
+                    _frow(m0 - 4, buy=-1)],
+            "x y": [_frow(m0)], "SLOW": [_frow(m0 - 30, buy=10, sell=10)]}
+    b.update(info={"ib": "conectado", "unit": 1, "large_usd": 25000}, now=t0, flow=flow)
+    assert sorted(b.flow["BIO"]) == sorted([yday, pre, m0 - 20, m0 - 2, m0 - 1, m0]), sorted(b.flow["BIO"])  # ayer se
+    #                                                              guarda (20 h) pero no suma en el día de hoy
+    f = b.flow_stats("BIO", t0)
+    tin, tout = 1000 + 4000 + 500 + 3000 + 2000 + 500, 500 + 1000 + 500 + 1000 + 2000 + 100
+    assert f["in"] == tin and f["out"] == tout and f["ratio"] == round(tin / tout, 2), f
+    assert f["in15"] == 3000 + 2000 + 500 and f["out15"] == 1000 + 2000 + 100 and f["ratio15"] == round(5500 / 3100, 2), f
+    lg = f["large"]
+    assert lg["buy"] == 1 and lg["sell"] == 1 and lg["in"] == 30000 and lg["out"] == 26000 and lg["rec_buy"] == 0, lg
+    assert lg["last"] == {"t": "10:29", "side": "sell", "usd": 26000, "x": 1.0}, lg["last"]
+    assert f["desde"] == "08:00" and f["covered"] == m0 - pre and f["src"] == "ibkr" and f["trades"] == 50, f
+    # Menos de 3 minutos recientes con operaciones: sin razón de 15 min
+    b.update(now=t0, flow={"ONE": [_frow(m0, buy=10, sell=5), _frow(m0 - 40, buy=1, sell=1)]})
+    assert b.flow_stats("ONE", t0)["ratio15"] is None
+    # Lotes de 100: los montos se multiplican; las ballenas decididas con la unidad vieja no cuentan
+    b.unit = 100.0
+    f2 = b.flow_stats("BIO", t0)
+    assert f2["in"] == tin * 100 and f2["large"]["n"] == 0 and f2["large"]["in"] == 0, f2
+    b.unit = None
+    # Sin flujo nuevo en 3 min y sin precio fresco: no vale
+    assert b.flow_stats("BIO", t0 + 181) is None and b.flow_stats("NADA", t0) is None
+    b.update(quotes={"BIO": {"last": 2.0, "bid": 1.99, "ask": 2.01, "vol": 5e5}}, now=t0 + 170)
+    assert b.flow_stats("BIO", t0 + 200) is not None                         # el puente la sigue (precio fresco)
+    assert b.quote("BIO", t0 + 175) == {"last": 2.0, "bid": 1.99, "ask": 2.01} and b.quote("BIO", t0 + 190) is None
+    st = b.status(now=t0 + 175)
+    assert st["flow"] == 3 and st["unit"] == 1 and not st["unit_ok"] and "1.99" not in str(st), st
+    # Unidad: volumen del puente contra el de Yahoo (pocas acciones o razón ambigua: no decide)
+    b2 = Bridge()
+    b2.update(quotes={"AAA": {"last": 5, "vol": 1_100_000}, "BBB": {"last": 5, "vol": 300_000}}, now=t0)
+    assert b2.calibrate({"AAA": 1_000_000, "BBB": 250_000}, t0) is None                  # solo 2 acciones
+    b2.update(quotes={"CCC": {"last": 5, "vol": 90_000}, "DDD": {"last": 5, "vol": 10}}, now=t0)
+    assert b2.calibrate({"AAA": 1_000_000, "BBB": 250_000, "CCC": 80_000, "DDD": 1000}, t0) == 1.0  # DDD: Yahoo < 50 k
+    b3 = Bridge()
+    b3.update(quotes={k: {"last": 5, "vol": v} for k, v in (("A", 10_500), ("B", 2_600), ("C", 900))}, now=t0)
+    assert b3.calibrate({"A": 1_000_000, "B": 250_000, "C": 80_000}, t0) == 100.0 and b3.eff_unit() == 100.0
+    b4 = Bridge()
+    b4.update(quotes={k: {"last": 5, "vol": v} for k, v in (("A", 150_000), ("B", 30_000), ("C", 10_000))}, now=t0)
+    assert b4.calibrate({"A": 1_000_000, "B": 250_000, "C": 80_000}, t0) is None    # razón 0.12: no decide
+    # Memoria acotada
+    b5 = Bridge()
+    for k in range(4):
+        b5.update(now=t0 + k, flow={f"S{k}{chr(65 + i // 26)}{chr(65 + i % 26)}": [_frow(m0)] for i in range(60)})
+    assert len(b5.flow) <= 150, len(b5.flow)
+
+
+def test_flow_follow_and_spread():
+    """El semáforo le dice al puente qué seguir (armadas, abiertas, radar de flujo, la lista del semáforo y la de
+    seguimiento, con tope) y la unidad confirmada; usa el bid/ask de IBKR para el spread y el flujo real en la tarjeta."""
+    now = DAY.replace(hour=10, minute=30)
+    r = runner.Radar(notify=False)
+    r.armed = {"ARM": {"level": 5, "entry": 5.01}}
+    r.flujo.sigs = {"HOT": {"status": "abierta"}, "OLD": {"status": "cierre"}}
+    r.flujo.snap = {"rows": [{"t": "RED", "decision": "ROJO"}, {"t": "YEL", "decision": "AMARILLO"}]}
+    r.flujo_cand = ["CAN"]
+    rows = [{"t": "BUY"}, {"t": "SPY"}, {"t": "WAIT"}]
+    old_n = runner.FOLLOW_N
+    try:
+        f = r._follow_list(rows, ["OPEN"])
+        assert f[:8] == ["ARM", "OPEN", "HOT", "YEL", "RED", "CAN", "BUY", "WAIT"] and "SPY" not in f and "OLD" not in f, f
+        runner.FOLLOW_N = 3
+        assert r._follow_list(rows, ["OPEN"]) == ["ARM", "OPEN", "HOT"]
+    finally:
+        runner.FOLLOW_N = old_n
+    r.ib_follow = ["ARM", "BIO"]
+    out = r.on_bridge(info={"ib": "conectado"}, now=now)
+    assert out["follow"] == ["ARM", "BIO"] and out["unit"] is None, out
+    assert r.on_bridge(now=now.replace(hour=17))["follow"] == []                      # cerrado: nada
+    # Spread: el de IBKR si está fresco (aunque el de Yahoo sea falso); si no, el de Yahoo validado
+    q = {"bid": 1.5, "ask": 2.5}
+    m = {"px": 2.0, "rng1m": 0.5}
+    assert r._spread("BIO", q, m, now) is None                                        # Yahoo: 50 % no cuadra
+    r.bridge.update(quotes={"BIO": {"last": 2.0, "bid": 1.99, "ask": 2.01}}, now=now.timestamp())
+    assert r._spread("BIO", q, m, now) == 1.0
+    assert r._spread("BIO", q, m, now + timedelta(seconds=30)) is None                 # precio viejo: Yahoo
+    # Flujo: real solo con IB_FLOW_MIN minutos cubiertos
+    m0 = int(now.timestamp() // 60)
+    r.bridge.update(info={"unit": 1}, now=now.timestamp(), flow={"BIO": [_frow(m0 - 5, buy=900, sell=100), _frow(m0, buy=1, sell=1)]})
+    assert r._ib_flow("BIO", now) is None                                             # 5 min: todavía no
+    r.bridge.update(now=now.timestamp(), flow={"BIO": [_frow(m0 - 12, buy=100, sell=100)]})
+    fl = r._flow("BIO", {}, None, now, "open")
+    assert fl["src"] == "ibkr" and fl["in"] == 1001 and fl["ratio_est"] is None and fl["vfav"] is None, fl
+
+
 def test_bridge_break():
     """Con el puente conectado, la ruptura de una acción armada se avisa al llegar el precio (sin esperar los 15 s del
     vigía), una sola vez, y la armada guarda la hora y la fuente de la ruptura (sin el precio)."""
@@ -1375,6 +1484,8 @@ if __name__ == "__main__":
     test_watch_positions()
     test_follow_outside_universe()
     test_bridge_state()
+    test_bridge_flow()
+    test_flow_follow_and_spread()
     test_bridge_break()
     test_bridge_universe()
     test_foco_biotech()
