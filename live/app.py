@@ -117,7 +117,7 @@ def positions_remove(t: str, x_token: str | None = Header(default=None)):
     return {"removed": radar.positions.remove(t)}
 
 
-BRIDGE_MAX = 200_000  # bytes por envío del puente
+BRIDGE_MAX = 200_000  # bytes por envío del puente (el flujo va en tandas de hasta 800 minutos: ≤ ~125 KB)
 
 
 class BridgeIn(BaseModel):
@@ -125,6 +125,8 @@ class BridgeIn(BaseModel):
     scan: dict[str, list[str]] | None = None   # {código de escáner de IBKR: [tickers en orden]}
     quotes: dict[str, dict] | None = None      # {ticker: {last, high, bid, ask}} de las acciones armadas
     info: dict | None = None                   # estado del programa (conexión con IBKR, último error)
+    flow: dict | None = None                   # {ticker: [[minuto, o, h, l, c, v, n, compras, ventas, …], …]} (1.2+);
+    #                                            se valida registro por registro en live/bridge.py: uno malo no tumba el resto
 
 
 async def _body(request: Request) -> bytes:
@@ -150,7 +152,7 @@ async def bridge_feed(request: Request, x_token: str | None = Header(default=Non
         b = BridgeIn.model_validate_json(raw or b"{}")
     except ValidationError as e:
         raise HTTPException(422, str(e)[:300])
-    return clean(await run_in_threadpool(radar.on_bridge, b.scan, b.quotes, b.info))
+    return clean(await run_in_threadpool(radar.on_bridge, b.scan, b.quotes, b.info, None, b.flow))
 
 
 class PaperIn(BaseModel):

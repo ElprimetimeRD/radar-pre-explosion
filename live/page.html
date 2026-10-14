@@ -112,7 +112,7 @@ function meta(r){const w=r.whale||{};const b=[];
  if(r.rvol!=null)b.push(`RVOL ${r.rvol.toFixed(1)}×`);if(r.ext!=null)b.push(`VWAP ${r.ext>=0?'+':''}${r.ext.toFixed(1)}%`);
  if(r.atr!=null)b.push(`rango diario ${r.atr.toFixed(1)}%`);if(r.spread!=null)b.push(`spread ${r.spread.toFixed(2)}%`);
  if(w.buy||w.sell)b.push(`ballenas ${w.buy||0}↑ ${w.sell||0}↓`);
- const f=r.flow;if(f){b.push(`entradas ${usd(f.in)} · salidas ${usd(f.out)} · ${xx(f.ratio)}`);
+ const f=r.flow;if(f){b.push(`${f.src==='ibkr'?'flujo IBKR':'flujo estimado'}: entradas ${usd(f.in)} · salidas ${usd(f.out)} · ${xx(f.ratio)}`);
   const g=f.large||{};if(g.buy||g.sell)b.push(`ballenas $ ${usd(g.in)}↑ ${usd(g.out)}↓`)}
  return b.map(x=>`<span>${x}</span>`).join('')}
 function card(r){const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
@@ -152,7 +152,7 @@ function fcard(r){const lg=r.large||{},tot=(r.in||0)+(r.out||0),pin=tot>0?Math.m
  const why=r.decision!=='ROJO'&&r.why&&r.why.length?`<div class="trig">A favor: ${esc(r.why.join(' · '))}</div>`:'';
  const razon=r.decision==='AMARILLO'?`<div class="falta">Falta: ${esc((r.falta||[]).join(' · ')||r.reason)}</div>`:`<div class="reason">${esc(r.reason)}</div>`;
  const cat=r.cat&&r.cat.title?`<div class="trig">📰 ${r.cat.url?`<a href="${esc(r.cat.url)}" target="_blank" rel="noopener">${esc(r.cat.title)}</a>`:esc(r.cat.title)}</div>`:'';
- const m=[`cierre de ayer ${p2(r.prev)}`,`entradas÷salidas ${xx(r.ratio)} · 15 min ${xx(r.ratio15)}`,`ballenas ${lg.buy||0}↑ ${lg.sell||0}↓`,
+ const m=[r.flow_src==='ibkr'?`flujo REAL IBKR desde ${esc(r.desde||'—')}${r.ratio_est!=null?` (estimado ${xx(r.ratio_est)})`:''}`:'flujo estimado (velas)',`cierre de ayer ${p2(r.prev)}`,`entradas÷salidas ${xx(r.ratio)} · 15 min ${xx(r.ratio15)}`,`ballenas ${lg.buy||0}↑ ${lg.sell||0}↓`,
   r.rvol!=null?`volumen ${r.rvol.toFixed(0)}× lo normal`:null,`${usd(r.usd)} negociados`,r.ext!=null?`VWAP ${sg(r.ext).replace('%',' %')}`:null,
   r.dd!=null?`a ${r.dd.toFixed(0)} % del máximo`:null,r.vfav?`sube ${xx(r.vfav)} más de lo que baja`:null,
   r.spread!=null?`spread ${r.spread.toFixed(2)} %`:null,r.halted?`halt ${esc(r.halted)}`:null,r.shelf?'estante S-3/F-3':null];
@@ -179,7 +179,7 @@ function renderFlu(){try{
  $('#fprev').innerHTML=H.length?H.map(h=>{const a=h.sigs||[],w=a.filter(x=>x.close_pct!=null&&x.close_pct>0).length;
   return`<details><summary><b>${esc(h.day)}</b> · ${a.length} aviso(s) · máx medio ${sg(avg(a.map(x=>x.mfe)))} · mín medio ${sg(avg(a.map(x=>x.mae)))} · ${w} cerraron en verde</summary>${a.map(srow).join('')}</details>`}).join('')
   :'Sin historial todavía (se guarda al cambiar de día; un redeploy en Render lo borra).';
- $('#fnote').innerHTML=`${ok?`Para VERDE: entradas÷salidas ≥ ${cfg.ratio}× (últimos 15 min ≥ ${cfg.ratio15}×), ballenas compradoras (vela ≥ ${cfg.large_k}× lo normal y ≥ ${usd(cfg.large_usd)}), sobre el VWAP, a ≤ ${cfg.hod} % del máximo, volumen ≥ ${cfg.rvol}× lo normal, ≥ ${usd(cfg.usd)} negociados y sin dilución en la SEC ni titulares.<br>`:''}⚠ El flujo es <b>ESTIMADO</b> con velas de 1 min de Yahoo (1–2 min de retraso): cada vela se reparte entre entradas y salidas según hacia dónde se movió el precio. No es el Large/Medium/Small de tu app: confírmalo allá. Los umbrales son una primera versión; los avisos quedan registrados con su máx/mín para ajustarlos. Solo aviso, no hay orden. Penny de alto riesgo: tamaño chico y stop puesto.`
+ $('#fnote').innerHTML=`${ok?`Para VERDE: entradas÷salidas ≥ ${cfg.ratio}× (últimos 15 min ≥ ${cfg.ratio15}×), ballenas compradoras (vela ≥ ${cfg.large_k}× lo normal y ≥ ${usd(cfg.large_usd)}), sobre el VWAP, a ≤ ${cfg.hod} % del máximo, volumen ≥ ${cfg.rvol}× lo normal, ≥ ${usd(cfg.usd)} negociados y sin dilución en la SEC ni titulares.<br>`:''}Con el puente IBKR conectado, el flujo de las acciones que sigue es <b>REAL</b> (marcado «flujo REAL IBKR»): cada operación se clasifica compra o venta contra el bid/ask de ese momento y una ballena es una operación ≥ US$25 k. Sin el puente (o en sus primeros 10 min con una acción) es <b>ESTIMADO</b> con velas de 1 min de Yahoo (1–2 min de retraso): cada vela se reparte entre entradas y salidas según hacia dónde se movió el precio. Los umbrales son una primera versión; los avisos quedan registrados con su máx/mín para ajustarlos. Solo aviso, no hay orden. Penny de alto riesgo: tamaño chico y stop puesto.`
 }catch(e){$('#fhead').innerHTML=`<div class="warn">No pude mostrar el radar de flujo: ${esc(e.message)}</div>`}}
 function setV(v){V=v;$('#vsem').hidden=v!=='sem';$('#vflu').hidden=v!=='flu';document.querySelectorAll('.views button').forEach(x=>x.classList.toggle('on',x.dataset.v===v));
  try{history.replaceState(null,'',v==='flu'?'#flujo':location.pathname+location.search)}catch(e){}}
