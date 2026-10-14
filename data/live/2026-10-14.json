@@ -176,7 +176,7 @@
    "t": "HALO",
    "day": "2026-10-14",
    "time": "09:35",
-   "m": 824,
+   "m": 957,
    "kind": "armada",
    "order": "stop",
    "level": 113.83,
@@ -190,14 +190,15 @@
    "limit": false,
    "valid_m": 930,
    "perfil": "volatil",
-   "status": "t1",
+   "status": "cierre",
    "hit1": true,
    "mfe": 4.62,
    "mae": -0.35,
-   "last": 118.66999816894531,
+   "last": 116.7699966430664,
    "fill": 113.9438,
    "fill_m": 576,
-   "t1_m": 589
+   "t1_m": 589,
+   "close_pct": 2.48
   },
   {
    "t": "ARWR",
@@ -312,7 +313,7 @@
    "t": "ARDX",
    "day": "2026-10-14",
    "time": "10:47",
-   "m": 822,
+   "m": 957,
    "kind": "armada",
    "order": "stop",
    "level": 3.18,
@@ -326,13 +327,14 @@
    "limit": false,
    "valid_m": 930,
    "perfil": "volatil",
-   "status": "abierta",
+   "status": "cierre",
    "hit1": false,
    "mfe": 1.97,
    "mae": -0.41,
-   "last": 3.2249999046325684,
+   "last": 3.180000066757202,
    "fill": 3.1832,
-   "fill_m": 648
+   "fill_m": 648,
+   "close_pct": -0.1
   }
  ]
 }
